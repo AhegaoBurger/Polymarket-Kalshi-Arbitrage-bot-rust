@@ -225,6 +225,7 @@ impl ExecutionEngine {
                     let no_price = req.no_price;
                     let poly_yes_token = pair.poly_yes_token.clone();
                     let poly_no_token = pair.poly_no_token.clone();
+                    let poly_condition_id = pair.poly_condition_id.clone();
                     let kalshi_ticker = pair.kalshi_market_ticker.clone();
                     let original_cost_per_contract = if yes_filled > no_filled {
                         if yes_filled > 0 { yes_cost / yes_filled } else { 0 }
@@ -236,7 +237,7 @@ impl ExecutionEngine {
                         Self::auto_close_background(
                             kalshi, poly_async, arb_type, yes_filled, no_filled,
                             yes_price, no_price, poly_yes_token, poly_no_token,
-                            kalshi_ticker, original_cost_per_contract
+                            poly_condition_id, kalshi_ticker, original_cost_per_contract
                         ).await;
                     });
                 }
@@ -303,6 +304,7 @@ impl ExecutionEngine {
                 );
                 let poly_fut = self.poly_async.buy_fak(
                     &pair.poly_yes_token,
+                    &pair.poly_condition_id,
                     cents_to_price(req.yes_price),
                     contracts as f64,
                 );
@@ -320,6 +322,7 @@ impl ExecutionEngine {
                 );
                 let poly_fut = self.poly_async.buy_fak(
                     &pair.poly_no_token,
+                    &pair.poly_condition_id,
                     cents_to_price(req.no_price),
                     contracts as f64,
                 );
@@ -331,11 +334,13 @@ impl ExecutionEngine {
             ArbType::PolyOnly => {
                 let yes_fut = self.poly_async.buy_fak(
                     &pair.poly_yes_token,
+                    &pair.poly_condition_id,
                     cents_to_price(req.yes_price),
                     contracts as f64,
                 );
                 let no_fut = self.poly_async.buy_fak(
                     &pair.poly_no_token,
+                    &pair.poly_condition_id,
                     cents_to_price(req.no_price),
                     contracts as f64,
                 );
@@ -470,6 +475,7 @@ impl ExecutionEngine {
         no_price: u16,
         poly_yes_token: Arc<str>,
         poly_no_token: Arc<str>,
+        poly_condition_id: Arc<str>,
         kalshi_ticker: Arc<str>,
         original_cost_per_contract: i64,
     ) {
@@ -501,7 +507,7 @@ impl ExecutionEngine {
                 info!("[EXEC] 🔄 Waiting 2s for Poly settlement before auto-close ({} {} contracts)", excess, side);
                 tokio::time::sleep(Duration::from_secs(2)).await;
 
-                match poly_async.sell_fak(token, close_price, excess as f64).await {
+                match poly_async.sell_fak(token, &poly_condition_id, close_price, excess as f64).await {
                     Ok(fill) => log_close_pnl("Poly", fill.filled_size as i64, (fill.fill_cost * 100.0) as i64),
                     Err(e) => warn!("[EXEC] ⚠️ Failed to close Poly excess: {}", e),
                 }
@@ -531,7 +537,7 @@ impl ExecutionEngine {
                     info!("[EXEC] 🔄 Waiting 2s for Poly settlement before auto-close ({} yes contracts)", excess);
                     tokio::time::sleep(Duration::from_secs(2)).await;
 
-                    match poly_async.sell_fak(&poly_yes_token, close_price, excess as f64).await {
+                    match poly_async.sell_fak(&poly_yes_token, &poly_condition_id, close_price, excess as f64).await {
                         Ok(fill) => log_close_pnl("Poly", fill.filled_size as i64, (fill.fill_cost * 100.0) as i64),
                         Err(e) => warn!("[EXEC] ⚠️ Failed to close Poly excess: {}", e),
                     }
@@ -565,7 +571,7 @@ impl ExecutionEngine {
                     info!("[EXEC] 🔄 Waiting 2s for Poly settlement before auto-close ({} no contracts)", excess);
                     tokio::time::sleep(Duration::from_secs(2)).await;
 
-                    match poly_async.sell_fak(&poly_no_token, close_price, excess as f64).await {
+                    match poly_async.sell_fak(&poly_no_token, &poly_condition_id, close_price, excess as f64).await {
                         Ok(fill) => log_close_pnl("Poly", fill.filled_size as i64, (fill.fill_cost * 100.0) as i64),
                         Err(e) => warn!("[EXEC] ⚠️ Failed to close Poly excess: {}", e),
                     }

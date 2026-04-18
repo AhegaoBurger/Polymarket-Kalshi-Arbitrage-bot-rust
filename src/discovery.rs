@@ -431,7 +431,7 @@ impl DiscoveryClient {
                 async move {
                     let _permit = semaphore.acquire().await.ok()?;
                     match gamma.lookup_market(&task.poly_slug).await {
-                        Ok(Some((yes_token, no_token))) => {
+                        Ok(Some((yes_token, no_token, condition_id))) => {
                             let team_suffix = extract_team_suffix(&task.market.ticker);
                             Some(MarketPair {
                                 pair_id: format!("{}-{}", task.poly_slug, task.market.ticker).into(),
@@ -443,6 +443,7 @@ impl DiscoveryClient {
                                 poly_slug: task.poly_slug.into(),
                                 poly_yes_token: yes_token.into(),
                                 poly_no_token: no_token.into(),
+                                poly_condition_id: condition_id.into(),
                                 line_value: task.market.floor_strike,
                                 team_suffix: team_suffix.map(|s| s.into()),
                             })

@@ -55,6 +55,8 @@ pub struct MarketPair {
     pub poly_yes_token: Arc<str>,
     /// Polymarket NO outcome token address
     pub poly_no_token: Arc<str>,
+    /// Polymarket condition ID (needed for CLOB market-metadata lookups, e.g. taker fee).
+    pub poly_condition_id: Arc<str>,
     /// Line value for spread/total markets (if applicable)
     pub line_value: Option<f64>,
     /// Team suffix for team-specific markets
@@ -821,6 +823,7 @@ mod tests {
             poly_slug: format!("test-{}", id).into(),
             poly_yes_token: format!("yes_token_{}", id).into(),
             poly_no_token: format!("no_token_{}", id).into(),
+            poly_condition_id: format!("cond_{}", id).into(),
             line_value: None,
             team_suffix: None,
         }
@@ -1104,6 +1107,7 @@ mod tests {
             poly_slug: "chelsea-vs-arsenal".into(),
             poly_yes_token: "yes_token_cfc".into(),
             poly_no_token: "no_token_cfc".into(),
+            poly_condition_id: "cond_cfc".into(),
             line_value: None,
             team_suffix: Some("CFC".into()),
         };
@@ -1245,6 +1249,8 @@ pub struct GammaMarket {
     pub question: Option<String>,
     #[serde(rename = "clobTokenIds")]
     pub clob_token_ids: Option<String>,
+    #[serde(rename = "conditionId")]
+    pub condition_id: Option<String>,
     pub outcomes: Option<String>,
     #[serde(rename = "outcomePrices")]
     pub outcome_prices: Option<String>,

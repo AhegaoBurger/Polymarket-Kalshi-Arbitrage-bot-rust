@@ -519,17 +519,32 @@ impl PolymarketAsyncClient {
         Ok(resp.json().await?)
     }
 
-    /// Check neg_risk for token - with caching
-    pub async fn check_neg_risk(&self, token_id: &str) -> Result<bool> {
-        let url = format!("{}/neg-risk?token_id={}", self.host, token_id);
+    /// Fetch market metadata from CLOB: returns (neg_risk, taker_fee_bps).
+    /// Polymarket's `/markets/{condition_id}` is the authoritative source for fees
+    /// after the 2026 fee rollout (sports, crypto, politics all have non-zero fees).
+    /// We bundle neg_risk + fee into one call since both are signing-critical.
+    pub async fn fetch_market_meta(&self, condition_id: &str) -> Result<(bool, i64)> {
+        let url = format!("{}/markets/{}", self.host, condition_id);
         let resp = self.http
             .get(&url)
             .header("User-Agent", USER_AGENT)
             .send()
             .await?;
 
+        if !resp.status().is_success() {
+            anyhow::bail!("fetch_market_meta {} failed: {}", condition_id, resp.status());
+        }
+
         let val: serde_json::Value = resp.json().await?;
-        Ok(val["neg_risk"].as_bool().unwrap_or(false))
+        // Polymarket sometimes surfaces this field as a string ("1000"), sometimes as a number.
+        let fee = val["taker_fee_rate_bps"]
+            .as_i64()
+            .or_else(|| val["taker_fee_rate_bps"].as_str().and_then(|s| s.parse::<i64>().ok()))
+            .or_else(|| val["fee_rate_bps"].as_i64())
+            .or_else(|| val["fee_rate_bps"].as_str().and_then(|s| s.parse::<i64>().ok()))
+            .unwrap_or(0);
+        let neg_risk = val["neg_risk"].as_bool().unwrap_or(false);
+        Ok((neg_risk, fee))
     }
 
     #[allow(dead_code)]
@@ -553,8 +568,9 @@ pub struct SharedAsyncClient {
     inner: Arc<PolymarketAsyncClient>,
     creds: PreparedCreds,
     chain_id: u64,
-    /// Pre-cached neg_risk lookups
-    neg_risk_cache: std::sync::RwLock<HashMap<String, bool>>,
+    /// Per-token cache of (neg_risk, taker_fee_bps), keyed by token_id.
+    /// Populated lazily on first order; subsequent orders hit cache in O(1).
+    meta_cache: std::sync::RwLock<HashMap<String, (bool, i64)>>,
 }
 
 impl SharedAsyncClient {
@@ -563,55 +579,65 @@ impl SharedAsyncClient {
             inner: Arc::new(client),
             creds,
             chain_id,
-            neg_risk_cache: std::sync::RwLock::new(HashMap::new()),
+            meta_cache: std::sync::RwLock::new(HashMap::new()),
         }
     }
 
-    /// Load neg_risk cache from JSON file (output of build_sports_cache.py)
+    /// Load meta cache from JSON file. Accepts either:
+    ///   - legacy format: {token_id: bool} (treats fee as 0)
+    ///   - new format:    {token_id: [neg_risk, fee_bps]}
     pub fn load_cache(&self, path: &str) -> Result<usize> {
         let data = std::fs::read_to_string(path)?;
-        let map: HashMap<String, bool> = serde_json::from_str(&data)?;
+        // Try new format first
+        let map: HashMap<String, (bool, i64)> =
+            if let Ok(m) = serde_json::from_str::<HashMap<String, (bool, i64)>>(&data) {
+                m
+            } else {
+                let legacy: HashMap<String, bool> = serde_json::from_str(&data)?;
+                legacy.into_iter().map(|(k, v)| (k, (v, 0i64))).collect()
+            };
         let count = map.len();
-        let mut cache = self.neg_risk_cache.write().unwrap();
+        let mut cache = self.meta_cache.write().unwrap();
         *cache = map;
         Ok(count)
     }
 
-    /// Execute FAK buy order - 
-    pub async fn buy_fak(&self, token_id: &str, price: f64, size: f64) -> Result<PolyFillAsync> {
+    /// Execute FAK buy order. `condition_id` is required to look up the market's
+    /// taker fee for signing — the CLOB rejects orders whose signed `feeRateBps`
+    /// does not match the market's current fee.
+    pub async fn buy_fak(&self, token_id: &str, condition_id: &str, price: f64, size: f64) -> Result<PolyFillAsync> {
         debug_assert!(!token_id.is_empty(), "token_id must not be empty");
+        debug_assert!(!condition_id.is_empty(), "condition_id must not be empty");
         debug_assert!(price > 0.0 && price < 1.0, "price must be 0 < p < 1");
         debug_assert!(size >= 1.0, "size must be >= 1");
-        self.execute_order(token_id, price, size, "BUY").await
+        self.execute_order(token_id, condition_id, price, size, "BUY").await
     }
 
-    /// Execute FAK sell order - 
-    pub async fn sell_fak(&self, token_id: &str, price: f64, size: f64) -> Result<PolyFillAsync> {
+    /// Execute FAK sell order.
+    pub async fn sell_fak(&self, token_id: &str, condition_id: &str, price: f64, size: f64) -> Result<PolyFillAsync> {
         debug_assert!(!token_id.is_empty(), "token_id must not be empty");
+        debug_assert!(!condition_id.is_empty(), "condition_id must not be empty");
         debug_assert!(price > 0.0 && price < 1.0, "price must be 0 < p < 1");
         debug_assert!(size >= 1.0, "size must be >= 1");
-        self.execute_order(token_id, price, size, "SELL").await
+        self.execute_order(token_id, condition_id, price, size, "SELL").await
     }
 
-    async fn execute_order(&self, token_id: &str, price: f64, size: f64, side: &str) -> Result<PolyFillAsync> {
-        // Check neg_risk cache first
-        let neg_risk = {
-            let cache = self.neg_risk_cache.read().unwrap();
-            cache.get(token_id).copied()
-        };
+    /// Look up (neg_risk, fee_bps) for a token, fetching and caching on miss.
+    pub async fn get_market_meta(&self, token_id: &str, condition_id: &str) -> Result<(bool, i64)> {
+        if let Some(meta) = self.meta_cache.read().unwrap().get(token_id).copied() {
+            return Ok(meta);
+        }
+        let meta = self.inner.fetch_market_meta(condition_id).await?;
+        self.meta_cache.write().unwrap().insert(token_id.to_string(), meta);
+        Ok(meta)
+    }
 
-        let neg_risk = match neg_risk {
-            Some(nr) => nr,
-            None => {
-                let nr = self.inner.check_neg_risk(token_id).await?;
-                let mut cache = self.neg_risk_cache.write().unwrap();
-                cache.insert(token_id.to_string(), nr);
-                nr
-            }
-        };
+    async fn execute_order(&self, token_id: &str, condition_id: &str, price: f64, size: f64, side: &str) -> Result<PolyFillAsync> {
+        let (neg_risk, fee_bps) = self.get_market_meta(token_id, condition_id).await?;
 
-        // Build signed order
-        let signed = self.build_signed_order(token_id, price, size, side, neg_risk)?;
+        // Build signed order — fee_bps must match market's current taker fee
+        // (CLOB validates this against the EIP-712 signed value).
+        let signed = self.build_signed_order(token_id, price, size, side, neg_risk, fee_bps)?;
         // Owner must be the API key (not wallet address or funder!)
         let body = signed.post_body(&self.creds.api_key, PolyOrderType::FAK.as_str());
 
@@ -644,7 +670,9 @@ impl SharedAsyncClient {
         })
     }
 
-    /// Build a signed order
+    /// Build a signed order. `fee_rate_bps` must match the market's current taker fee —
+    /// the value is baked into both the EIP-712 signature (consensus-critical) and
+    /// the JSON body (rejected by CLOB if the two don't match).
     fn build_signed_order(
         &self,
         token_id: &str,
@@ -652,6 +680,7 @@ impl SharedAsyncClient {
         size: f64,
         side: &str,
         neg_risk: bool,
+        fee_rate_bps: i64,
     ) -> Result<SignedOrder> {
         let price_bps = price_to_bps(price);
         let size_micro = size_to_micro(size);
@@ -671,8 +700,9 @@ impl SharedAsyncClient {
         let salt = generate_seed();
         let maker_amount_str = maker_amt.to_string();
         let taker_amount_str = taker_amt.to_string();
+        let fee_rate_str = fee_rate_bps.to_string();
 
-        // Use references for EIP712 signing 
+        // Use references for EIP712 signing
         let data = OrderData {
             maker: &self.inner.funder,
             taker: ZERO_ADDRESS,
@@ -680,7 +710,7 @@ impl SharedAsyncClient {
             maker_amount: &maker_amount_str,
             taker_amount: &taker_amount_str,
             side: side_code,
-            fee_rate_bps: "0",
+            fee_rate_bps: &fee_rate_str,
             nonce: "0",
             signer: &self.inner.wallet_address_str,
             expiration: "0",
@@ -705,7 +735,7 @@ impl SharedAsyncClient {
                 taker_amount: taker_amount_str,
                 expiration: "0".to_string(),
                 nonce: "0".to_string(),
-                fee_rate_bps: "0".to_string(),
+                fee_rate_bps: fee_rate_str,
                 side: side_code,
                 signature_type: 1,
             },
