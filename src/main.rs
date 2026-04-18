@@ -166,6 +166,22 @@ async fn main() -> Result<()> {
         s
     });
 
+    // Set Polymarket taker-fee rate on every market for the arb detector.
+    // Every tracked league is a sports market, so we hardcode Sports = 30_000 ppm (3.00%).
+    // The detector applies the probability-scaled formula `rate × p × (1-p)` at check time.
+    // (The order-signing path fetches the exact per-market fee via CLOB meta lazily —
+    //  see PolymarketClob::get_market_meta — this hardcode only affects detection.)
+    {
+        let n = state.market_count();
+        for i in 0..n {
+            state.markets[i].set_poly_fee_rate_ppm(types::SPORTS_FEE_RATE_PPM);
+        }
+        info!(
+            "[POLYMARKET] Detector fee rate set to {} ppm (Sports) for {} markets",
+            types::SPORTS_FEE_RATE_PPM, n
+        );
+    }
+
     // Initialize execution infrastructure
     let (exec_tx, exec_rx) = create_execution_channel();
     let circuit_breaker = Arc::new(CircuitBreaker::new(CircuitBreakerConfig::from_env()));

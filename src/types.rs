@@ -4,9 +4,16 @@
 //! orderbook representation, and arbitrage opportunity detection.
 
 use serde::{Deserialize, Serialize};
-use std::sync::atomic::{AtomicU64, Ordering};
+use std::sync::atomic::{AtomicU32, AtomicU64, Ordering};
 use std::sync::Arc;
 use rustc_hash::FxHashMap;
+
+/// Polymarket taker fee rate in parts-per-million for Sports category (3.00% = 30_000 ppm).
+/// Every market tracked by this bot is a sports league, so we hardcode this instead of
+/// fetching per-market. Polymarket's effective fee is probability-scaled:
+///   fee_USD = rate × p × (1-p)  (per $1 contract)
+/// which peaks at p=0.5 (≈¢0.75 here) and falls to zero at the edges.
+pub const SPORTS_FEE_RATE_PPM: u32 = 30_000;
 
 // === Market Types ===
 
@@ -158,6 +165,10 @@ pub struct AtomicMarketState {
     pub kalshi: AtomicOrderbook,
     /// Polymarket platform orderbook state
     pub poly: AtomicOrderbook,
+    /// Polymarket taker fee rate in parts-per-million, set once after discovery.
+    /// Used with the probability-scaled formula `fee = rate × p × (1-p)` (see
+    /// `poly_fee_cents`). Defaults to 0 (no fee deduction) until explicitly set.
+    pub poly_fee_rate_ppm: AtomicU32,
     /// Market pair metadata (immutable after discovery phase)
     pub pair: Option<Arc<MarketPair>>,
     /// Unique market identifier for O(1) lookups
@@ -169,9 +180,17 @@ impl AtomicMarketState {
         Self {
             kalshi: AtomicOrderbook::new(),
             poly: AtomicOrderbook::new(),
+            poly_fee_rate_ppm: AtomicU32::new(0),
             pair: None,
             market_id,
         }
+    }
+
+    /// Set Polymarket taker fee rate in parts-per-million (called once per market
+    /// after discovery). For Sports, use `SPORTS_FEE_RATE_PPM`.
+    #[inline(always)]
+    pub fn set_poly_fee_rate_ppm(&self, ppm: u32) {
+        self.poly_fee_rate_ppm.store(ppm, Ordering::Relaxed);
     }
 
     #[inline(always)]
@@ -188,10 +207,14 @@ impl AtomicMarketState {
         let k_yes_fee = KALSHI_FEE_TABLE[k_yes as usize];
         let k_no_fee = KALSHI_FEE_TABLE[k_no as usize];
 
+        let poly_ppm = self.poly_fee_rate_ppm.load(Ordering::Relaxed);
+        let p_yes_fee = poly_fee_cents(p_yes, poly_ppm);
+        let p_no_fee = poly_fee_cents(p_no, poly_ppm);
+
         let costs = i16x8::new([
-            (p_yes + k_no + k_no_fee) as i16,
-            (k_yes + k_yes_fee + p_no) as i16,
-            (p_yes + p_no) as i16,
+            (p_yes + p_yes_fee + k_no + k_no_fee) as i16,
+            (k_yes + k_yes_fee + p_no + p_no_fee) as i16,
+            (p_yes + p_yes_fee + p_no + p_no_fee) as i16,
             (k_yes + k_yes_fee + k_no + k_no_fee) as i16,
             i16::MAX, i16::MAX, i16::MAX, i16::MAX,
         ]);
@@ -206,6 +229,21 @@ impl AtomicMarketState {
         if arr[3] != 0 { mask |= 8; }
         mask
     }
+}
+
+/// Polymarket per-contract taker fee in cents at a given fill price and fee rate (ppm).
+///
+/// Polymarket charges `fee_USD = rate × p × (1-p)` per $1 contract, which peaks at
+/// p=0.5 and goes to zero at the edges. Computed in integer math as:
+///   fee_cents = ceil(rate_ppm × p × (100-p) / 100_000_000)
+/// Worst-case intermediate (rate_ppm=1e6, p=50) is 2.5e9 — within u64 trivially,
+/// and within u32 too, but we use u64 for safety.
+/// Rounded up so the detector never under-estimates cost.
+#[inline(always)]
+pub fn poly_fee_cents(price_cents: PriceCents, rate_ppm: u32) -> PriceCents {
+    if rate_ppm == 0 || price_cents == 0 || price_cents >= 100 { return 0; }
+    let num = rate_ppm as u64 * price_cents as u64 * (100 - price_cents) as u64;
+    ((num + 99_999_999) / 100_000_000) as PriceCents
 }
 
 /// Precomputed Kalshi trading fee lookup table (101 entries for prices 0-100 cents).
@@ -649,6 +687,82 @@ mod tests {
                 "Fee mismatch at {}¢: int={}, float={}", price_cents, int_fee, float_fee
             );
         }
+    }
+
+    // =========================================================================
+    // poly_fee_cents Tests - Probability-scaled fee
+    // =========================================================================
+
+    #[test]
+    fn test_poly_fee_cents_sports_formula() {
+        let r = SPORTS_FEE_RATE_PPM; // 30_000 ppm (3.00%)
+
+        // p=0.50 → rate × 0.5 × 0.5 = 0.0075 $/contract = 0.75¢ → ceil 1¢
+        assert_eq!(poly_fee_cents(50, r), 1);
+
+        // p=0.15 → 30_000 × 15 × 85 / 1e8 = 0.3825¢ → ceil 1¢
+        assert_eq!(poly_fee_cents(15, r), 1);
+
+        // p=0.85 → symmetric to p=0.15 → ceil 1¢
+        assert_eq!(poly_fee_cents(85, r), 1);
+
+        // p=0.01 → 30_000 × 1 × 99 / 1e8 = 0.0297¢ → ceil 1¢
+        assert_eq!(poly_fee_cents(1, r), 1);
+
+        // p=0.99 → 30_000 × 99 × 1 / 1e8 = 0.0297¢ → ceil 1¢
+        assert_eq!(poly_fee_cents(99, r), 1);
+    }
+
+    #[test]
+    fn test_poly_fee_cents_edges() {
+        // Price 0 or 100 → no fee (nothing to fill, or certain outcome).
+        assert_eq!(poly_fee_cents(0, SPORTS_FEE_RATE_PPM), 0);
+        assert_eq!(poly_fee_cents(100, SPORTS_FEE_RATE_PPM), 0);
+
+        // Rate 0 (e.g. Geopolitics) → no fee regardless of price.
+        assert_eq!(poly_fee_cents(50, 0), 0);
+        assert_eq!(poly_fee_cents(25, 0), 0);
+    }
+
+    #[test]
+    fn test_poly_fee_cents_symmetry() {
+        // Formula is symmetric around p=50: fee(p) must equal fee(100-p).
+        for p in 1..100u16 {
+            assert_eq!(
+                poly_fee_cents(p, SPORTS_FEE_RATE_PPM),
+                poly_fee_cents(100 - p, SPORTS_FEE_RATE_PPM),
+                "Asymmetry at p={}", p
+            );
+        }
+    }
+
+    #[test]
+    fn test_poly_fee_cents_higher_rates() {
+        // Crypto is 0.072 → 72_000 ppm. At p=0.5: 72_000 × 50 × 50 / 1e8 = 1.8¢ → ceil 2¢
+        assert_eq!(poly_fee_cents(50, 72_000), 2);
+
+        // Politics 0.04 = 40_000 ppm. At p=0.5: 40_000 × 2500 / 1e8 = 1.0¢ exactly → ceil 1¢
+        assert_eq!(poly_fee_cents(50, 40_000), 1);
+    }
+
+    #[test]
+    fn test_check_arbs_respects_poly_fee() {
+        // Scenario: Poly YES 50 + Poly NO 49 = 99¢ raw
+        // Without any Poly fee, that's a 1¢ arb (< 100).
+        // With sports rate (1¢ on each leg at these prices): 99 + 2 = 101 — eliminated.
+        let state = make_market_state(60, 60, 50, 49);
+
+        // Default: no fee rate set yet → arb should fire on the poly-only leg.
+        let mask_no_fee = state.check_arbs(100);
+        assert!(mask_no_fee & 4 != 0, "Poly-only arb must fire when fee rate unset");
+
+        // Apply Sports rate → poly-only arb should disappear.
+        state.set_poly_fee_rate_ppm(SPORTS_FEE_RATE_PPM);
+        let mask_with_fee = state.check_arbs(100);
+        assert_eq!(
+            mask_with_fee & 4, 0,
+            "Poly-only arb must be eliminated once fee is applied"
+        );
     }
 
     // =========================================================================
