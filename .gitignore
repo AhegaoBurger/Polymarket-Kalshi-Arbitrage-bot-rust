@@ -2,6 +2,8 @@ target/
 .env
 .env.keys
 kalshi_private_key.txt
+keys/
+*.pem
 claude.md
 .DS_Store
 positions.json
