@@ -418,17 +418,32 @@ pub struct PolymarketAsyncClient {
 
 /// Polymarket CLOB signature types.
 ///   0 = EOA               (funder == signer, raw external wallet)
-///   1 = POLY_PROXY        (funder is a Polymarket email/Magic proxy contract)
-///   2 = POLY_GNOSIS_SAFE  (funder is a Gnosis Safe)
+///   1 = POLY_PROXY        (funder is a Polymarket email/Magic login proxy)
+///   2 = POLY_GNOSIS_SAFE  (funder is a Gnosis Safe — MetaMask / external wallet login)
 /// Picking the wrong one produces a valid ECDSA signature that fails server-side
-/// verification with "invalid signature" — the server runs different recovery
-/// logic per type, and recovery doesn't match the declared `maker`.
+/// verification with "invalid signature" — the server runs different EIP-1271
+/// logic per type against different proxy contract shapes.
+///
+/// Detection rules:
+///   1. `POLY_SIG_TYPE` env var overrides if set to 0/1/2.
+///   2. funder == signer             → 0 (EOA).
+///   3. funder != signer (the rest)  → 2 (Gnosis Safe), because MetaMask /
+///      external-wallet login is the default Polymarket account type for
+///      users who hold their own private keys. Magic/email users are rare in
+///      an API trading context and can set POLY_SIG_TYPE=1 explicitly.
 #[inline]
 fn detect_signature_type(funder: &str, wallet_address: &str) -> i32 {
+    if let Ok(s) = std::env::var("POLY_SIG_TYPE") {
+        if let Ok(n) = s.trim().parse::<i32>() {
+            if (0..=2).contains(&n) {
+                return n;
+            }
+        }
+    }
     if funder.trim().eq_ignore_ascii_case(wallet_address.trim()) {
-        0  // EOA
+        0
     } else {
-        1  // Polymarket proxy (most common for Magic/email accounts)
+        2
     }
 }
 
@@ -440,12 +455,15 @@ impl PolymarketAsyncClient {
             .map_err(|e| anyhow!("Invalid wallet address for header: {}", e))?;
 
         let sig_type = detect_signature_type(funder, &wallet_address_str);
+        let sig_type_name = match sig_type {
+            0 => "EOA",
+            1 => "POLY_PROXY",
+            2 => "POLY_GNOSIS_SAFE",
+            _ => "UNKNOWN",
+        };
         tracing::info!(
             "[POLYMARKET] Wallet signer={} funder={} → signatureType={} ({})",
-            wallet_address_str,
-            funder,
-            sig_type,
-            if sig_type == 0 { "EOA" } else { "POLY_PROXY" }
+            wallet_address_str, funder, sig_type, sig_type_name
         );
 
         // Build async client with connection pooling and keepalive
