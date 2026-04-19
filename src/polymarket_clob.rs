@@ -19,6 +19,7 @@ use serde_json::json;
 use sha2::Sha256;
 use std::collections::HashMap;
 use std::sync::Arc;
+use std::sync::atomic::{AtomicBool, Ordering};
 
 const USER_AGENT: &str = "py_clob_client";
 const MSG_TO_SIGN: &str = "This message attests that I control the given wallet";
@@ -407,6 +408,28 @@ pub struct PolymarketAsyncClient {
     funder: String,
     wallet_address_str: String,
     address_header: HeaderValue,
+    /// EIP-712 `signatureType` for the configured wallet. Auto-detected at
+    /// startup: 0 if funder==signer (EOA), else 1 (POLY_PROXY).
+    signature_type: i32,
+    /// One-shot guard so we log the raw CLOB `/markets/{id}` response exactly
+    /// once per process — used to diagnose which JSON key carries the taker fee.
+    logged_meta_shape: AtomicBool,
+}
+
+/// Polymarket CLOB signature types.
+///   0 = EOA               (funder == signer, raw external wallet)
+///   1 = POLY_PROXY        (funder is a Polymarket email/Magic proxy contract)
+///   2 = POLY_GNOSIS_SAFE  (funder is a Gnosis Safe)
+/// Picking the wrong one produces a valid ECDSA signature that fails server-side
+/// verification with "invalid signature" — the server runs different recovery
+/// logic per type, and recovery doesn't match the declared `maker`.
+#[inline]
+fn detect_signature_type(funder: &str, wallet_address: &str) -> i32 {
+    if funder.trim().eq_ignore_ascii_case(wallet_address.trim()) {
+        0  // EOA
+    } else {
+        1  // Polymarket proxy (most common for Magic/email accounts)
+    }
 }
 
 impl PolymarketAsyncClient {
@@ -415,6 +438,15 @@ impl PolymarketAsyncClient {
         let wallet_address_str = format!("{:?}", wallet.address());
         let address_header = HeaderValue::from_str(&wallet_address_str)
             .map_err(|e| anyhow!("Invalid wallet address for header: {}", e))?;
+
+        let sig_type = detect_signature_type(funder, &wallet_address_str);
+        tracing::info!(
+            "[POLYMARKET] Wallet signer={} funder={} → signatureType={} ({})",
+            wallet_address_str,
+            funder,
+            sig_type,
+            if sig_type == 0 { "EOA" } else { "POLY_PROXY" }
+        );
 
         // Build async client with connection pooling and keepalive
         let http = reqwest::Client::builder()
@@ -433,6 +465,8 @@ impl PolymarketAsyncClient {
             funder: funder.to_string(),
             wallet_address_str,
             address_header,
+            signature_type: sig_type,
+            logged_meta_shape: AtomicBool::new(false),
         })
     }
 
@@ -523,6 +557,10 @@ impl PolymarketAsyncClient {
     /// Polymarket's `/markets/{condition_id}` is the authoritative source for fees
     /// after the 2026 fee rollout (sports, crypto, politics all have non-zero fees).
     /// We bundle neg_risk + fee into one call since both are signing-critical.
+    ///
+    /// The CLOB rejects orders signed with the wrong `feeRateBps`, so reading the
+    /// right JSON key here is critical — if the field is missing, we bail rather
+    /// than silently submit a known-bad order.
     pub async fn fetch_market_meta(&self, condition_id: &str) -> Result<(bool, i64)> {
         let url = format!("{}/markets/{}", self.host, condition_id);
         let resp = self.http
@@ -536,15 +574,70 @@ impl PolymarketAsyncClient {
         }
 
         let val: serde_json::Value = resp.json().await?;
-        // Polymarket sometimes surfaces this field as a string ("1000"), sometimes as a number.
-        let fee = val["taker_fee_rate_bps"]
-            .as_i64()
-            .or_else(|| val["taker_fee_rate_bps"].as_str().and_then(|s| s.parse::<i64>().ok()))
-            .or_else(|| val["fee_rate_bps"].as_i64())
-            .or_else(|| val["fee_rate_bps"].as_str().and_then(|s| s.parse::<i64>().ok()))
-            .unwrap_or(0);
-        let neg_risk = val["neg_risk"].as_bool().unwrap_or(false);
-        Ok((neg_risk, fee))
+
+        // One-shot: log the raw response the first time so we can verify which
+        // key the CLOB uses for the taker fee on this account/endpoint.
+        if !self.logged_meta_shape.swap(true, Ordering::Relaxed) {
+            tracing::info!(
+                "[POLYMARKET] First CLOB /markets response (key survey): {}",
+                val
+            );
+        }
+
+        // Polymarket's CLOB has used several names for the taker fee over time.
+        // We try snake_case, camelCase, and the legacy base-fee names. Values may
+        // arrive as either a number or a string — handle both.
+        let fee_keys = [
+            "taker_base_fee",
+            "takerBaseFee",
+            "taker_fee_rate_bps",
+            "takerFeeRateBps",
+            "fee_rate_bps",
+            "feeRateBps",
+            "taker_fee",
+            "takerFee",
+        ];
+        let mut fee: Option<i64> = None;
+        let mut matched_key: Option<&str> = None;
+        for k in fee_keys {
+            if let Some(n) = val[k].as_i64() {
+                fee = Some(n);
+                matched_key = Some(k);
+                break;
+            }
+            if let Some(n) = val[k].as_str().and_then(|s| s.parse::<i64>().ok()) {
+                fee = Some(n);
+                matched_key = Some(k);
+                break;
+            }
+        }
+
+        let neg_risk = val["neg_risk"].as_bool()
+            .or_else(|| val["negRisk"].as_bool())
+            .unwrap_or(false);
+
+        match (fee, matched_key) {
+            (Some(f), Some(k)) => {
+                tracing::debug!(
+                    "[POLYMARKET] meta {} → (neg_risk={}, fee={} via key '{}')",
+                    condition_id, neg_risk, f, k
+                );
+                Ok((neg_risk, f))
+            }
+            _ => {
+                // No fee field matched. Bail — signing with 0 against a non-zero
+                // market fee produces the 400 "invalid fee rate" error we've been
+                // chasing. Better to fail the single order than spam bad signatures.
+                tracing::warn!(
+                    "[POLYMARKET] fetch_market_meta {}: no known taker-fee key in response (tried {:?}); raw={}",
+                    condition_id, fee_keys, val
+                );
+                anyhow::bail!(
+                    "fetch_market_meta {}: no taker-fee key found (see logged response)",
+                    condition_id
+                )
+            }
+        }
     }
 
     #[allow(dead_code)]
@@ -714,7 +807,7 @@ impl SharedAsyncClient {
             nonce: "0",
             signer: &self.inner.wallet_address_str,
             expiration: "0",
-            signature_type: 1,
+            signature_type: self.inner.signature_type,
             salt,
         };
         let exchange = get_exchange_address(self.chain_id, neg_risk)?;
@@ -737,7 +830,7 @@ impl SharedAsyncClient {
                 nonce: "0".to_string(),
                 fee_rate_bps: fee_rate_str,
                 side: side_code,
-                signature_type: 1,
+                signature_type: self.inner.signature_type,
             },
             signature: format!("0x{}", sig),
         })
