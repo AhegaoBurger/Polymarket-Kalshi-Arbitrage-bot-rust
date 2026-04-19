@@ -550,8 +550,12 @@ impl PolymarketAsyncClient {
         Ok(resp)
     }
 
-    /// Get order by ID 
-    pub async fn get_order_async(&self, order_id: &str, creds: &PreparedCreds) -> Result<PolymarketOrderResponse> {
+    /// Get order by ID.
+    ///
+    /// Returns `Ok(None)` when the CLOB responds with JSON `null` — this happens
+    /// for FAK orders that didn't match any resting liquidity (no persistent row
+    /// to return). Callers should treat `None` as a zero-fill, not an error.
+    pub async fn get_order_async(&self, order_id: &str, creds: &PreparedCreds) -> Result<Option<PolymarketOrderResponse>> {
         let path = format!("/data/order/{}", order_id);
         let url = format!("{}{}", self.host, path);
         let headers = self.build_l2_headers("GET", &path, None, creds)?;
@@ -568,7 +572,11 @@ impl PolymarketAsyncClient {
             return Err(anyhow!("get_order failed {}: {}", status, body));
         }
 
-        Ok(resp.json().await?)
+        let val: serde_json::Value = resp.json().await?;
+        if val.is_null() {
+            return Ok(None);
+        }
+        Ok(Some(serde_json::from_value(val)?))
     }
 
     /// Fetch market metadata from CLOB: returns (neg_risk, taker_fee_bps).
@@ -764,15 +772,28 @@ impl SharedAsyncClient {
         let resp_json: serde_json::Value = resp.json().await?;
         let order_id = resp_json["orderID"].as_str().unwrap_or("unknown").to_string();
 
-        // Query fill status
+        // Query fill status. FAK orders that don't match leave no persistent
+        // record — the CLOB returns literal `null`, which we interpret as a
+        // zero-fill rather than an error.
         let order_info = self.inner.get_order_async(&order_id, &self.creds).await?;
-        let filled_size: f64 = order_info.size_matched.parse().unwrap_or(0.0);
-        let order_price: f64 = order_info.price.parse().unwrap_or(price);
+        let (filled_size, order_price) = match order_info.as_ref() {
+            Some(info) => (
+                info.size_matched.parse::<f64>().unwrap_or(0.0),
+                info.price.parse::<f64>().unwrap_or(price),
+            ),
+            None => (0.0, price),
+        };
 
-        tracing::debug!(
-            "[POLY-ASYNC] FAK {} {}: status={}, filled={:.2}/{:.2}, price={:.4}",
-            side, order_id, order_info.status, filled_size, size, order_price
-        );
+        match order_info.as_ref() {
+            Some(info) => tracing::debug!(
+                "[POLY-ASYNC] FAK {} {}: status={}, filled={:.2}/{:.2}, price={:.4}",
+                side, order_id, info.status, filled_size, size, order_price
+            ),
+            None => tracing::debug!(
+                "[POLY-ASYNC] FAK {} {}: no fill (order not found — unmatched FAK)",
+                side, order_id
+            ),
+        }
 
         Ok(PolyFillAsync {
             order_id,
