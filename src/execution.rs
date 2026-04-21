@@ -10,6 +10,7 @@ use std::time::{Duration, Instant};
 use tokio::sync::mpsc;
 use tracing::{info, warn, error};
 
+use crate::balance::{BalanceCache, KALSHI_MIN_CONTRACTS, POLY_MIN_ORDER_CENTS};
 use crate::kalshi::KalshiApiClient;
 use crate::polymarket_clob::SharedAsyncClient;
 use crate::types::{
@@ -23,6 +24,48 @@ use crate::position_tracker::{FillRecord, PositionChannel};
 // =============================================================================
 // EXECUTION ENGINE
 // =============================================================================
+
+/// Per-exchange dollar cost of a single-contract fill, derived from the arb
+/// type. Used for balance-cap sizing and min-order-size floor checks.
+///
+/// The same-platform arbs (PolyOnly, KalshiOnly) spend on two legs on the same
+/// exchange, so `cents_per_contract` is the sum of both leg prices.
+struct LegCost {
+    /// Cents to spend on Kalshi per contract (0 if no Kalshi leg).
+    kalshi_cents_per_contract: i64,
+    /// Cents to spend on Polymarket per contract, summed across legs (0 if none).
+    poly_cents_per_contract: i64,
+    /// Min per-leg price in cents on the Polymarket side — the per-order
+    /// minimum applies to each leg individually, so for PolyOnly we must use
+    /// the cheaper of the two legs here. 0 if no Polymarket leg.
+    poly_min_leg_price_cents: i64,
+}
+
+#[inline]
+fn leg_cost(arb_type: ArbType, yes_cents: i64, no_cents: i64) -> LegCost {
+    match arb_type {
+        ArbType::PolyYesKalshiNo => LegCost {
+            kalshi_cents_per_contract: no_cents,
+            poly_cents_per_contract: yes_cents,
+            poly_min_leg_price_cents: yes_cents,
+        },
+        ArbType::KalshiYesPolyNo => LegCost {
+            kalshi_cents_per_contract: yes_cents,
+            poly_cents_per_contract: no_cents,
+            poly_min_leg_price_cents: no_cents,
+        },
+        ArbType::PolyOnly => LegCost {
+            kalshi_cents_per_contract: 0,
+            poly_cents_per_contract: yes_cents + no_cents,
+            poly_min_leg_price_cents: yes_cents.min(no_cents),
+        },
+        ArbType::KalshiOnly => LegCost {
+            kalshi_cents_per_contract: yes_cents + no_cents,
+            poly_cents_per_contract: 0,
+            poly_min_leg_price_cents: 0,
+        },
+    }
+}
 
 /// High-precision monotonic clock for latency measurement and performance tracking
 pub struct NanoClock {
@@ -53,6 +96,7 @@ pub struct ExecutionEngine {
     state: Arc<GlobalState>,
     circuit_breaker: Arc<CircuitBreaker>,
     position_channel: PositionChannel,
+    balance: Arc<BalanceCache>,
     in_flight: Arc<[AtomicU64; 8]>,
     clock: NanoClock,
     pub dry_run: bool,
@@ -66,6 +110,7 @@ impl ExecutionEngine {
         state: Arc<GlobalState>,
         circuit_breaker: Arc<CircuitBreaker>,
         position_channel: PositionChannel,
+        balance: Arc<BalanceCache>,
         dry_run: bool,
     ) -> Self {
         let test_mode = std::env::var("TEST_ARB")
@@ -78,6 +123,7 @@ impl ExecutionEngine {
             state,
             circuit_breaker,
             position_channel,
+            balance,
             in_flight: Arc::new(std::array::from_fn(|_| AtomicU64::new(0))),
             clock: NanoClock::new(),
             dry_run,
@@ -154,6 +200,46 @@ impl ExecutionEngine {
             });
         }
 
+        // === Balance-aware cap ===
+        // Intersect the liquidity cap with what each wallet can actually pay
+        // for. Without this the bot submits orders that the exchange 400s with
+        // "insufficient balance" — guaranteed-fail round-trips.
+        let cost = leg_cost(req.arb_type, req.yes_price as i64, req.no_price as i64);
+        if cost.kalshi_cents_per_contract > 0 {
+            let kalshi_cap = self.balance.kalshi_max_contracts(cost.kalshi_cents_per_contract);
+            max_contracts = max_contracts.min(kalshi_cap);
+        }
+        if cost.poly_cents_per_contract > 0 {
+            let poly_cap = self.balance.poly_max_contracts(cost.poly_cents_per_contract);
+            max_contracts = max_contracts.min(poly_cap);
+        }
+
+        if max_contracts < KALSHI_MIN_CONTRACTS {
+            self.release_in_flight(market_id);
+            return Ok(ExecutionResult {
+                market_id,
+                success: false,
+                profit_cents: 0,
+                latency_ns: self.clock.now_ns() - req.detected_ns,
+                error: Some("Balance below min contracts"),
+            });
+        }
+
+        // Polymarket rejects any single leg below $5. Check the cheaper of the
+        // two legs against the min so we don't submit guaranteed-reject orders.
+        if cost.poly_min_leg_price_cents > 0
+            && max_contracts * cost.poly_min_leg_price_cents < POLY_MIN_ORDER_CENTS
+        {
+            self.release_in_flight(market_id);
+            return Ok(ExecutionResult {
+                market_id,
+                success: false,
+                profit_cents: 0,
+                latency_ns: self.clock.now_ns() - req.detected_ns,
+                error: Some("Balance below Poly min order"),
+            });
+        }
+
         // Circuit breaker check
         if let Err(_reason) = self.circuit_breaker.can_execute(&pair.pair_id, max_contracts).await {
             self.release_in_flight(market_id);
@@ -190,7 +276,21 @@ impl ExecutionEngine {
             });
         }
 
-        // Execute both legs concurrently 
+        // Reserve balance on both sides *before* submitting so a concurrent
+        // opportunity doesn't try to spend the same dollars. Next refresh
+        // overwrites with ground truth; on partial-fill / FAK-miss we over-
+        // reserve until then, which is the safe direction to be wrong in.
+        if cost.kalshi_cents_per_contract > 0 {
+            self.balance.commit_kalshi(max_contracts * cost.kalshi_cents_per_contract);
+        }
+        if cost.poly_cents_per_contract > 0 {
+            let poly_cost_micros = (max_contracts as u64)
+                * (cost.poly_cents_per_contract as u64)
+                * 10_000;
+            self.balance.commit_poly(poly_cost_micros);
+        }
+
+        // Execute both legs concurrently
         let result = self.execute_both_legs_async(&req, pair, max_contracts).await;
 
         // Release in-flight after delay

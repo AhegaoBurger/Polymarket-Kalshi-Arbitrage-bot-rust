@@ -579,6 +579,51 @@ impl PolymarketAsyncClient {
         Ok(Some(serde_json::from_value(val)?))
     }
 
+    /// Fetch USDC collateral balance from `/balance-allowance?asset_type=COLLATERAL`.
+    /// Returns the raw 6-decimal USDC micro value (23_870_001 = $23.870001).
+    ///
+    /// Allowances are ignored here: for typical Polymarket accounts the UI
+    /// pre-approves MAX_UINT256 to all three exchange spenders on first deposit,
+    /// so the binding cap is balance. If you ever hit a partially-revoked
+    /// allowance, the order will 400 at submit time — rare enough to not be
+    /// worth a per-spender min check on the hot path.
+    ///
+    /// NOTE 1: Polymarket's L2 HMAC signs the *bare* request path. The query
+    /// is appended to the URL but excluded from the signed message — mirroring
+    /// py-clob-client. Signing the full path+query produces a misleading 401
+    /// "Unauthorized/Invalid api key" (actually a signature mismatch).
+    ///
+    /// NOTE 2: The `signature_type` query param tells the CLOB which account
+    /// shape to resolve the balance for (0=EOA, 1=Magic proxy, 2=Safe). Without
+    /// it, the CLOB defaults to the signer EOA — for Safe users that's the
+    /// wrong address and returns a spurious "$0 balance."
+    pub async fn fetch_balance_allowance_usdc_micros(&self, creds: &PreparedCreds) -> Result<u64> {
+        let sign_path = "/balance-allowance";
+        let query = format!("?asset_type=COLLATERAL&signature_type={}", self.signature_type);
+        let url = format!("{}{}{}", self.host, sign_path, query);
+        let headers = self.build_l2_headers("GET", sign_path, None, creds)?;
+
+        let resp = self.http
+            .get(&url)
+            .headers(headers)
+            .send()
+            .await?;
+
+        if !resp.status().is_success() {
+            let status = resp.status();
+            let text = resp.text().await.unwrap_or_default();
+            return Err(anyhow!("balance-allowance failed {}: {}", status, text));
+        }
+
+        #[derive(serde::Deserialize)]
+        struct BalanceResp {
+            balance: String,
+        }
+        let parsed: BalanceResp = resp.json().await?;
+        parsed.balance.parse::<u64>()
+            .map_err(|e| anyhow!("balance-allowance: could not parse balance '{}': {}", parsed.balance, e))
+    }
+
     /// Fetch market metadata from CLOB: returns (neg_risk, taker_fee_bps).
     /// Polymarket's `/markets/{condition_id}` is the authoritative source for fees
     /// after the 2026 fee rollout (sports, crypto, politics all have non-zero fees).
@@ -719,6 +764,11 @@ impl SharedAsyncClient {
         let mut cache = self.meta_cache.write().unwrap();
         *cache = map;
         Ok(count)
+    }
+
+    /// Fetch USDC collateral balance (6-decimal micros) from the CLOB.
+    pub async fn fetch_poly_balance_usdc_micros(&self) -> Result<u64> {
+        self.inner.fetch_balance_allowance_usdc_micros(&self.creds).await
     }
 
     /// Execute FAK buy order. `condition_id` is required to look up the market's

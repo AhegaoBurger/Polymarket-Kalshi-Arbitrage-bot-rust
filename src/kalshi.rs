@@ -281,7 +281,21 @@ impl KalshiApiClient {
         let resp: KalshiMarketsResponse = self.get(&path).await?;
         Ok(resp.markets)
     }
-    
+
+    /// Fetch cash available to trade (in USD cents) from `/portfolio/balance`.
+    /// Confirmed shape: `{balance: i64, portfolio_value: i64, updated_ts: u64}`.
+    /// `balance` is what we want — cash that can be spent on new orders.
+    /// `portfolio_value` is cash + mark-to-market of open positions and is
+    /// *not* spendable, despite the name.
+    pub async fn fetch_balance_cents(&self) -> Result<i64> {
+        #[derive(serde::Deserialize)]
+        struct BalanceResp {
+            balance: i64,
+        }
+        let resp: BalanceResp = self.get("/portfolio/balance").await?;
+        Ok(resp.balance)
+    }
+
     /// Generic authenticated POST request
     async fn post<T: serde::de::DeserializeOwned, B: Serialize>(&self, path: &str, body: &B) -> Result<T> {
         let url = format!("{}{}", KALSHI_API_BASE, path);

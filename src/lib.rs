@@ -3,6 +3,7 @@
 //! A high-performance, production-ready arbitrage trading system for cross-platform
 //! prediction markets with real-time price monitoring and execution.
 
+pub mod balance;
 pub mod cache;
 pub mod circuit_breaker;
 pub mod config;

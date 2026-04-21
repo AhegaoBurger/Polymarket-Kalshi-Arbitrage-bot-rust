@@ -22,6 +22,7 @@
 //! - **Circuit breaker protection** with configurable risk limits
 //! - **Market discovery system** with intelligent caching and incremental updates
 
+mod balance;
 mod cache;
 mod circuit_breaker;
 mod config;
@@ -114,6 +115,23 @@ async fn main() -> Result<()> {
     // Create Kalshi API client
     let kalshi_api = Arc::new(KalshiApiClient::new(kalshi_config));
 
+    // Balance cache: prime at startup (blocking) so the first opportunity
+    // doesn't see zeros; then spawn a background refresh task.
+    let balance_cache = Arc::new(balance::BalanceCache::new());
+    match balance::refresh_once(&balance_cache, &kalshi_api, &poly_async).await {
+        Ok(()) => info!(
+            "[BALANCE] Primed at startup: Kalshi=${:.2}, Poly=${:.2}",
+            balance_cache.kalshi_cents() as f64 / 100.0,
+            balance_cache.poly_usdc_micros() as f64 / 1_000_000.0,
+        ),
+        Err(e) => warn!("[BALANCE] Startup prime failed: {} (continuing with zero cache)", e),
+    }
+    balance::spawn_refresh_task(
+        balance_cache.clone(),
+        kalshi_api.clone(),
+        poly_async.clone(),
+    );
+
     // Run discovery (with caching support)
     let force_discovery = std::env::var("FORCE_DISCOVERY")
         .map(|v| v == "1" || v == "true")
@@ -200,6 +218,7 @@ async fn main() -> Result<()> {
         state.clone(),
         circuit_breaker.clone(),
         position_channel,
+        balance_cache,
         dry_run,
     ));
 
@@ -306,7 +325,8 @@ async fn main() -> Result<()> {
     let heartbeat_state = state.clone();
     let heartbeat_threshold = threshold_cents;
     let heartbeat_handle = tokio::spawn(async move {
-        use crate::types::kalshi_fee_cents;
+        use crate::types::{kalshi_fee_cents, poly_fee_cents};
+        use std::sync::atomic::Ordering;
         let mut interval = tokio::time::interval(tokio::time::Duration::from_secs(60));
         loop {
             interval.tick().await;
@@ -314,8 +334,9 @@ async fn main() -> Result<()> {
             let mut with_kalshi = 0;
             let mut with_poly = 0;
             let mut with_both = 0;
-            // Track best arbitrage opportunity: (total_cost, market_id, p_yes, k_no, k_yes, p_no, fee, is_poly_yes_kalshi_no)
-            let mut best_arb: Option<(u16, u16, u16, u16, u16, u16, u16, bool)> = None;
+            // Track best arb: (total_cost, market_id, p_yes, k_no, k_yes, p_no,
+            // k_fee, p_fee, is_poly_yes_kalshi_no)
+            let mut best_arb: Option<(u16, u16, u16, u16, u16, u16, u16, u16, bool)> = None;
 
             for market in heartbeat_state.markets.iter().take(market_count) {
                 let (k_yes, k_no, _, _) = market.kalshi.load();
@@ -327,20 +348,26 @@ async fn main() -> Result<()> {
                 if has_k && has_p {
                     with_both += 1;
 
-                    let fee1 = kalshi_fee_cents(k_no);
-                    let cost1 = p_yes + k_no + fee1;
+                    let poly_ppm = market.poly_fee_rate_ppm.load(Ordering::Relaxed);
 
-                    let fee2 = kalshi_fee_cents(k_yes);
-                    let cost2 = k_yes + fee2 + p_no;
+                    // Leg 1: buy P_yes + K_no. Poly fee applies to the YES leg.
+                    let k_fee1 = kalshi_fee_cents(k_no);
+                    let p_fee1 = poly_fee_cents(p_yes, poly_ppm);
+                    let cost1 = p_yes + p_fee1 + k_no + k_fee1;
 
-                    let (best_cost, best_fee, is_poly_yes) = if cost1 <= cost2 {
-                        (cost1, fee1, true)
+                    // Leg 2: buy K_yes + P_no. Poly fee applies to the NO leg.
+                    let k_fee2 = kalshi_fee_cents(k_yes);
+                    let p_fee2 = poly_fee_cents(p_no, poly_ppm);
+                    let cost2 = k_yes + k_fee2 + p_no + p_fee2;
+
+                    let (best_cost, best_k_fee, best_p_fee, is_poly_yes) = if cost1 <= cost2 {
+                        (cost1, k_fee1, p_fee1, true)
                     } else {
-                        (cost2, fee2, false)
+                        (cost2, k_fee2, p_fee2, false)
                     };
 
                     if best_arb.is_none() || best_cost < best_arb.as_ref().unwrap().0 {
-                        best_arb = Some((best_cost, market.market_id, p_yes, k_no, k_yes, p_no, best_fee, is_poly_yes));
+                        best_arb = Some((best_cost, market.market_id, p_yes, k_no, k_yes, p_no, best_k_fee, best_p_fee, is_poly_yes));
                     }
                 }
             }
@@ -348,16 +375,18 @@ async fn main() -> Result<()> {
             info!("💓 System heartbeat | Markets: {} total, {} with Kalshi prices, {} with Polymarket prices, {} with both | threshold={}¢",
                   market_count, with_kalshi, with_poly, with_both, heartbeat_threshold);
 
-            if let Some((cost, market_id, p_yes, k_no, k_yes, p_no, fee, is_poly_yes)) = best_arb {
+            if let Some((cost, market_id, p_yes, k_no, k_yes, p_no, k_fee, p_fee, is_poly_yes)) = best_arb {
                 let gap = cost as i16 - heartbeat_threshold as i16;
                 let desc = heartbeat_state.get_by_id(market_id)
                     .and_then(|m| m.pair.as_ref())
                     .map(|p| &*p.description)
                     .unwrap_or("Unknown");
                 let leg_breakdown = if is_poly_yes {
-                    format!("P_yes({}¢) + K_no({}¢) + K_fee({}¢) = {}¢", p_yes, k_no, fee, cost)
+                    format!("P_yes({}¢) + P_fee({}¢) + K_no({}¢) + K_fee({}¢) = {}¢",
+                            p_yes, p_fee, k_no, k_fee, cost)
                 } else {
-                    format!("K_yes({}¢) + P_no({}¢) + K_fee({}¢) = {}¢", k_yes, p_no, fee, cost)
+                    format!("K_yes({}¢) + K_fee({}¢) + P_no({}¢) + P_fee({}¢) = {}¢",
+                            k_yes, k_fee, p_no, p_fee, cost)
                 };
                 if gap <= 10 {
                     info!("   📊 Best opportunity: {} | {} | gap={:+}¢ | [Poly_yes={}¢ Kalshi_no={}¢ Kalshi_yes={}¢ Poly_no={}¢]",
