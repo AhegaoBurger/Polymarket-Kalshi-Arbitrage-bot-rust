@@ -1,21 +1,21 @@
-# Multi-Category Market Matching & Per-Category Fees
+# Multi-Category Market Matching, Canonical Schema & Auditable AI Matcher
 
-**Status:** Draft
-**Date:** 2026-04-21
-**Scope:** Extend the arbitrage bot from sports-only to multi-category (FOMC, macro econ, elections, and a long-tail fallback) with per-category Polymarket fee handling.
+**Status:** Draft v2 (regenerated 2026-04-21)
+**Scope:** Extend the bot from sports-only to multi-category (FOMC, macro econ, elections, long-tail) with (a) a canonical-event-schema + per-event-type adapter architecture, (b) per-category Polymarket fees driven by the CLOB `feeSchedule`, and (c) a standalone human-auditable AI matcher sidecar.
 
 ---
 
 ## 1. Background
 
-Today the bot is hard-wired to sports in two places:
+Two bottlenecks are blocking expansion beyond sports:
 
-- **Discovery** (`src/discovery.rs`, `src/config.rs`): league configs drive a ticker parser that decomposes Kalshi events into `(date, team1, team2)` and builds Polymarket slugs of the form `prefix-team1-team2-date[-suffix]`. This shape is specific to sports and does not generalize to FOMC, elections, CPI, etc.
-- **Fees** (`src/main.rs:192-201`): a single `SPORTS_FEE_RATE_PPM` is stamped onto every tracked market. Post-March 2026, Polymarket charges different taker fees by category (Crypto 1.80%, Economics 1.50%, Politics 1.00%, Sports 0.75%, Geopolitical 0%). Using the sports rate on, e.g., an FOMC market *underestimates fees by 2×* and can turn a detected arb into a loss.
+**Discovery is tightly coupled to sports.** `src/discovery.rs` parses Kalshi tickers as `date+team1+team2` (see `parse_kalshi_event_ticker` at `discovery.rs:537`) and builds Polymarket slugs of the form `prefix-team1-team2-date[-suffix]` (`build_poly_slug` at `discovery.rs:468`). This shape does not generalize: FOMC markets encode a target-rate band, elections encode jurisdiction + candidate, CPI encodes a release date + value range.
 
-The motivation for this work is that high-discrepancy categories — FOMC rate decisions, macro econ releases, elections — systematically show larger cross-platform spreads than sports because the participant bases diverge (CFTC-regulated US retail on Kalshi vs. crypto-native global on Polymarket). The spread opportunity is exactly where the fee differential matters most.
+**Fees are stamped as a single sports constant.** `src/main.rs:192-201` applies `SPORTS_FEE_RATE_PPM` to every tracked market. After Polymarket's March 2026 rollout, categories charge different taker fees (Crypto 1.80%, Economics 1.50%, Politics 1.00%, Sports 0.75%, Geopolitical 0%). Using the sports rate on an FOMC market under-estimates fees by 2× and can convert a detected arb into a guaranteed loss — the current `ARB_THRESHOLD = 0.995` has zero headroom for this error.
 
-Note: `src/types.rs:11-16` comments `SPORTS_FEE_RATE_PPM = 30_000` as "3.00%", but the `poly_fee_cents` formula yields a peak of `rate_ppm / 40_000` cents per dollar, i.e. 0.75% at 30,000 ppm — which matches current Polymarket Sports. The value is correct; the comment is wrong and will be fixed as part of this work.
+**Motivation.** The highest-alpha categories for cross-venue arbitrage are the ones where the participant bases diverge most — FOMC rate decisions, macro econ releases, and elections. These are precisely the categories where fee misestimation hurts the most.
+
+**Note on the existing `SPORTS_FEE_RATE_PPM = 30_000` comment.** `types.rs:11-16` labels this "3.00%", but `poly_fee_cents` yields a peak of `rate_ppm / 40_000` cents per dollar, i.e. **0.75% at 30,000 ppm** — which matches Polymarket's current Sports rate. The value is correct; the comment is wrong and will be fixed in PR 1.
 
 ---
 
@@ -23,87 +23,91 @@ Note: `src/types.rs:11-16` comments `SPORTS_FEE_RATE_PPM = 30_000` as "3.00%", b
 
 **Goals**
 
-1. Per-category Polymarket fee handling, driven by a category→ppm table with the CLOB `get_market_meta` fetch as authoritative override.
-2. A structured `FomcMatcher` that pairs Kalshi `KXFED*` rate-band markets with the corresponding Polymarket neg-risk outcomes, using a current-rate anchor.
-3. An AI-backed long-tail matcher (Python sidecar) using a two-layer embeddings + LLM pipeline. Runs as a scheduled job with category-specific TTLs.
-4. Zero regression in the existing sports pipeline.
-5. Discovery output remains a single `Vec<MarketPair>` consumable by `GlobalState` without changes to trading-hot-path code.
+1. Per-category Polymarket fee handling, with the CLOB as source of truth and a category→ppm fallback table.
+2. A **canonical event schema** and per-event-type adapter layer (`SportsAdapter`, `FomcAdapter`, future: `CpiAdapter`, `ElectionAdapter`).
+3. A structured `FomcAdapter` that pairs Kalshi `KXFED*` rate-band markets with Polymarket neg-risk outcomes using a current-rate anchor.
+4. An AI matcher that is **runnable entirely independently of the Rust binary** and produces human-auditable output (static HTML review UI + `manual_overrides.json` for sign-off).
+5. Zero regression in the existing sports pipeline.
+6. Discovery output remains a single `Vec<MarketPair>` consumable by `GlobalState`; the hot path (execution, WebSocket, orderbook) is untouched.
 
 **Non-Goals**
 
-- Replacing the existing sports discovery / `SportsMatcher`. It works and is deterministic — keep it.
-- Supporting Polymarket's fee-free Geopolitical category (possible follow-up; adds no fee-math value).
-- Live-updating existing `MarketPair` rows mid-session (matches are loaded at startup and on re-discovery, same as today).
-- Fixing `tests/integration_tests.rs` (already broken per project memory; separate concern).
-- Building embedded vector-search infra in Rust — Python sidecar owns that.
+- Replacing the existing sports logic with AI matching. Sports stays deterministic.
+- Polymarket fee-free Geopolitical category support (follow-up).
+- Maker/taker routing in the execution engine — out of scope; keep taker-only behavior.
+- Full versioned mapping-registry database. Extending the existing `.discovery_cache.json` with adapter-version tags is sufficient.
+- Live hot-reloading of `MarketPair` set mid-session.
+- Fixing `tests/integration_tests.rs` (pre-existing breakage; separate concern).
+- Any dependency from the Rust hot path on pmxt or any Python library.
 
 ---
 
 ## 3. Design Overview
 
 ```
-┌────────────────────────────────────────────────────────────────────────────┐
-│                             Startup (Rust)                                  │
-│                                                                             │
-│  DiscoveryClient ──▶ merges:                                                │
-│    1. SportsMatcher          (existing, unchanged)                          │
-│    2. FomcMatcher            (new, rate-band join)                          │
-│    3. AiMatcherReader        (new, reads JSON produced by Python sidecar)   │
-│                                                                             │
-│  Result: Vec<MarketPair> → GlobalState                                      │
-│                                                                             │
-│  FeeResolver.apply_to_markets(state):                                       │
-│    for each market: fee_ppm = seed_from_clob_meta() ?? category_table()     │
+┌─── Rust process ──────────────────────────────────────────────────────────┐
+│                                                                            │
+│  DiscoveryClient orchestrates a Vec<Box<dyn EventAdapter>>:                │
+│                                                                            │
+│    SportsAdapter ─┐                                                        │
+│                   │                                                        │
+│    FomcAdapter ───┼─▶ CanonicalEvent ─▶ pair-join ─▶ Vec<MarketPair>       │
+│                   │                                                        │
+│    AiMatcherRead ─┘  (consumes .ai_matches.json produced by sidecar)       │
+│                                                                            │
+│  FeeResolver.apply_to_markets(state):                                      │
+│    for each market:                                                        │
+│      fee_ppm = seed_from_clob_meta()               // source of truth      │
+│             ?? category_fee_ppm(pair.category)     // fallback             │
+│                                                                            │
 └────────────────────────────────────────────────────────────────────────────┘
 
-┌────────────────────────────────────────────────────────────────────────────┐
-│                    scripts/ai_matcher.py (periodic sidecar)                 │
-│                                                                             │
-│  Every N minutes (category-dependent):                                      │
-│    1. Fetch Kalshi + Polymarket catalogs (REST)                             │
-│    2. Layer 1 — Embeddings:                                                 │
-│         - content-hash each market; skip re-embed if unchanged              │
-│         - cosine top-K=8 Poly candidates per Kalshi market                  │
-│    3. Layer 2 — LLM verification:                                           │
-│         - structured output {confidence, resolution_match, concerns[]}      │
-│         - cache by (kalshi_hash, poly_hash); skip if both unchanged         │
-│         - accept iff confidence ≥ 0.9 AND concerns is empty                 │
-│    4. Apply manual_overrides.json (human-reviewed whitelist/blacklist)      │
-│    5. Write .ai_matches.json for Rust to pick up                            │
+┌─── scripts/ai_matcher.py — runs entirely standalone ──────────────────────┐
+│                                                                            │
+│   python scripts/ai_matcher.py run      # periodic discovery run           │
+│   python scripts/ai_matcher.py review   # opens static HTML audit report   │
+│   python scripts/ai_matcher.py audit    # random-sample verification pass  │
+│                                                                            │
+│  Pipeline:                                                                 │
+│    1. Ingest via pmxt (Kalshi + Polymarket catalogs)                       │
+│    2. Normalize → CanonicalEventDraft (Python mirror of the Rust type)     │
+│    3. Apply event-type classifiers (FOMC / CPI / Elections / long-tail)    │
+│    4. Layer 1: embed + cosine top-K retrieval                              │
+│    5. Layer 2: LLM verification with structured output                     │
+│    6. Apply manual_overrides.json (whitelist/blacklist)                    │
+│    7. Emit:                                                                │
+│         - .ai_matches.json         (consumed by Rust)                      │
+│         - audit/report.html        (human review UI, static file)          │
+│         - .ai_matcher_audit.jsonl  (append-only full decision log)         │
 └────────────────────────────────────────────────────────────────────────────┘
 ```
 
-Structured matchers run first and their pairs win on ticker collision (AI matcher cannot override a structured match).
+Design rules:
+- **Structured adapters win over AI pairs.** If Sports or FOMC already produced a pair for a given Kalshi market, AI pairs for the same ticker are discarded during merge.
+- **Human overrides win over both.** `manual_overrides.json` blacklists reject any adapter's pair; whitelists force a specific pair.
+- **Sidecar has zero Rust dependency.** It can be run, reviewed, and trusted without the bot running. Rust only reads its output JSON.
 
 ---
 
 ## 4. Detailed Design
 
-### 4.1 Per-Category Fee Table + Per-Market Override
+### 4.1 Per-Category Fee Table + Per-Market CLOB Override
 
 New module `src/fees.rs`:
 
 ```rust
 #[derive(Debug, Clone, Copy, PartialEq, Eq, Hash, Serialize, Deserialize)]
 pub enum PolyCategory {
-    Sports,
-    Crypto,
-    Economics,   // FOMC, CPI, NFP, GDP
-    Politics,
-    Tech,
-    Culture,
-    Weather,
-    Finance,
-    Mentions,
-    Geopolitical, // fee-free
-    Unknown,      // AI-matched, category not confidently known
+    Sports, Crypto, Economics, Politics, Tech, Culture,
+    Weather, Finance, Mentions, Geopolitical, Unknown,
 }
 
 pub fn category_fee_ppm(c: PolyCategory) -> u32 {
-    // Values encode peak fee via rate_ppm / 40_000 = peak_pct.
-    // 0.75% peak → 30_000 ppm.
+    // ppm encodes the bot's internal pre-scale rate such that
+    // peak_cents_per_dollar at p=0.5 equals rate_ppm / 40_000.
+    // Verify this convention against feeSchedule during §4.1.5.
     match c {
-        PolyCategory::Crypto       => 72_000, // 1.80%
+        PolyCategory::Crypto       => 72_000, // 1.80% peak
         PolyCategory::Mentions     => 62_400, // 1.56%
         PolyCategory::Economics    => 60_000, // 1.50%
         PolyCategory::Culture      => 50_000, // 1.25%
@@ -113,283 +117,477 @@ pub fn category_fee_ppm(c: PolyCategory) -> u32 {
         PolyCategory::Tech         => 40_000, // 1.00%
         PolyCategory::Sports       => 30_000, // 0.75%
         PolyCategory::Geopolitical => 0,
-        PolyCategory::Unknown      => 72_000, // conservative: use the highest
+        PolyCategory::Unknown      => 72_000, // conservative: highest rate
     }
 }
 ```
 
-`SPORTS_FEE_RATE_PPM` becomes `pub const SPORTS_FEE_RATE_PPM: u32 = category_fee_ppm(PolyCategory::Sports);` (or deleted, with callers switched to `category_fee_ppm`). The misleading "3.00%" comment in `types.rs:11-16` is corrected to "0.75% peak" in the same commit.
+`SPORTS_FEE_RATE_PPM` either becomes `category_fee_ppm(PolyCategory::Sports)` or is deleted with callers migrated. The misleading "3.00%" comment in `types.rs:11-16` is corrected.
 
-**Seeding per-market fees at startup** (replaces `main.rs:192-201`):
+**Per-market fee seeding** (replaces `main.rs:192-201`):
 
 ```rust
 for i in 0..state.market_count() {
-    let pair = &state.markets[i].pair.as_ref().unwrap();
-    // 1. Prefer authoritative CLOB value (same call execution path uses).
-    //    If it fails, fall back to category table.
-    let ppm = match poly_async.get_market_meta(&pair.poly_yes_token, &pair.poly_condition_id).await {
-        Ok((_, fee_bps)) => bps_to_ppm(fee_bps),
-        Err(_) => category_fee_ppm(pair.category),
+    let pair = state.markets[i].pair.as_ref().unwrap();
+    let ppm = match poly_async.get_market_meta(&pair.poly_yes_token,
+                                                &pair.poly_condition_id).await {
+        Ok((_, fee_bps)) => fees::bps_to_ppm(fee_bps),
+        Err(e) => {
+            warn!("fee meta fetch failed for {}: {}; falling back to category",
+                  pair.pair_id, e);
+            fees::category_fee_ppm(pair.category)
+        }
     };
     state.markets[i].set_poly_fee_rate_ppm(ppm);
 }
 ```
 
-This makes the category table a **fallback**, with the CLOB as source of truth. Cost: one REST call per market at startup (parallelizable via the existing `SharedAsyncClient.meta_cache`). Benefits:
-- No drift when Polymarket changes per-category rates.
-- Consistent with what the signing path already uses (`polymarket_clob.rs:795-802`).
+Benefits:
+- CLOB is authoritative (no drift if Polymarket changes rates).
+- Reuses the existing `SharedAsyncClient.meta_cache` (`polymarket_clob.rs:737-802`); same cache also serves order signing.
+- Category table exists for offline use and as the guaranteed fallback.
 
-`bps_to_ppm` is a small helper whose exact conversion must be calibrated during implementation, not asserted in this spec. The bot's internal `rate_ppm` encodes a pre-`p(1-p)` rate such that `peak_cents_per_dollar = rate_ppm / 40_000` (see `poly_fee_cents` in `types.rs:243`). The CLOB's published `taker_fee_rate_bps` may be either the peak percent-bps or the pre-scale rate — Polymarket has used both conventions historically. Implementation step: fetch `get_market_meta` for a known-rate market (e.g. a Sports market at 0.75%) and back-solve the conversion factor from observed `fee_bps`. Encode the result as a single constant in `fees.rs` with a unit test that asserts `bps_to_ppm(bps_for_sports) == 30_000`.
+### 4.1.5 `feeSchedule` Verification + Fee Formula Verification
+
+**Two calibration tasks land before PR 1 is frozen.** Both are small (< 1 day) but they are blocking because getting either wrong invalidates fee math across every category.
+
+**Task A — `feeSchedule` field survey.** The current `fetch_market_meta` (`polymarket_clob.rs:635-712`) loops over eight legacy fee field names. Recent reporting suggests Polymarket now publishes a structured `feeSchedule` object per market. Action: fetch `GET /markets/{condition_id}` for one market per category, dump the raw JSON, confirm whether `feeSchedule` exists and what it contains. If present, it becomes the primary path in `fetch_market_meta`; the legacy key loop stays as fallback.
+
+**Task B — fee formula calibration.** The bot's `poly_fee_cents` uses `fee = rate × p × (1-p) / 10^8` (`types.rs:243`). Polymarket's published formula may be `p × (1-p)`-scaled or `min(p, 1-p)`-scaled — historically both have appeared in docs. Action: fetch meta for a known-rate market (a Sports market, quoted at 0.75%), observe the `fee_bps` (or `feeSchedule`) value, and back-solve the conversion:
+
+```rust
+// In fees.rs — encoded as a single calibrated constant + unit test.
+pub fn bps_to_ppm(bps: i64) -> u32 {
+    // To be calibrated during Task B. Must satisfy:
+    //   bps_to_ppm(<observed Sports bps>) == 30_000
+    // The unit test below locks this invariant.
+    unimplemented!("calibrate after feeSchedule survey")
+}
+
+#[cfg(test)]
+mod tests {
+    #[test]
+    fn sports_conversion_is_30k_ppm() {
+        // <OBSERVED_SPORTS_BPS> replaced during calibration.
+        assert_eq!(bps_to_ppm(OBSERVED_SPORTS_BPS), 30_000);
+    }
+}
+```
+
+If the formula convention itself differs (e.g. Polymarket switches to `min(p, 1-p)`), `poly_fee_cents` gains an alternate branch and a comment noting which convention applies. The test catches regressions.
 
 ### 4.2 `MarketPair` Additions
 
 ```rust
 pub struct MarketPair {
     // ... existing fields unchanged ...
-    pub category: PolyCategory,         // NEW — drives fee table fallback
-    pub match_source: MatchSource,      // NEW — who matched this pair
+    pub category: PolyCategory,         // NEW
+    pub match_source: MatchSource,      // NEW
 }
 
-#[derive(Debug, Clone, Copy, Serialize, Deserialize)]
+#[derive(Debug, Clone, Serialize, Deserialize)]
 pub enum MatchSource {
-    Structured { matcher: &'static str },     // "sports", "fomc"
-    Ai { confidence: f32, model: Arc<str> },  // "claude-opus-4-7" etc.
+    Structured { adapter: &'static str },       // "sports", "fomc"
+    Ai { confidence: f32, model: Arc<str> },    // e.g. "claude-opus-4-7"
     ManualOverride,
 }
 ```
 
-Both fields are `#[serde(default)]`-friendly so existing `.discovery_cache.json` files continue to deserialize (defaulting to `PolyCategory::Sports` + `MatchSource::Structured { matcher: "sports" }`), avoiding a forced cache wipe.
+Both fields use `#[serde(default)]` so existing `.discovery_cache.json` files deserialize without wipe — defaulting to `PolyCategory::Sports` + `MatchSource::Structured { adapter: "sports" }`.
 
-Execution filtering (shipped with PR 3, see §7):
-- A boolean env `EXEC_ALLOW_AI_MATCHES` (default `false`) gates whether AI-matched pairs are eligible for live trades. Detector still runs on them and logs opportunities; the execution engine checks `pair.match_source` against the gate and rejects AI pairs until the flag flips.
-- This is the only place in the hot path that reads `match_source`; one branch in `execution.rs` at the start of order dispatch.
+**Execution gate** (`execution.rs`, start of order dispatch — one branch):
+```rust
+if matches!(pair.match_source, MatchSource::Ai { .. })
+    && !config::exec_allow_ai_matches() {
+    return Err(anyhow!("AI-matched pair execution disabled"));
+}
+```
+Default `EXEC_ALLOW_AI_MATCHES=0`. Detector still runs and logs AI-matched opportunities; execution simply refuses them until the gate flips.
 
-### 4.3 `SportsMatcher` (unchanged)
+### 4.3 Canonical Schema + Adapter Architecture
 
-The current `discover_league` / `parse_kalshi_event_ticker` / `build_poly_slug` pipeline is repackaged without logic change into `src/matchers/sports.rs` behind a trait:
+The core insight from the research: instead of each matcher returning `MarketPair` directly (which collapses normalization into pairing), introduce an intermediate canonical representation. Every adapter produces `CanonicalMarket`s; pairing is a single join that all categories share.
+
+```rust
+// src/canonical.rs
+#[derive(Debug, Clone)]
+pub struct CanonicalMarket {
+    pub event_type: EventType,        // Sports | Fomc | Cpi | Election | Other
+    pub underlier: Underlier,         // what is being predicted
+    pub parameters: Parameters,       // outcome-specific params (enum variant)
+    pub time_window: TimeWindow,      // event_at, settles_at
+    pub venue: Venue,                 // Kalshi | Polymarket + venue-specific IDs
+    pub category: PolyCategory,       // drives fees
+    pub raw_title: Arc<str>,          // preserved for audit logs
+    pub raw_description: Arc<str>,
+    pub adapter_version: u32,         // cache key
+}
+
+pub enum EventType { Sports, Fomc, Cpi, NfpJobs, Election, Other }
+
+pub enum Underlier {
+    SportsGame { league: Arc<str>, home: Arc<str>, away: Arc<str> },
+    FomcRateBand { meeting_date: NaiveDate, floor_bps: i32 },
+    CpiValue { release_date: NaiveDate, series: CpiSeries, threshold: f32,
+               cmp: Comparison },
+    ElectionCandidate { race_id: Arc<str>, candidate_normalized: Arc<str> },
+    Other,  // AI-matched markets don't project onto a structured underlier
+}
+
+pub struct Venue {
+    pub platform: Platform,                // Kalshi | Polymarket
+    pub kalshi_market_ticker: Option<Arc<str>>,
+    pub kalshi_event_ticker: Option<Arc<str>>,
+    pub poly_slug: Option<Arc<str>>,
+    pub poly_yes_token: Option<Arc<str>>,
+    pub poly_no_token: Option<Arc<str>>,
+    pub poly_condition_id: Option<Arc<str>>,
+}
+```
+
+**The `EventAdapter` trait** owns both normalization and candidate generation, but pairing is shared:
 
 ```rust
 #[async_trait]
-pub trait MarketMatcher: Send + Sync {
-    fn name(&self) -> &'static str;
-    async fn discover(&self) -> Result<Vec<MarketPair>>;
+pub trait EventAdapter: Send + Sync {
+    fn name(&self) -> &'static str;                    // "sports", "fomc"
+    fn event_type(&self) -> EventType;
+    fn version(&self) -> u32;
+
+    /// Fetch raw markets from both venues and normalize them.
+    async fn normalize(&self) -> Result<NormalizedBatch>;
+}
+
+pub struct NormalizedBatch {
+    pub kalshi: Vec<CanonicalMarket>,
+    pub poly: Vec<CanonicalMarket>,
 }
 ```
 
-`DiscoveryClient` owns a `Vec<Arc<dyn MarketMatcher>>` and runs them in parallel, then merges results. Sports keeps its cache file; each matcher namespaces its cache (e.g. `.discovery_cache_sports.json`, `.discovery_cache_fomc.json`, `.ai_matches.json`).
+**Shared pairing logic** (no per-adapter code):
 
-### 4.4 `FomcMatcher`
-
-**Input config** (new `src/config.rs` entry):
 ```rust
-pub struct FomcSource {
-    pub kalshi_series: &'static str,     // "KXFED"
-    pub poly_event_search: &'static str, // Gamma search hint, e.g. "fomc-decision"
-    pub anchor_source: FedFundsAnchor,   // see below
+// src/matchers/mod.rs
+pub fn pair_batch(batch: NormalizedBatch,
+                  adapter_name: &'static str) -> Vec<MarketPair> {
+    let poly_by_key: HashMap<(EventType, Underlier), &CanonicalMarket> =
+        batch.poly.iter().map(|m| ((m.event_type, m.underlier.clone()), m)).collect();
+
+    batch.kalshi.iter().filter_map(|k| {
+        poly_by_key.get(&(k.event_type, k.underlier.clone()))
+                   .map(|p| build_pair(k, p, adapter_name))
+    }).collect()
 }
 ```
 
-**Anchor** — the current fed-funds target mid-rate is needed to translate Kalshi's absolute bands to Polymarket's delta outcomes. Two resolution strategies, tried in order:
+The adapter's job shrinks to one verb: **normalize into a canonical form**. Pairing is automatic once both sides project onto the same `Underlier`. This is what the research report calls "two-phase discovery": normalization is candidate generation; the shared `pair_batch` does verification via equality on the canonical key.
 
-1. **From Kalshi event metadata** if the `KXFED` event exposes `current_rate` or similar. (To verify during implementation; if not, fall through.)
-2. **From FRED API** (`https://api.stlouisfed.org/fred/series/observations?series_id=DFEDTARU`). Requires a `FRED_API_KEY` env var; documented as optional-but-recommended for FOMC support.
+### 4.4 `SportsAdapter` (Existing Logic, Refactored)
 
-If both fail, the matcher logs an error and emits zero pairs rather than guessing (a wrong anchor silently mis-aligns every pair).
+Lives in `src/adapters/sports.rs`. Logic is lifted verbatim from `discovery.rs`:
+- Fetches Kalshi events by series (`KXEPLGAME`, `KXNBAGAME`, etc.).
+- Parses `date+teams` → structured fields via `parse_kalshi_event_ticker`.
+- Builds Polymarket slug via `build_poly_slug` and fetches via Gamma.
 
-**Algorithm** (pseudocode):
+The only change: instead of returning `MarketPair` directly, it returns `NormalizedBatch`:
+- Each Kalshi market becomes `CanonicalMarket { underlier: Underlier::SportsGame {...}, ... }`.
+- Each matched Polymarket market becomes a `CanonicalMarket` with the same `Underlier`.
+
+`pair_batch` then joins them. Behavior is byte-identical to today's output; this refactor is mechanical and should produce an unchanged `.discovery_cache.json`.
+
+### 4.5 `FomcAdapter` (New, Structured)
+
+Lives in `src/adapters/fomc.rs`. Algorithm:
+
+1. **Fetch Kalshi events** in series `KXFED`. Each event corresponds to one FOMC meeting (e.g. `KXFED-26MAY`).
+2. **Resolve anchor** — the current fed-funds target lower-bound (bps). Two strategies, tried in order:
+   1. Read from Kalshi event metadata if exposed (to verify during impl; may not exist).
+   2. Fetch from FRED: `https://api.stlouisfed.org/fred/series/observations?series_id=DFEDTARL` (target lower bound). Requires optional `FRED_API_KEY`.
+   3. If both fail → log error, emit zero pairs for this meeting. Never guess.
+3. **Normalize Kalshi side.** For each market in the event with a `floor_strike`:
+   ```
+   CanonicalMarket {
+     underlier: FomcRateBand { meeting_date, floor_bps: (floor_strike * 100) as i32 },
+     ...
+   }
+   ```
+4. **Fetch Polymarket neg-risk event** via Gamma search (hint: slug pattern `fomc-decision-<month>-<year>`). Iterate its outcomes.
+5. **Normalize Polymarket side.** For each outcome, parse delta from title (`"25 bps cut"` → `-25`, `"No change"` → `0`, `"25 bps hike"` → `+25`), compute `floor_bps = anchor_bps + delta_bps`:
+   ```
+   CanonicalMarket {
+     underlier: FomcRateBand { meeting_date, floor_bps: anchor + delta },
+     ...
+   }
+   ```
+6. `pair_batch` joins on `(Fomc, FomcRateBand { meeting_date, floor_bps })`.
+
+Tail bands with no Polymarket counterpart (e.g. "above 6.00%") are simply skipped — no error, they produce no pair.
+
+**Parser** for Polymarket outcome labels handles common variants: `"\d+\s*bps?\s*(cut|decrease|lower)"`, `"no change|hold"`, `"\d+\s*bps?\s*(hike|increase|raise)"`. Unrecognized labels are logged and skipped.
+
+### 4.6 AI Matcher Sidecar
+
+Located at `scripts/ai_matcher.py`. **Fully standalone**: runs without any Rust process, without the bot's Rust data files, and without any service from the rest of the codebase. It reads configs, hits APIs, writes outputs. Rust reads its output file and trusts it.
+
+Command-line surface:
 ```
-for each open Kalshi event in series KXFED:
-    anchor_bps = resolve_anchor(event)
-    kalshi_markets = kalshi.get_markets(event.ticker)    // each has floor_strike (%)
-    poly_event     = gamma.find_fomc_event(event.meeting_date)
-    if poly_event is None: skip
-
-    // Build lookup: canonical rate-band → Polymarket outcome token pair
-    poly_by_band = {}
-    for outcome in poly_event.outcomes:
-        delta_bps = parse_fed_delta(outcome.title)  // "25 bps decrease" → -25
-        if delta_bps is None: continue
-        band_bps = anchor_bps + delta_bps
-        poly_by_band[band_bps] = outcome
-
-    for k_market in kalshi_markets:
-        band_bps = (k_market.floor_strike * 100.0) as i32  // 4.25% → 425 bps
-        if let Some(outcome) = poly_by_band.get(&band_bps):
-            emit MarketPair {
-                category: PolyCategory::Economics,
-                match_source: MatchSource::Structured { matcher: "fomc" },
-                ...
-            }
+python scripts/ai_matcher.py run                # one discovery pass
+python scripts/ai_matcher.py run --loop         # loop with per-category TTLs
+python scripts/ai_matcher.py run --category politics --sample 50
+python scripts/ai_matcher.py review             # open audit/report.html
+python scripts/ai_matcher.py audit --sample 20  # random spot-check of accepted pairs
+python scripts/ai_matcher.py calibrate-fees     # one-shot: survey feeSchedule (Task A/B)
 ```
 
-Unmatched markets are skipped (not errors). Tail bands with no Poly counterpart (e.g. "above 6.00%") simply produce no pair.
+Dependencies (`scripts/requirements.txt`): `pmxt`, `anthropic`, `openai` (for embeddings), `hnswlib`, `jinja2`, `requests`. No Flask, no web server — review UI is static HTML.
 
-### 4.5 AI Matcher Sidecar
+#### 4.6.1 Ingestion via pmxt
 
-**Location**: `scripts/ai_matcher.py` — consistent with the existing Python-produced `.clob_market_cache.json` pattern (`src/main.rs:104`).
+`scripts/ai_matcher/ingestion.py` is a thin facade over pmxt:
 
-**Inputs**:
-- Kalshi REST: list open markets for non-sports, non-FOMC series/categories.
-- Polymarket Gamma: list open markets with `active=true`.
-- `.ai_matcher_cache.json` — persistent cache of `{(kalshi_hash, poly_hash): {decision, timestamp, model}}`.
-- `config/manual_overrides.json` — human-curated whitelist (force match) and blacklist (force reject).
+```python
+import pmxt
 
-**Layer 1 — Embeddings**
-- Model: OpenAI `text-embedding-3-small` (cheap, 1536-dim, well-benchmarked). Swappable via env `EMBEDDING_MODEL`.
-- Embedded text: `title + \n + description + \n + resolution_criteria + \n + outcomes_joined`.
-- Content-hash (SHA-256 over the input text) keyed in cache; unchanged markets skip re-embed.
-- Index: `hnswlib` in-memory, rebuilt per run (fast enough for tens of thousands of markets; switch to on-disk `lancedb` if we exceed ~100k).
-- Retrieval: cosine top-K=8 Poly candidates per Kalshi market; configurable threshold `MIN_COSINE=0.55` filters obvious non-matches before reaching the LLM.
+class Ingestion:
+    def __init__(self):
+        self._kalshi = pmxt.Kalshi(api_key=..., api_secret=...)
+        self._poly   = pmxt.Polymarket()
 
-**Layer 2 — LLM verification**
-- Model: Claude `claude-opus-4-7` (or `claude-sonnet-4-6` for cost), structured JSON output.
-- Prompt template (Appendix A) scores **resolution-criteria identity**, not topical similarity — the subtle-definition trap (e.g., "any BTC held" vs. "National BTC Reserve") is called out explicitly in the system prompt.
-- Response schema:
+    def fetch_all(self) -> IngestionResult:
+        kalshi = self._kalshi.fetch_markets()   # list[pmxt.Market]
+        poly   = self._poly.fetch_markets()
+        # If pmxt drops fields we need (e.g. Polymarket condition_id, neg_risk),
+        # fall back to direct REST for those specific fields — documented per-field
+        # below as they are discovered during PR 3 implementation.
+        return IngestionResult(kalshi=kalshi, poly=poly)
+```
+
+**Why facade:** pmxt is pre-1.0 (dependency risk). Everything downstream consumes `IngestionResult` with known fields; if pmxt breaks or omits a field, we change the facade only. Swap-to-direct-REST is a one-day rollback.
+
+**Rate-limit hygiene.** pmxt has its own Kalshi rate limiter. The sidecar and the Rust discovery loop must not hit Kalshi concurrently. Rule: Rust's `DiscoveryClient` runs once at startup + on-demand; sidecar schedules so its runs don't overlap with Rust's. If it becomes a real issue, we share a `kalshi_rate.lock` file.
+
+#### 4.6.2 Layer 1 — Embeddings
+
+- **Model:** OpenAI `text-embedding-3-small` (swappable via `EMBEDDING_MODEL` env). Cheap, 1536-dim.
+- **Input text:** `title + "\n" + description + "\n" + resolution_criteria + "\n" + outcomes_joined`.
+- **Content hash:** SHA-256 over the input text. Stored in `.ai_matcher_cache.json` as the re-embed cache key. Unchanged markets → skip re-embed → ~free incremental runs.
+- **Index:** `hnswlib` in-memory, rebuilt per run. Fine for tens of thousands of markets; move to `lancedb` if >100k.
+- **Retrieval:** for each Kalshi market, top-K=8 Polymarket candidates by cosine similarity. Pre-filter: `MIN_COSINE=0.55` (configurable) strips obvious non-matches before spending LLM tokens.
+
+#### 4.6.3 Layer 2 — LLM Verification
+
+- **Model:** Claude `claude-opus-4-7` by default (swappable; Sonnet 4.6 if cost-sensitive).
+- **Structured output** (enforced via `response_format`):
   ```json
   {
-    "confidence": 0.0,
+    "confidence": 0.97,
     "resolution_match": true,
-    "concerns": ["string"],
-    "reasoning": "string",
-    "category": "Politics"
+    "concerns": [],
+    "reasoning": "Both markets resolve on …",
+    "category": "Economics",
+    "event_type": "Cpi"
   }
   ```
-- Accept iff `confidence ≥ 0.9 AND resolution_match AND len(concerns) == 0`.
-- Cache key: `(kalshi_hash, poly_hash)`. If both sides' hashes are unchanged since the last accepted decision, skip the LLM call.
+- **Cache:** keyed by `(kalshi_content_hash, poly_content_hash, llm_model)`. If both sides' hashes are unchanged since the last accepted decision, skip the LLM call entirely.
+- **Acceptance rule:** `confidence >= 0.9 AND resolution_match AND len(concerns) == 0`. Any rejection, including borderline ones, is still written to the audit log with full reasoning.
+- **Prompt** (Appendix A) is explicit that we are scoring *resolution-criteria identity*, not topical similarity — the trap of "any BTC held" vs "National BTC Reserve" is called out by name.
 
-**Output** — `.ai_matches.json`:
+#### 4.6.4 Human Audit Surface (the critical deliverable)
+
+All three outputs are always produced on every `run`:
+
+**1. `.ai_matches.json`** — machine-readable, consumed by Rust:
 ```json
 {
   "generated_at": "2026-04-21T14:00:00Z",
   "model": "claude-opus-4-7",
   "embedding_model": "text-embedding-3-small",
+  "pmxt_version": "0.7.3",
   "version": 1,
   "pairs": [
     {
-      "kalshi_event_ticker": "KXCPIYOY-26APR",
       "kalshi_market_ticker": "KXCPIYOY-26APR-B3.0",
-      "poly_slug": "cpi-yoy-april-2026-above-3pct",
-      "poly_yes_token": "0x...",
-      "poly_no_token": "0x...",
-      "poly_condition_id": "0x...",
+      "poly_condition_id": "0x…",
+      "poly_yes_token": "0x…",
+      "poly_no_token": "0x…",
       "category": "Economics",
-      "description": "CPI YoY April 2026 > 3.0%",
-      "confidence": 0.97
+      "event_type": "Cpi",
+      "confidence": 0.97,
+      "description": "CPI YoY April 2026 > 3.0%"
     }
   ]
 }
 ```
+Rust's `AiMatcherReader` loads this, filters by freshness (reject if `generated_at` older than `AI_MATCHES_MAX_AGE_SEC`, default 24h), and emits `MarketPair` rows.
 
-The Rust-side reader (`src/matchers/ai.rs`) is deliberately thin: load JSON, filter by freshness (reject if `generated_at` older than configured TTL), emit `MarketPair { match_source: Ai { .. }, .. }`.
+**2. `audit/report.html`** — static HTML, one pair per row, zero JS server required. Generated via Jinja2. Columns per row:
 
-### 4.6 Scheduling
+| Decision | Kalshi side | Polymarket side | LLM analysis | Override action |
+|---|---|---|---|---|
+| ✅ accepted (0.97) | Title, description, resolution criteria, outcomes — each with a `→` link to `kalshi.com/markets/...` | Same, linking to `polymarket.com/event/...` | `confidence`, `concerns[]`, `reasoning` paragraph, parsed `category` and `event_type` | Pre-filled JSON snippet to paste into `manual_overrides.json` for reject/keep |
 
-Python sidecar is invoked by:
-- **Option A (chosen)**: `tokio::spawn` at Rust startup, runs the script as a subprocess on an interval. One Rust process, one cron-like loop. Logged through the same `tracing` infra.
-- Option B (considered, rejected): external cron / systemd timer. Adds deploy complexity; harder to reason about in dev.
+The user opens `audit/report.html` in a browser (`file://`), reads rows side-by-side, and — if they disagree with a decision — copies the pre-filled snippet into `config/manual_overrides.json` (manual JSON editing, as you asked for).
 
-Per-category TTL passed as script argument:
+The report also supports filters rendered as simple HTML anchors (no JS): `report.html?only=accepted`, `?only=rejected`, `?category=economics`, `?confidence_below=0.95`. Filters work by generating separate static files (`report-accepted.html`, `report-rejected.html`, etc.) alongside the main one.
 
-| Category          | Interval  |
-|-------------------|-----------|
-| Macro econ (CPI, NFP, GDP) | 12h |
-| Elections / politics       | 2h  |
-| Crypto hourly              | 15m |
-| Sports                     | n/a (structured matcher) |
-| FOMC                       | n/a (structured matcher) |
+**3. `.ai_matcher_audit.jsonl`** — append-only full decision log (accepted AND rejected), human-grep-able:
+```jsonl
+{"ts":"2026-04-21T14:00:01Z","kalshi":"KXCPIYOY-26APR-B3.0","poly":"0x…","decision":"accept","confidence":0.97,"concerns":[],"reasoning":"…"}
+{"ts":"2026-04-21T14:00:02Z","kalshi":"KXFED-26MAY-T425","poly":"0x…","decision":"reject","confidence":0.62,"concerns":["Different meeting dates"],"reasoning":"…"}
+```
 
-The sidecar reads which categories to process from `config/ai_categories.json`.
+**`config/manual_overrides.json`** — human-authored ground truth:
+```json
+{
+  "version": 1,
+  "whitelist": [
+    { "kalshi_market_ticker": "...", "poly_condition_id": "...",
+      "category": "Politics", "reason": "verified 2026-04-21" }
+  ],
+  "blacklist": [
+    { "kalshi_market_ticker": "...", "poly_condition_id": "...",
+      "reason": "different resolution dates (Kalshi: Jun 5, Poly: Jun 30)" }
+  ]
+}
+```
+Blacklist wins over whitelist wins over AI decision. Sidecar applies overrides in-memory during every `run`; overrides persist across runs because the file is source-controlled.
 
-### 4.7 Safety Gates
+**`python scripts/ai_matcher.py audit --sample 20`** — spot-check workflow. Picks 20 random *accepted* pairs (biased toward low-confidence if available), renders a single-page HTML with each pair expanded, opens it in the browser. Use case: "randomly verify the bot isn't hallucinating matches" — exactly what you asked for.
 
-1. **Confidence floor**: AI pairs below 0.9 never reach `GlobalState`.
-2. **`concerns[]` is a hard reject**: any non-empty concerns → no pair.
-3. **Manual override file**: `config/manual_overrides.json` with `whitelist` (force match) and `blacklist` (force reject) keyed by `(kalshi_market_ticker, poly_condition_id)`. Blacklist wins over whitelist wins over AI.
-4. **Execution gate**: AI-matched pairs are detected but not traded until `EXEC_ALLOW_AI_MATCHES=1`. First week after launch: keep off, eyeball the detection logs, build confidence, then flip.
-5. **Audit log**: every AI decision (accepted *and* rejected) is appended to `.ai_matcher_audit.jsonl` with full reasoning — enables retroactive review and prompt iteration.
-6. **Model version pinning**: embedding + LLM model names are part of the cache key. Changing either invalidates cache, forcing a fresh run. Stored in `.ai_matches.json` metadata.
+**Running the sidecar without the Rust code.** Everything above — ingestion, embeddings, LLM, audit reports, override application — runs purely in Python. The user can inspect the bot's matching *without* trusting any Rust state.
+
+### 4.7 Scheduling
+
+A small scheduler inside `scripts/ai_matcher.py --loop` runs each category on its own TTL:
+
+| Category                      | Interval |
+|-------------------------------|----------|
+| Macro econ (CPI, NFP, GDP)    | 12h      |
+| Elections / politics          | 2h       |
+| Crypto hourly                 | 15m      |
+| Long-tail / other             | 6h       |
+| Sports                        | n/a (structured) |
+| FOMC                          | n/a (structured) |
+
+Categories are listed in `config/ai_categories.json` with their TTLs. A run ticker persists last-run timestamps in `.ai_matcher_schedule.json`.
+
+**Deployment options** (user picks later):
+- Cron / systemd timer running `run --loop` — simplest.
+- `tokio::spawn` subprocess launch from Rust at startup (lost independence benefit — not recommended given the "runnable without Rust" requirement).
+
+Default: user runs `python scripts/ai_matcher.py run --loop` in a separate terminal / tmux pane / systemd unit. This keeps the sidecar cleanly decoupled.
+
+### 4.8 Safety Gates
+
+1. **Confidence floor** (≥0.9) and non-empty `concerns[]` rejection, enforced inside the sidecar.
+2. **Manual override file** wins over any AI decision (blacklist > whitelist > AI).
+3. **Execution gate** `EXEC_ALLOW_AI_MATCHES=0` by default — detector still runs on AI pairs, execution refuses them.
+4. **Freshness gate** in Rust reader — reject `.ai_matches.json` if older than `AI_MATCHES_MAX_AGE_SEC` (default 24h). Protects against stale matches after a long pause.
+5. **Model / embedding version pinning** — cache keys include model names; bumping either invalidates cache. `.ai_matches.json` metadata records which models produced it.
+6. **Audit log retention** — `.ai_matcher_audit.jsonl` is append-only and never auto-pruned. Retained for retrospective review.
+7. **Structured matchers win on collision** — AI pair for the same `kalshi_market_ticker` as a Sports/FOMC pair is discarded during merge, with a log entry.
 
 ---
 
 ## 5. File Changes
 
-**New files**
-- `src/fees.rs` — `PolyCategory`, `category_fee_ppm`, `bps_to_ppm`.
-- `src/matchers/mod.rs` — `MarketMatcher` trait.
-- `src/matchers/sports.rs` — existing sports logic lifted from `discovery.rs`.
-- `src/matchers/fomc.rs` — `FomcMatcher` + anchor resolver.
-- `src/matchers/ai.rs` — reads `.ai_matches.json` produced by sidecar.
-- `scripts/ai_matcher.py` — sidecar orchestrator.
-- `scripts/ai_matcher/embedder.py`, `scripts/ai_matcher/verifier.py`, `scripts/ai_matcher/cache.py` — broken out for testability.
-- `config/ai_categories.json` — which categories run through AI and their TTLs.
-- `config/manual_overrides.json` — whitelist/blacklist.
-- `requirements.txt` (new) or `scripts/requirements.txt` — `anthropic`, `openai`, `hnswlib`, `requests`.
+**New — Rust side**
+- `src/fees.rs` — `PolyCategory`, `category_fee_ppm`, `bps_to_ppm` (calibrated).
+- `src/canonical.rs` — `CanonicalMarket`, `EventType`, `Underlier`, `TimeWindow`, `Venue`.
+- `src/adapters/mod.rs` — `EventAdapter` trait + shared `pair_batch` logic.
+- `src/adapters/sports.rs` — existing discovery logic, refactored to produce `NormalizedBatch`.
+- `src/adapters/fomc.rs` — `FomcAdapter` + FRED anchor resolver.
+- `src/adapters/ai_reader.rs` — loads `.ai_matches.json`, emits `MarketPair`s with freshness check.
 
-**Modified files**
-- `src/types.rs` — `MarketPair` gets `category` and `match_source` fields; fix the "3.00%" comment on `SPORTS_FEE_RATE_PPM`.
+**New — Python sidecar**
+- `scripts/ai_matcher.py` — CLI entrypoint (`run | review | audit | calibrate-fees`).
+- `scripts/ai_matcher/ingestion.py` — pmxt facade.
+- `scripts/ai_matcher/embedder.py` — OpenAI embeddings + hnswlib index + content-hash cache.
+- `scripts/ai_matcher/verifier.py` — Claude structured-output verification + cache.
+- `scripts/ai_matcher/overrides.py` — apply `manual_overrides.json`.
+- `scripts/ai_matcher/report.py` — Jinja2 static HTML generator.
+- `scripts/ai_matcher/scheduler.py` — per-category TTL loop.
+- `scripts/ai_matcher/templates/report.html.j2` — HTML template.
+- `scripts/requirements.txt`.
+- `config/ai_categories.json`.
+- `config/manual_overrides.json` (seeded empty).
+
+**Modified**
+- `src/types.rs` — `MarketPair` gets `category` + `match_source` (both `#[serde(default)]`); fix `SPORTS_FEE_RATE_PPM` comment.
 - `src/config.rs` — add `FomcSource`; existing `LeagueConfig` unchanged.
-- `src/discovery.rs` — becomes an orchestrator of `MarketMatcher` instances. Sports logic moves to `src/matchers/sports.rs` verbatim.
-- `src/main.rs:192-201` — replace the sports-only fee loop with the per-market resolver described in §4.1.
+- `src/discovery.rs` — becomes an orchestrator that runs `EventAdapter`s in parallel, calls `pair_batch`, merges results, and reads `ai_reader`. Sports logic is gone from this file (moved to `adapters/sports.rs`).
+- `src/main.rs:192-201` — per-market fee resolver (§4.1).
+- `src/execution.rs` — one-line AI-execution gate (§4.2).
+- `src/polymarket_clob.rs:635-712` — `feeSchedule` primary path after Task A survey; legacy key loop as fallback.
 - `src/lib.rs` — wire new modules.
-- `.gitignore` — add `.ai_matches.json`, `.ai_matcher_cache.json`, `.ai_matcher_audit.jsonl`.
+- `.gitignore` — `.ai_matches.json`, `.ai_matcher_cache.json`, `.ai_matcher_audit.jsonl`, `.ai_matcher_schedule.json`, `audit/`.
 
 **Untouched**
-- Hot-path trading / execution (`execution.rs`, `polymarket_clob.rs` signing path, WebSocket handlers). The fee field is already `AtomicU32` per-market; we're just populating it smarter.
+- Hot-path trading/execution (WebSocket handlers, orderbook atomics, order signing).
+- Kalshi / Polymarket Rust clients (they continue to serve the Rust discovery + hot path).
 
 ---
 
 ## 6. Failure Modes & Mitigations
 
-| Failure                                         | Detection                             | Mitigation                                                                 |
-|-------------------------------------------------|---------------------------------------|----------------------------------------------------------------------------|
-| CLOB `get_market_meta` times out at startup     | per-call timeout + err log            | Fall back to category-table ppm; continue. One failure ≠ abort.            |
-| FRED anchor unavailable for FOMC                | HTTP error                            | Emit zero FOMC pairs, log error. Never guess anchor.                       |
-| LLM hallucinates a match                        | post-hoc audit log review             | Blacklist via `manual_overrides.json`; confidence threshold; execution gate |
-| Embedding model change silently accepted        | cache version mismatch                | Cache key includes model name; mismatch forces rerun.                      |
-| Definition drift (BTC Reserve vs. any BTC)      | LLM `concerns[]` non-empty → reject   | Prompt explicitly checks resolution criteria, not topic.                   |
-| Python sidecar crashes mid-run                  | exit code ≠ 0 in Rust subprocess hook | Keep prior `.ai_matches.json` in place; alert via `tracing::warn!`.        |
-| Stale `.ai_matches.json` loaded after long pause | file mtime vs. configured TTL         | Rust reader rejects if older than `AI_MATCHES_MAX_AGE_SEC`.                |
-| Duplicate pair across structured + AI matchers  | merge pass                            | Structured wins; AI-only pairs added. Dedupe by `(kalshi_market_ticker, poly_condition_id)`. |
+| Failure | Detection | Mitigation |
+|---|---|---|
+| CLOB `get_market_meta` times out at startup | per-call timeout + err log | Fall back to `category_fee_ppm`; continue. |
+| `feeSchedule` absent on some markets | JSON field missing at runtime | Legacy key loop remains as fallback. |
+| `bps_to_ppm` calibrated wrong | unit test `sports_conversion_is_30k_ppm` fails | Blocking — can't ship PR 1 until green. |
+| FRED anchor unavailable for FOMC | HTTP error | Emit zero FOMC pairs; log error. Never guess anchor. |
+| LLM hallucinates a match | post-hoc review of `audit/report.html` | Blacklist via `manual_overrides.json`; confidence floor; execution gate. |
+| Definition drift (scope mismatch) | LLM `concerns[]` non-empty | Prompt explicitly checks resolution criteria. |
+| pmxt drops a field we need | facade test + manual verify on real markets | Direct-REST fallback in `ingestion.py` for the affected field. |
+| pmxt breaking release | pinned version in `requirements.txt` | Swap-out behind the facade (~1 day of work). |
+| Sidecar crashes mid-run | exit code ≠ 0; partial outputs not swapped in | Atomic rename (`.ai_matches.json.tmp` → `.ai_matches.json`). Prior file stays valid. |
+| Stale `.ai_matches.json` loaded after long pause | `AI_MATCHES_MAX_AGE_SEC` freshness check | Rust reader refuses; logs `warn`. |
+| Duplicate pair across structured + AI | merge pass dedupes by `(kalshi_market_ticker, poly_condition_id)` | Structured wins; AI-only pairs added. |
+| Rust discovery + sidecar both hitting Kalshi | Kalshi 429s | Schedule sidecar outside Rust's discovery window. Add shared lockfile if it recurs. |
+| User edits `manual_overrides.json` while sidecar is mid-run | Sidecar reads overrides at start of run | Current run uses pre-edit state; next run picks up edits. Documented, acceptable. |
 
 ---
 
 ## 7. Rollout Plan
 
-Ship in three independently-valuable PRs, so any can be reverted without the others:
+Three independently-valuable PRs, each reversible without the others:
 
-**PR 1 — Per-category fees** (low risk, immediate correctness win)
-- Introduce `PolyCategory`, fee table, `bps_to_ppm`.
-- Add `category` to `MarketPair` (defaulting to `Sports` for back-compat).
-- Replace `main.rs` loop with CLOB-seeded fees + table fallback.
-- Fix the `types.rs` "3.00%" comment.
-- Sports pipeline keeps working; fee values become more accurate.
+**PR 1 — Per-category fees + `feeSchedule` + canonical schema foundation**
+- Land Tasks A and B (feeSchedule survey + fee-formula calibration) first.
+- Introduce `PolyCategory`, `category_fee_ppm`, calibrated `bps_to_ppm` + unit test.
+- Add `category` + `match_source` to `MarketPair` (serde-defaulted).
+- Replace `main.rs:192-201` fee loop with CLOB-seeded + category fallback.
+- Introduce `src/canonical.rs` types and `EventAdapter` trait (no new adapter yet).
+- Refactor existing sports logic behind `SportsAdapter` — behavior-preserving.
+- Fix `types.rs` "3.00%" comment.
+- **Acceptance:** existing sports discovery produces the same set of `MarketPair`s (same pair_id, tickers, tokens) as the pre-PR cache; pre-existing `.discovery_cache.json` loads cleanly via the new serde defaults; fees match CLOB values on spot-check of 5 markets per category; `SPORTS_FEE_RATE_PPM` callers migrated; `bps_to_ppm` unit test green.
 
-**PR 2 — Matcher trait + FomcMatcher**
-- Extract `SportsMatcher` behind `MarketMatcher` trait (no behavior change).
-- Add `FomcMatcher` with FRED anchor.
-- `DiscoveryClient` runs both matchers in parallel.
-- Gates: detection-only for FOMC pairs for one week, then enable execution.
+**PR 2 — FomcAdapter**
+- Add `FomcAdapter` + FRED anchor resolver + rate-band parser.
+- Wire it into `DiscoveryClient`'s adapter list.
+- **Detection-only** for the first scheduled FOMC meeting: no execution on FOMC pairs (separate env or temporary code gate).
+- **Acceptance:** for the next FOMC meeting, discover N-1 pairs for N Kalshi bands where Polymarket has the intervening delta; anchor correctly resolved from FRED; unmatched tail bands skipped cleanly.
 
-**PR 3 — AI matcher sidecar**
-- `scripts/ai_matcher.py` with embeddings + LLM layers.
-- `src/matchers/ai.rs` reader.
-- `MatchSource::Ai` + `EXEC_ALLOW_AI_MATCHES` gate (default off).
-- Manual overrides file + audit log.
-
-Each PR has acceptance criteria:
-- PR 1: every existing sports market gets the correct fee (verified against CLOB); existing integration behavior unchanged.
-- PR 2: FOMC pairs discovered for next scheduled FOMC meeting; anchor correctly resolved; rate-band join produces N-1 pairs for N Kalshi bands where Poly has the intervening delta.
-- PR 3: sidecar produces JSON, Rust reader loads it; end-to-end dry run on a 50-market sample; at least 1 high-value non-sports pair flows through detection.
+**PR 3 — AI matcher sidecar (standalone, auditable)**
+- `scripts/ai_matcher.py` + submodules.
+- pmxt ingestion facade.
+- Embeddings + LLM pipeline with content-hash cache.
+- `audit/report.html` generator, `manual_overrides.json` application.
+- `src/adapters/ai_reader.rs` + Rust freshness gate.
+- `EXEC_ALLOW_AI_MATCHES=0` default.
+- **Acceptance:** sidecar runnable end-to-end without the Rust bot; produces `report.html` with at least 10 accepted and 10 rejected pairs for inspection; at least one high-value non-sports pair flows through Rust detection (logged, not executed); `audit --sample 20` opens in browser and shows random accepted pairs.
 
 ---
 
 ## 8. Open Questions
 
-1. **Embedding provider** — OpenAI `text-embedding-3-small` vs. Voyage/Cohere. Defaulting to OpenAI on cost/familiarity; swappable.
-2. **FOMC anchor fallback** — if FRED requires an API key the user doesn't want to manage, is there a Kalshi-hosted alternative exposing the current target rate? To resolve during PR 2 implementation.
-3. **AI matcher on sports** — currently excluded. Worth running *as a shadow / verification layer* (disagreement = alert) once PR 3 stabilizes? Deferred.
-4. **Live re-matching of AI pairs** — today matches are loaded at startup. AI pairs change as markets change; do we hot-reload `.ai_matches.json` into `GlobalState` on file change? Deferred; first cut restarts the process.
-5. **Cost ceiling** — should we hard-cap monthly LLM spend with a token-counter kill switch in the sidecar? Likely yes, but tunable after observing real-run costs.
+1. **`feeSchedule` shape.** To resolve in Task A. Sample response JSON will dictate the exact field path.
+2. **Fed anchor via Kalshi metadata.** Does Kalshi's `KXFED` event expose a current-rate field? If yes, we skip FRED; if no, FRED + `FRED_API_KEY` becomes a documented soft-requirement for FOMC.
+3. **pmxt field completeness.** Confirm pmxt exposes Polymarket `condition_id`, neg-risk flag, and full outcome tokens. If any are missing we'll fall through the facade to direct REST for those fields — flag and document per-field during PR 3.
+4. **Long-tail category whitelist.** Which non-structured categories does the AI matcher actually attempt? Start narrow (Politics + Elections + Mentions) to contain cost and audit surface; widen once the review UI is being used.
+5. **AI matcher on sports as a shadow verifier.** Run AI in parallel over sports and alert on disagreement with `SportsAdapter`? Out of scope for PR 3; potentially valuable in follow-up.
+6. **Live hot-reload of AI matches into `GlobalState`.** First cut requires Rust restart. If sidecar cadence becomes tight (e.g. 15m for crypto), revisit.
+7. **Cost ceiling.** Hard-cap monthly LLM token spend with a killswitch in the sidecar? Defer until we see real-run costs; structured-output + content-hash cache should keep it cheap (<$10/mo at initial category scope).
 
 ---
 
@@ -404,10 +602,11 @@ matching, so false positives cost real money.
 Be paranoid about resolution criteria. Two markets that sound similar can
 resolve differently on edge cases. Classic traps:
   - Different resolution dates / windows
-  - Different data sources (e.g., which exchange's BTC price)
+  - Different data sources (e.g., which exchange's BTC price; which BLS series)
   - Qualitative vs. quantitative thresholds with different cutoffs
-  - Definitional scope differences (e.g., "any X" vs. "official X")
+  - Scope differences (e.g., "any X" vs. "official X"; "primary" vs. "general")
   - Inclusive vs. exclusive range boundaries
+  - Different underliers that share a topic (e.g., target rate vs. effective rate)
 
 Respond with a JSON object and nothing else:
 {
@@ -417,21 +616,28 @@ Respond with a JSON object and nothing else:
   "reasoning": "one-paragraph explanation",
   "category": one of ["Sports","Crypto","Economics","Politics","Tech",
                       "Culture","Weather","Finance","Mentions",
-                      "Geopolitical","Unknown"]
+                      "Geopolitical","Unknown"],
+  "event_type": one of ["Sports","Fomc","Cpi","NfpJobs","Election","Other"]
 }
+
+Confidence calibration:
+  0.95–1.0  identical resolution; safe to arbitrage
+  0.85–0.94 very likely identical; flag any concerns
+  0.70–0.84 plausibly identical; concerns must be investigated
+  <0.70     too uncertain; reject
 
 User:
 KALSHI MARKET:
-  Title: {kalshi.title}
-  Description: {kalshi.description}
-  Resolution criteria: {kalshi.resolution_criteria}
-  Outcomes: {kalshi.outcomes}
+  Title:                {kalshi.title}
+  Description:          {kalshi.description}
+  Resolution criteria:  {kalshi.resolution_criteria}
+  Outcomes:             {kalshi.outcomes}
 
 POLYMARKET MARKET:
-  Title: {poly.title}
-  Description: {poly.description}
-  Resolution criteria: {poly.resolution_criteria}
-  Outcomes: {poly.outcomes}
+  Title:                {poly.title}
+  Description:          {poly.description}
+  Resolution criteria:  {poly.resolution_criteria}
+  Outcomes:             {poly.outcomes}
 
 Do these resolve identically? Score accordingly.
 ```
@@ -441,21 +647,32 @@ Do these resolve identically? Score accordingly.
 ## Appendix B — Numeric Examples
 
 **FOMC mapping, April 2026 meeting**
-Anchor: fed funds target 4.25–4.50% (midpoint 4.375%, lower bound 425 bps).
+Anchor: fed funds target lower bound 425 bps (4.25%). Polymarket outcomes resolve relative to anchor.
 
-| Kalshi market       | floor_strike | band (bps) | Poly outcome           | delta (bps) | Match? |
-|---------------------|--------------|------------|------------------------|-------------|--------|
-| `KXFED-26APR-T375`  | 3.75         | 375        | "50 bps decrease"      | −50         | ✅     |
-| `KXFED-26APR-T400`  | 4.00         | 400        | "25 bps decrease"      | −25         | ✅     |
-| `KXFED-26APR-T425`  | 4.25         | 425        | "No change"            |   0         | ✅     |
-| `KXFED-26APR-T450`  | 4.50         | 450        | "25 bps increase"      | +25         | ✅     |
-| `KXFED-26APR-T475`  | 4.75         | 475        | (no outcome)           | —           | ❌ skip |
+| Kalshi market       | floor_strike | floor_bps | Poly outcome        | delta | Match? |
+|---------------------|--------------|-----------|---------------------|-------|--------|
+| `KXFED-26APR-T375`  | 3.75         | 375       | "50 bps decrease"   | −50   | ✅     |
+| `KXFED-26APR-T400`  | 4.00         | 400       | "25 bps decrease"   | −25   | ✅     |
+| `KXFED-26APR-T425`  | 4.25         | 425       | "No change"         |   0   | ✅     |
+| `KXFED-26APR-T450`  | 4.50         | 450       | "25 bps increase"   | +25   | ✅     |
+| `KXFED-26APR-T475`  | 4.75         | 475       | (no outcome)        |   —   | ❌ skip |
 
-**Fee sanity check**
-A 50¢ FOMC market with the old sports rate (30,000 ppm, 0.75% peak):
-- fee per dollar = 30,000 × 50 × 50 / 100,000,000 = 0.75¢
+**Fee impact at 50¢ market price**
 
-Same market at the correct Economics rate (60,000 ppm, 1.50% peak):
-- fee per dollar = 60,000 × 50 × 50 / 100,000,000 = 1.50¢
+| Rate                      | ppm    | fee/$ at p=0.5 |
+|---------------------------|--------|----------------|
+| Sports (0.75% peak)       | 30,000 | 0.75¢          |
+| Economics (1.50% peak)    | 60,000 | 1.50¢          |
+| Crypto (1.80% peak)       | 72,000 | 1.80¢          |
 
-Delta: **0.75¢ per Polymarket leg** at p=0.5. For a cross-platform arb (one Poly leg + one Kalshi leg) the detector would under-estimate total cost by 0.75¢/$ — any detected arb with <0.75¢ of modeled profit is actually a loss. For a Poly-only arb (both legs on Polymarket), the under-estimate doubles to 1.5¢/$. At `ARB_THRESHOLD = 0.995` (0.5¢ of modeled profit) the current threshold has zero headroom for this error, so PR 1 is a correctness fix, not just hygiene.
+**Impact at `ARB_THRESHOLD = 0.995` (0.5¢ modeled profit).** Using the Sports rate on an Economics market under-estimates fee by 0.75¢/$ per Polymarket leg. A cross-platform arb (one Poly + one Kalshi leg) would show 0.5¢ of modeled profit while actually costing 0.25¢ — *a guaranteed loss*. PR 1 is a correctness fix.
+
+---
+
+## Appendix C — pmxt Risk Mitigations
+
+- **Pin** exact version in `scripts/requirements.txt` (e.g. `pmxt==0.7.3`). No `^` or `~` ranges.
+- **Facade** in `scripts/ai_matcher/ingestion.py` — all downstream code consumes a stable internal dataclass, not pmxt types directly.
+- **Facade contract test** — a small fixture-based test (`scripts/tests/test_ingestion.py`) that snapshot-tests the shape of `IngestionResult` for a handful of markets. If pmxt changes behavior, the test catches it before a run hits production.
+- **Direct-REST fallback** — for any field pmxt doesn't surface (discovered during PR 3), `ingestion.py` enriches via direct `requests.get` calls. The facade boundary stays stable.
+- **Swap-out time estimate** — ~1 day to replace pmxt with direct Kalshi + Gamma REST calls inside the facade. Acceptable dependency risk given the code we save.
