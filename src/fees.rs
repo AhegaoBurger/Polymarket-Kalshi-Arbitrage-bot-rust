@@ -9,6 +9,8 @@
 //! as of April 2026; the CLOB remains the source of truth when available
 //! (see `bps_to_ppm`).
 
+use std::sync::Arc;
+
 use serde::{Deserialize, Serialize};
 
 /// Polymarket market category. Drives the fallback fee table when the per-market
@@ -72,6 +74,26 @@ pub fn bps_to_ppm(bps: i64) -> u32 {
         return 0;
     }
     (bps as u32).saturating_mul(K)
+}
+
+/// Provenance of a matched MarketPair — which component matched it.
+#[derive(Debug, Clone, Serialize, Deserialize)]
+#[serde(tag = "kind", rename_all = "snake_case")]
+pub enum MatchSource {
+    /// Produced by a deterministic adapter (sports, fomc, etc).
+    Structured { adapter: String },
+    /// Produced by the AI matcher sidecar.
+    Ai { confidence: f32, model: Arc<str> },
+    /// Manually curated via config/manual_overrides.json.
+    ManualOverride,
+}
+
+impl Default for MatchSource {
+    fn default() -> Self {
+        // Existing .discovery_cache.json files predate this field and
+        // all current entries are sports-structured.
+        MatchSource::Structured { adapter: "sports".to_string() }
+    }
 }
 
 #[cfg(test)]
@@ -149,5 +171,32 @@ mod tests {
     #[test]
     fn default_category_is_sports() {
         assert_eq!(PolyCategory::default(), PolyCategory::Sports);
+    }
+
+    #[test]
+    fn match_source_serializes_with_tag() {
+        let m = MatchSource::Structured { adapter: "sports".into() };
+        let s = serde_json::to_string(&m).unwrap();
+        assert!(s.contains("\"kind\":\"structured\""), "got: {}", s);
+        assert!(s.contains("\"adapter\":\"sports\""), "got: {}", s);
+    }
+
+    #[test]
+    fn match_source_round_trips() {
+        let m = MatchSource::Ai {
+            confidence: 0.97,
+            model: Arc::from("claude-opus-4-7"),
+        };
+        let s = serde_json::to_string(&m).unwrap();
+        let back: MatchSource = serde_json::from_str(&s).unwrap();
+        assert!(matches!(back, MatchSource::Ai { .. }));
+    }
+
+    #[test]
+    fn match_source_default_is_sports_structured() {
+        match MatchSource::default() {
+            MatchSource::Structured { adapter } => assert_eq!(adapter, "sports"),
+            _ => panic!("expected Structured default"),
+        }
     }
 }

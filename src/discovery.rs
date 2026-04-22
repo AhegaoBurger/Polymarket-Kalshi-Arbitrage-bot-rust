@@ -446,6 +446,8 @@ impl DiscoveryClient {
                                 poly_condition_id: condition_id.into(),
                                 line_value: task.market.floor_strike,
                                 team_suffix: team_suffix.map(|s| s.into()),
+                                category: crate::fees::PolyCategory::default(),
+                                match_source: crate::fees::MatchSource::default(),
                             })
                         }
                         Ok(None) => None,

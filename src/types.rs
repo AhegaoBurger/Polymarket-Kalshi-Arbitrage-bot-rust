@@ -7,6 +7,7 @@ use serde::{Deserialize, Serialize};
 use std::sync::atomic::{AtomicU32, AtomicU64, Ordering};
 use std::sync::Arc;
 use rustc_hash::FxHashMap;
+use crate::fees::{PolyCategory, MatchSource};
 
 /// Polymarket taker fee rate in parts-per-million for the Sports category.
 /// 30_000 ppm yields a peak fee of 0.75¢ per $1 contract at p=0.5 — matching
@@ -69,6 +70,13 @@ pub struct MarketPair {
     pub line_value: Option<f64>,
     /// Team suffix for team-specific markets
     pub team_suffix: Option<Arc<str>>,
+    /// Market category — drives Polymarket fee lookup when CLOB meta is
+    /// unavailable. Defaults to Sports for back-compat with pre-PR-1 caches.
+    #[serde(default)]
+    pub category: PolyCategory,
+    /// Who matched this pair. Defaults to `Structured { adapter: "sports" }`.
+    #[serde(default)]
+    pub match_source: MatchSource,
 }
 
 /// Price representation in cents (1-99 for $0.01-$0.99), 0 indicates no price available
@@ -941,6 +949,8 @@ mod tests {
             poly_condition_id: format!("cond_{}", id).into(),
             line_value: None,
             team_suffix: None,
+            category: PolyCategory::default(),
+            match_source: MatchSource::default(),
         }
     }
 
@@ -1225,6 +1235,8 @@ mod tests {
             poly_condition_id: "cond_cfc".into(),
             line_value: None,
             team_suffix: Some("CFC".into()),
+            category: PolyCategory::default(),
+            match_source: MatchSource::default(),
         };
 
         let poly_yes_token = pair.poly_yes_token.clone();
@@ -1311,6 +1323,36 @@ mod tests {
         assert!(k_no > 0 && k_no < 100);
         assert!(p_yes > 0 && p_yes < 100);
         assert!(p_no > 0 && p_no < 100);
+    }
+
+    #[test]
+    fn market_pair_deserializes_pre_pr1_cache() {
+        // Pre-PR-1 cache entries lacked `category` and `match_source`.
+        // Both must default via #[serde(default)] so existing caches
+        // load without a wipe.
+        let legacy = r#"{
+            "pair_id": "test-pair",
+            "league": "epl",
+            "market_type": "Moneyline",
+            "description": "Test",
+            "kalshi_event_ticker": "KXEPLGAME-25DEC27CFCAVL",
+            "kalshi_market_ticker": "KXEPLGAME-25DEC27CFCAVL-CFC",
+            "poly_slug": "epl-cfc-avl-2025-12-27-cfc",
+            "poly_yes_token": "0xabc",
+            "poly_no_token": "0xdef",
+            "poly_condition_id": "0xcond",
+            "line_value": null,
+            "team_suffix": "CFC"
+        }"#;
+        let pair: MarketPair = serde_json::from_str(legacy)
+            .expect("legacy cache entry must deserialize with defaulted fields");
+        assert_eq!(pair.category, crate::fees::PolyCategory::Sports);
+        match pair.match_source {
+            crate::fees::MatchSource::Structured { adapter } => {
+                assert_eq!(adapter, "sports");
+            }
+            other => panic!("expected Structured default, got {:?}", other),
+        }
     }
 }
 
