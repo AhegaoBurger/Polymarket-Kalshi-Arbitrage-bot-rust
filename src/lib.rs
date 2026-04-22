@@ -5,6 +5,7 @@
 
 pub mod balance;
 pub mod cache;
+pub mod canonical;
 pub mod circuit_breaker;
 pub mod config;
 pub mod discovery;

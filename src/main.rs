@@ -24,6 +24,7 @@
 
 mod balance;
 mod cache;
+mod canonical;
 mod circuit_breaker;
 mod config;
 mod discovery;
