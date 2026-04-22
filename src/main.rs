@@ -28,6 +28,7 @@ mod circuit_breaker;
 mod config;
 mod discovery;
 mod execution;
+mod fees;
 mod kalshi;
 mod polymarket;
 mod polymarket_clob;
