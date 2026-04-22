@@ -10,6 +10,7 @@ repository = "https://github.com/terauss/prediction-market-arbitrage"
 
 [dependencies]
 anyhow = "1.0"
+async-trait = "0.1"
 base64 = "0.22"
 chrono = { version = "0.4", features = ["serde"] }
 dotenvy = "0.15"

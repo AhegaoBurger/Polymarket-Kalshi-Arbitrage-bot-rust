@@ -22,6 +22,7 @@
 //! - **Circuit breaker protection** with configurable risk limits
 //! - **Market discovery system** with intelligent caching and incremental updates
 
+mod adapters;
 mod balance;
 mod cache;
 mod canonical;
