@@ -8,11 +8,12 @@ use std::sync::atomic::{AtomicU32, AtomicU64, Ordering};
 use std::sync::Arc;
 use rustc_hash::FxHashMap;
 
-/// Polymarket taker fee rate in parts-per-million for Sports category (3.00% = 30_000 ppm).
-/// Every market tracked by this bot is a sports league, so we hardcode this instead of
-/// fetching per-market. Polymarket's effective fee is probability-scaled:
-///   fee_USD = rate × p × (1-p)  (per $1 contract)
-/// which peaks at p=0.5 (≈¢0.75 here) and falls to zero at the edges.
+/// Polymarket taker fee rate in parts-per-million for the Sports category.
+/// 30_000 ppm yields a peak fee of 0.75¢ per $1 contract at p=0.5 — matching
+/// Polymarket's published Sports rate (0.75%). The probability-scaled formula
+/// `rate × p × (1-p) / 1e8` peaks at p=0.5 and falls to zero at the edges
+/// (see `poly_fee_cents`). For other categories use `fees::category_fee_ppm`;
+/// for per-market CLOB-sourced rates use `fees::bps_to_ppm`.
 pub const SPORTS_FEE_RATE_PPM: u32 = 30_000;
 
 // === Market Types ===
@@ -695,7 +696,7 @@ mod tests {
 
     #[test]
     fn test_poly_fee_cents_sports_formula() {
-        let r = SPORTS_FEE_RATE_PPM; // 30_000 ppm (3.00%)
+        let r = SPORTS_FEE_RATE_PPM; // 30_000 ppm → 0.75% peak fee
 
         // p=0.50 → rate × 0.5 × 0.5 = 0.0075 $/contract = 0.75¢ → ceil 1¢
         assert_eq!(poly_fee_cents(50, r), 1);
