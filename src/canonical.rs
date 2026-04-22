@@ -44,12 +44,20 @@ pub enum Underlier {
     },
     FomcRateBand {
         meeting_date: NaiveDate,
+        /// Target-rate lower bound in basis points (4.25% → 425).
+        /// Integer-keyed to preserve Hash/Eq; do not regress to f32/f64.
         floor_bps: i32,
     },
     CpiValue {
         release_date: NaiveDate,
         series: CpiSeries,
-        threshold_hundredths: i32,  // 3.15% → 315; avoids f32 Hash issues
+        /// Primary threshold in hundredths of a percent (3.15% → 315).
+        /// Integer-keyed to preserve Hash/Eq; do not regress to f32/f64.
+        threshold_hundredths: i32,
+        /// Upper bound, set iff `cmp == Comparison::Between`.
+        /// For `Above`/`Below`, always `None`. This avoids the single-threshold
+        /// ambiguity an eventual CpiAdapter would otherwise face.
+        threshold_hundredths_upper: Option<i32>,
         cmp: Comparison,
     },
     ElectionCandidate {
@@ -142,9 +150,35 @@ mod tests {
             release_date: date,
             series: CpiSeries::HeadlineYoY,
             threshold_hundredths: 315,
+            threshold_hundredths_upper: None,
             cmp: Comparison::Above,
         };
         let b = a.clone();
         assert_eq!(a, b);
+    }
+
+    #[test]
+    fn cpi_between_requires_both_thresholds() {
+        // Guards against the single-threshold ambiguity for Comparison::Between.
+        // "CPI between 3.00% and 3.50%" must encode both bounds; any adapter
+        // that forgets threshold_hundredths_upper breaks the join.
+        let date = NaiveDate::from_ymd_opt(2026, 4, 10).unwrap();
+        let between = Underlier::CpiValue {
+            release_date: date,
+            series: CpiSeries::HeadlineYoY,
+            threshold_hundredths: 300,
+            threshold_hundredths_upper: Some(350),
+            cmp: Comparison::Between,
+        };
+        let bad_missing_upper = Underlier::CpiValue {
+            release_date: date,
+            series: CpiSeries::HeadlineYoY,
+            threshold_hundredths: 300,
+            threshold_hundredths_upper: None,
+            cmp: Comparison::Between,
+        };
+        // Different upper bounds → different canonical keys → different pairs.
+        // This is the invariant CpiAdapter must respect.
+        assert_ne!(between, bad_missing_upper);
     }
 }
