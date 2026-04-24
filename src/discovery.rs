@@ -13,6 +13,9 @@ use std::time::{SystemTime, UNIX_EPOCH};
 use tokio::sync::Semaphore;
 use tracing::{info, warn};
 
+use crate::adapters::sports::{
+    extract_team_suffix, kalshi_date_to_iso, parse_kalshi_event_ticker, ParsedKalshiTicker,
+};
 use crate::cache::TeamCache;
 use crate::config::{LeagueConfig, get_league_configs, get_league_config};
 use crate::kalshi::KalshiApiClient;
@@ -526,151 +529,8 @@ impl DiscoveryClient {
     }
 }
 
-// === Helpers ===
-
-#[derive(Debug, Clone)]
-struct ParsedKalshiTicker {
-    date: String,  // "25DEC27"
-    team1: String, // "CFC"
-    team2: String, // "AVL"
-}
-
-/// Parse Kalshi event ticker like "KXEPLGAME-25DEC27CFCAVL" or "KXNCAAFGAME-25DEC27M-OHFRES"
-fn parse_kalshi_event_ticker(ticker: &str) -> Option<ParsedKalshiTicker> {
-    let parts: Vec<&str> = ticker.split('-').collect();
-    if parts.len() < 2 {
-        return None;
-    }
-
-    // Handle two formats:
-    // 1. "KXEPLGAME-25DEC27CFCAVL" - date+teams in parts[1]
-    // 2. "KXNCAAFGAME-25DEC27M-OHFRES" - date in parts[1], teams in parts[2]
-    let (date, teams_part) = if parts.len() >= 3 && parts[2].len() >= 4 {
-        // Format 2: 3-part ticker with separate teams section
-        // parts[1] is like "25DEC27M" (date + optional suffix)
-        let date_part = parts[1];
-        let date = if date_part.len() >= 7 {
-            date_part[..7].to_uppercase()
-        } else {
-            return None;
-        };
-        (date, parts[2])
-    } else {
-        // Format 1: 2-part ticker with combined date+teams
-        let date_teams = parts[1];
-        // Minimum: 7 (date) + 2 + 2 (min team codes) = 11
-        if date_teams.len() < 11 {
-            return None;
-        }
-        let date = date_teams[..7].to_uppercase();
-        let teams = &date_teams[7..];
-        (date, teams)
-    };
-
-    // Split team codes - try to find the best split point
-    // Team codes range from 2-4 chars (e.g., OM, CFC, FRES)
-    let (team1, team2) = split_team_codes(teams_part);
-
-    Some(ParsedKalshiTicker { date, team1, team2 })
-}
-
-/// Split a combined team string into two team codes
-/// Tries multiple split strategies based on string length
-fn split_team_codes(teams: &str) -> (String, String) {
-    let len = teams.len();
-
-    // For 6 chars, could be 3+3, 2+4, or 4+2
-    // For 5 chars, could be 2+3 or 3+2
-    // For 4 chars, must be 2+2
-    // For 7 chars, could be 3+4 or 4+3
-    // For 8 chars, could be 4+4, 3+5, 5+3
-
-    match len {
-        4 => (teams[..2].to_uppercase(), teams[2..].to_uppercase()),
-        5 => {
-            // Prefer 2+3 (common for OM+ASM, OL+PSG)
-            (teams[..2].to_uppercase(), teams[2..].to_uppercase())
-        }
-        6 => {
-            // Check if it looks like 2+4 pattern (e.g., OHFRES = OH+FRES)
-            // Common 2-letter codes: OM, OL, OH, SF, LA, NY, KC, TB, etc.
-            let first_two = &teams[..2].to_uppercase();
-            if is_likely_two_letter_code(first_two) {
-                (first_two.clone(), teams[2..].to_uppercase())
-            } else {
-                // Default to 3+3
-                (teams[..3].to_uppercase(), teams[3..].to_uppercase())
-            }
-        }
-        7 => {
-            // Could be 3+4 or 4+3 - prefer 3+4
-            (teams[..3].to_uppercase(), teams[3..].to_uppercase())
-        }
-        _ if len >= 8 => {
-            // 4+4 or longer
-            (teams[..4].to_uppercase(), teams[4..].to_uppercase())
-        }
-        _ => {
-            let mid = len / 2;
-            (teams[..mid].to_uppercase(), teams[mid..].to_uppercase())
-        }
-    }
-}
-
-/// Check if a 2-letter code is a known/likely team abbreviation
-fn is_likely_two_letter_code(code: &str) -> bool {
-    matches!(
-        code,
-        // European football (Ligue 1, etc.)
-        "OM" | "OL" | "FC" |
-        // US sports common abbreviations
-        "OH" | "SF" | "LA" | "NY" | "KC" | "TB" | "GB" | "NE" | "NO" | "LV" |
-        // Generic short codes
-        "BC" | "SC" | "AC" | "AS" | "US"
-    )
-}
-
-/// Convert Kalshi date "25DEC27" to ISO "2025-12-27"
-fn kalshi_date_to_iso(kalshi_date: &str) -> String {
-    if kalshi_date.len() != 7 {
-        return kalshi_date.to_string();
-    }
-    
-    let year = format!("20{}", &kalshi_date[..2]);
-    let month = match &kalshi_date[2..5].to_uppercase()[..] {
-        "JAN" => "01", "FEB" => "02", "MAR" => "03", "APR" => "04",
-        "MAY" => "05", "JUN" => "06", "JUL" => "07", "AUG" => "08",
-        "SEP" => "09", "OCT" => "10", "NOV" => "11", "DEC" => "12",
-        _ => "01",
-    };
-    let day = &kalshi_date[5..7];
-    
-    format!("{}-{}-{}", year, month, day)
-}
-
-/// Extract team suffix from market ticker (e.g., "KXEPLGAME-25DEC27CFCAVL-CFC" -> "CFC")
-fn extract_team_suffix(ticker: &str) -> Option<String> {
-    let mut splits = ticker.splitn(3, '-');
-    splits.next()?; // series
-    splits.next()?; // event
-    splits.next().map(|s| s.to_uppercase())
-}
-
-#[cfg(test)]
-mod tests {
-    use super::*;
-    
-    #[test]
-    fn test_parse_kalshi_ticker() {
-        let parsed = parse_kalshi_event_ticker("KXEPLGAME-25DEC27CFCAVL").unwrap();
-        assert_eq!(parsed.date, "25DEC27");
-        assert_eq!(parsed.team1, "CFC");
-        assert_eq!(parsed.team2, "AVL");
-    }
-    
-    #[test]
-    fn test_kalshi_date_to_iso() {
-        assert_eq!(kalshi_date_to_iso("25DEC27"), "2025-12-27");
-        assert_eq!(kalshi_date_to_iso("25JAN01"), "2025-01-01");
-    }
-}
+// Helpers (parse_kalshi_event_ticker, extract_team_suffix, kalshi_date_to_iso,
+// ParsedKalshiTicker, split_team_codes, is_likely_two_letter_code) have moved
+// to crate::adapters::sports. They are imported at the top of this file.
+// Task 9 will rewire DiscoveryClient to drive SportsAdapter directly and
+// remove these imports.
