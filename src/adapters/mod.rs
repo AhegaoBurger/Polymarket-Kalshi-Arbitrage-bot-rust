@@ -42,6 +42,13 @@ pub trait EventAdapter: Send + Sync {
 /// - `Underlier::Other` never produces pairs — AI-matched markets flow through
 ///   a separate reader (PR 3). This guard is the T6-flagged trap-door fix.
 /// - `MatchSource` on every emitted pair is `Structured { adapter: adapter_name }`.
+/// Convenience wrapper: threads `adapter.name()` into `pair_batch` so callers
+/// can't accidentally pass a name that drifts from what the adapter reports.
+/// Prefer this over `pair_batch` when you already hold a `&dyn EventAdapter`.
+pub fn pair_batch_from(adapter: &dyn EventAdapter, batch: NormalizedBatch) -> Vec<MarketPair> {
+    pair_batch(batch, adapter.name())
+}
+
 pub fn pair_batch(batch: NormalizedBatch, adapter_name: &'static str) -> Vec<MarketPair> {
     let mut poly_by_key: FxHashMap<(EventType, Underlier), &CanonicalMarket> =
         FxHashMap::default();
@@ -74,18 +81,35 @@ pub fn pair_batch(batch: NormalizedBatch, adapter_name: &'static str) -> Vec<Mar
 
 /// Construct a `MarketPair` from matched Kalshi and Polymarket `CanonicalMarket`s.
 /// Returns `None` if any required venue field is missing (defensive; a properly
-/// constructed adapter should never return `None`).
+/// constructed adapter should never return `None`). Each missing field emits a
+/// `debug!` line naming the specific field so an adapter bug is traceable
+/// instead of silently producing fewer pairs than expected.
 fn build_pair(
     k: &CanonicalMarket,
     p: &CanonicalMarket,
     adapter_name: &'static str,
 ) -> Option<MarketPair> {
-    let kalshi_market_ticker = k.venue.kalshi_market_ticker.clone()?;
-    let kalshi_event_ticker = k.venue.kalshi_event_ticker.clone()?;
-    let poly_slug = p.venue.poly_slug.clone()?;
-    let poly_yes_token = p.venue.poly_yes_token.clone()?;
-    let poly_no_token = p.venue.poly_no_token.clone()?;
-    let poly_condition_id = p.venue.poly_condition_id.clone()?;
+    macro_rules! required {
+        ($opt:expr, $field:literal) => {
+            match $opt.clone() {
+                Some(v) => v,
+                None => {
+                    debug!(
+                        adapter = adapter_name,
+                        field = $field,
+                        "build_pair: missing venue field — adapter bug, dropping pair"
+                    );
+                    return None;
+                }
+            }
+        };
+    }
+    let kalshi_market_ticker = required!(k.venue.kalshi_market_ticker, "kalshi_market_ticker");
+    let kalshi_event_ticker  = required!(k.venue.kalshi_event_ticker,  "kalshi_event_ticker");
+    let poly_slug            = required!(p.venue.poly_slug,            "poly_slug");
+    let poly_yes_token       = required!(p.venue.poly_yes_token,       "poly_yes_token");
+    let poly_no_token        = required!(p.venue.poly_no_token,        "poly_no_token");
+    let poly_condition_id    = required!(p.venue.poly_condition_id,    "poly_condition_id");
 
     let (market_type, line_value, team_suffix, league) = legacy_shape_fields(&k.underlier);
 
@@ -233,6 +257,23 @@ mod tests {
     fn pair_batch_empty_input_yields_empty_output() {
         let batch = NormalizedBatch { kalshi: vec![], poly: vec![] };
         assert!(pair_batch(batch, "sports").is_empty());
+    }
+
+    #[test]
+    fn pair_batch_drops_unmatched_poly_side() {
+        // Poly has a market with no Kalshi counterpart — must be silently
+        // dropped. The join iterates Kalshi and looks up Poly; poly-only
+        // entries are implicitly excluded. This test documents that intent.
+        let mut p = mk_canon_sports(Platform::Polymarket, "0xy", "0xn");
+        if let Underlier::SportsGame { ref mut home, .. } = p.underlier {
+            *home = "LIV".into();
+        }
+        let batch = NormalizedBatch {
+            kalshi: vec![mk_canon_sports(Platform::Kalshi, "", "")],
+            poly: vec![p],
+        };
+        let pairs = pair_batch(batch, "sports");
+        assert!(pairs.is_empty(), "poly-only entries must drop");
     }
 
     #[test]
