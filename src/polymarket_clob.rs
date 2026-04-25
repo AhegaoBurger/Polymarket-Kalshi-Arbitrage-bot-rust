@@ -655,31 +655,54 @@ impl PolymarketAsyncClient {
             );
         }
 
-        // Polymarket's CLOB has used several names for the taker fee over time.
-        // We try snake_case, camelCase, and the legacy base-fee names. Values may
-        // arrive as either a number or a string — handle both.
-        let fee_keys = [
-            "taker_base_fee",
-            "takerBaseFee",
-            "taker_fee_rate_bps",
-            "takerFeeRateBps",
-            "fee_rate_bps",
-            "feeRateBps",
-            "taker_fee",
-            "takerFee",
-        ];
+        // Fee extraction has two paths:
+        //   1. Structured `feeSchedule` object (forward-compat per March 2026
+        //      Polymarket reporting; absent on all April 2026 surveyed markets
+        //      — see docs/notes/2026-04-21-polymarket-fee-survey.md).
+        //   2. Flat legacy keys; `taker_base_fee` is the only one observed live.
+        // Values may arrive as number or string — handle both.
         let mut fee: Option<i64> = None;
-        let mut matched_key: Option<&str> = None;
-        for k in fee_keys {
-            if let Some(n) = val[k].as_i64() {
-                fee = Some(n);
-                matched_key = Some(k);
-                break;
+        let mut matched_key: Option<String> = None;
+
+        if let Some(fs) = val.get("feeSchedule").or_else(|| val.get("fee_schedule")) {
+            for k in ["takerBaseFee", "taker_base_fee", "takerFee", "taker_fee"] {
+                if let Some(n) = fs.get(k).and_then(|v| v.as_i64()) {
+                    fee = Some(n);
+                    matched_key = Some(format!("feeSchedule.{}", k));
+                    break;
+                }
+                if let Some(n) = fs.get(k)
+                    .and_then(|v| v.as_str())
+                    .and_then(|s| s.parse::<i64>().ok())
+                {
+                    fee = Some(n);
+                    matched_key = Some(format!("feeSchedule.{}", k));
+                    break;
+                }
             }
-            if let Some(n) = val[k].as_str().and_then(|s| s.parse::<i64>().ok()) {
-                fee = Some(n);
-                matched_key = Some(k);
-                break;
+        }
+        if fee.is_none() {
+            let legacy_keys = [
+                "taker_base_fee",
+                "takerBaseFee",
+                "taker_fee_rate_bps",
+                "takerFeeRateBps",
+                "fee_rate_bps",
+                "feeRateBps",
+                "taker_fee",
+                "takerFee",
+            ];
+            for k in legacy_keys {
+                if let Some(n) = val[k].as_i64() {
+                    fee = Some(n);
+                    matched_key = Some(k.to_string());
+                    break;
+                }
+                if let Some(n) = val[k].as_str().and_then(|s| s.parse::<i64>().ok()) {
+                    fee = Some(n);
+                    matched_key = Some(k.to_string());
+                    break;
+                }
             }
         }
 
@@ -700,8 +723,11 @@ impl PolymarketAsyncClient {
                 // market fee produces the 400 "invalid fee rate" error we've been
                 // chasing. Better to fail the single order than spam bad signatures.
                 tracing::warn!(
-                    "[POLYMARKET] fetch_market_meta {}: no known taker-fee key in response (tried {:?}); raw={}",
-                    condition_id, fee_keys, val
+                    "[POLYMARKET] fetch_market_meta {}: no known taker-fee key in response \
+                     (checked feeSchedule.{{taker_base_fee,takerBaseFee,taker_fee,takerFee}} \
+                     and flat taker_base_fee/takerBaseFee/taker_fee_rate_bps/takerFeeRateBps/\
+                     fee_rate_bps/feeRateBps/taker_fee/takerFee); raw={}",
+                    condition_id, val
                 );
                 anyhow::bail!(
                     "fetch_market_meta {}: no taker-fee key found (see logged response)",
@@ -932,4 +958,72 @@ pub struct PolyFillAsync {
     pub order_id: String,
     pub filled_size: f64,
     pub fill_cost: f64,
+}
+
+#[cfg(test)]
+mod meta_parse_tests {
+    //! Unit tests for the fee-key extraction logic in `fetch_market_meta`.
+    //!
+    //! Reproduces the parsing precedence (`feeSchedule` first, legacy keys
+    //! second) against synthetic JSON. If this drifts from the live
+    //! `fetch_market_meta` body, a future change will fail to update both
+    //! and the next forward-compat survey will catch it.
+    use serde_json::json;
+
+    fn parse_fee(val: &serde_json::Value) -> Option<i64> {
+        if let Some(fs) = val.get("feeSchedule").or_else(|| val.get("fee_schedule")) {
+            for k in ["takerBaseFee", "taker_base_fee", "takerFee", "taker_fee"] {
+                if let Some(n) = fs.get(k).and_then(|v| v.as_i64()) { return Some(n); }
+                if let Some(n) = fs.get(k).and_then(|v| v.as_str())
+                    .and_then(|s| s.parse::<i64>().ok()) { return Some(n); }
+            }
+        }
+        for k in ["taker_base_fee","takerBaseFee","taker_fee_rate_bps","takerFeeRateBps",
+                  "fee_rate_bps","feeRateBps","taker_fee","takerFee"]
+        {
+            if let Some(n) = val.get(k).and_then(|v| v.as_i64()) { return Some(n); }
+            if let Some(n) = val.get(k).and_then(|v| v.as_str())
+                .and_then(|s| s.parse::<i64>().ok()) { return Some(n); }
+        }
+        None
+    }
+
+    #[test]
+    fn fee_schedule_preferred_over_legacy() {
+        let v = json!({ "feeSchedule": { "takerBaseFee": 75 }, "takerBaseFee": 0 });
+        assert_eq!(parse_fee(&v), Some(75));
+    }
+
+    #[test]
+    fn legacy_used_when_no_schedule() {
+        // Today's actual surveyed shape: feeSchedule absent, taker_base_fee present.
+        let v = json!({ "taker_base_fee": 1000, "feeSchedule": null });
+        assert_eq!(parse_fee(&v), Some(1000));
+    }
+
+    #[test]
+    fn fee_as_string_parses() {
+        let v = json!({ "feeSchedule": { "takerBaseFee": "75" } });
+        assert_eq!(parse_fee(&v), Some(75));
+    }
+
+    #[test]
+    fn snake_case_fee_schedule_variant_accepted() {
+        let v = json!({ "fee_schedule": { "taker_base_fee": 60 } });
+        assert_eq!(parse_fee(&v), Some(60));
+    }
+
+    #[test]
+    fn missing_fee_returns_none() {
+        let v = json!({ "unrelated": 42 });
+        assert_eq!(parse_fee(&v), None);
+    }
+
+    #[test]
+    fn zero_fee_legacy_recognized() {
+        // Politics markets in the 2026-04-21 survey returned taker_base_fee: 0.
+        // Zero is a valid fee value, not "missing".
+        let v = json!({ "taker_base_fee": 0 });
+        assert_eq!(parse_fee(&v), Some(0));
+    }
 }
