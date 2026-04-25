@@ -190,19 +190,46 @@ async fn main() -> Result<()> {
         s
     });
 
-    // Set Polymarket taker-fee rate on every market for the arb detector.
-    // Every tracked league is a sports market, so we hardcode Sports = 30_000 ppm (3.00%).
-    // The detector applies the probability-scaled formula `rate × p × (1-p)` at check time.
-    // (The order-signing path fetches the exact per-market fee via CLOB meta lazily —
-    //  see PolymarketClob::get_market_meta — this hardcode only affects detection.)
+    // Seed each market's detector-side Polymarket taker-fee from the CLOB
+    // (source of truth — same call the order-signing path uses, so the
+    // SharedAsyncClient meta_cache is primed as a side effect). On lookup
+    // failure, fall back to the per-category table in `fees::category_fee_ppm`.
+    // See spec §4.1 and survey docs/notes/2026-04-21-polymarket-fee-survey.md.
     {
         let n = state.market_count();
+        let mut from_clob = 0usize;
+        let mut from_table = 0usize;
+        let mut zero_fee_markets = 0usize;
         for i in 0..n {
-            state.markets[i].set_poly_fee_rate_ppm(types::SPORTS_FEE_RATE_PPM);
+            let pair = match state.markets[i].pair.as_ref() {
+                Some(p) => p.clone(),
+                None => continue,
+            };
+            let ppm = match poly_async
+                .get_market_meta(&pair.poly_yes_token, &pair.poly_condition_id)
+                .await
+            {
+                Ok((_, fee_bps)) => {
+                    from_clob += 1;
+                    if fee_bps == 0 {
+                        zero_fee_markets += 1;
+                    }
+                    fees::bps_to_ppm(fee_bps)
+                }
+                Err(e) => {
+                    warn!(
+                        "[POLYMARKET] meta fetch failed for {} — falling back to category table: {}",
+                        pair.pair_id, e
+                    );
+                    from_table += 1;
+                    fees::category_fee_ppm(pair.category)
+                }
+            };
+            state.markets[i].set_poly_fee_rate_ppm(ppm);
         }
         info!(
-            "[POLYMARKET] Detector fee rate set to {} ppm (Sports) for {} markets",
-            types::SPORTS_FEE_RATE_PPM, n
+            "[POLYMARKET] Per-market detector fees set: {} via CLOB ({} fee-free), {} via category fallback (total {})",
+            from_clob, zero_fee_markets, from_table, n
         );
     }
 
