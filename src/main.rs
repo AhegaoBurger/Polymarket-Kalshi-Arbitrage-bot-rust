@@ -143,15 +143,18 @@ async fn main() -> Result<()> {
     info!("🔍 Market discovery{}...",
           if force_discovery { " (forced refresh)" } else { "" });
 
-    let discovery = DiscoveryClient::new(
-        KalshiApiClient::new(KalshiConfig::from_env()?),
-        team_cache
-    );
+    let sports_adapter: Arc<dyn adapters::EventAdapter> =
+        Arc::new(adapters::sports::SportsAdapter::new(
+            kalshi_api.clone(),
+            Arc::new(team_cache),
+            ENABLED_LEAGUES.to_vec(),
+        ));
+    let discovery = DiscoveryClient::new(vec![sports_adapter]);
 
     let result = if force_discovery {
-        discovery.discover_all_force(ENABLED_LEAGUES).await
+        discovery.discover_all_force().await
     } else {
-        discovery.discover_all(ENABLED_LEAGUES).await
+        discovery.discover_all().await
     };
 
     info!("📊 Market discovery complete:");
