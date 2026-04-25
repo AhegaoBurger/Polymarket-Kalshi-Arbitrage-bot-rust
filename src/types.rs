@@ -9,13 +9,9 @@ use std::sync::Arc;
 use rustc_hash::FxHashMap;
 use crate::fees::{PolyCategory, MatchSource};
 
-/// Polymarket taker fee rate in parts-per-million for the Sports category.
-/// 30_000 ppm yields a peak fee of 0.75¢ per $1 contract at p=0.5 — matching
-/// Polymarket's published Sports rate (0.75%). The probability-scaled formula
-/// `rate × p × (1-p) / 1e8` peaks at p=0.5 and falls to zero at the edges
-/// (see `poly_fee_cents`). For other categories use `fees::category_fee_ppm`;
-/// for per-market CLOB-sourced rates use `fees::bps_to_ppm`.
-pub const SPORTS_FEE_RATE_PPM: u32 = 30_000;
+// Sports peak rate (30_000 ppm → 0.75% peak via `rate_ppm / 40_000`) lives in
+// `fees::category_fee_ppm(PolyCategory::Sports)`. The previous public
+// SPORTS_FEE_RATE_PPM constant has been removed; use the fees module instead.
 
 // === Market Types ===
 
@@ -196,7 +192,8 @@ impl AtomicMarketState {
     }
 
     /// Set Polymarket taker fee rate in parts-per-million (called once per market
-    /// after discovery). For Sports, use `SPORTS_FEE_RATE_PPM`.
+    /// after discovery). Per-market values come from `fees::bps_to_ppm` against
+    /// CLOB meta; per-category fallbacks come from `fees::category_fee_ppm`.
     #[inline(always)]
     pub fn set_poly_fee_rate_ppm(&self, ppm: u32) {
         self.poly_fee_rate_ppm.store(ppm, Ordering::Relaxed);
@@ -530,6 +527,15 @@ mod tests {
     use super::*;
     use std::sync::Arc;
     use std::thread;
+    use crate::fees::{category_fee_ppm, PolyCategory};
+
+    /// Local helper so test sites can read as `sports_ppm()` and stay tied to
+    /// the canonical fee table in `fees::category_fee_ppm`. Resolves to 30_000
+    /// ppm; if the table value ever drifts from the formula's 0.75% peak,
+    /// `fees::tests::sports_rate_matches_075pct_peak` catches it.
+    fn sports_ppm() -> u32 {
+        category_fee_ppm(PolyCategory::Sports)
+    }
 
     // =========================================================================
     // Pack/Unpack Tests - Verify bit manipulation correctness
@@ -704,7 +710,7 @@ mod tests {
 
     #[test]
     fn test_poly_fee_cents_sports_formula() {
-        let r = SPORTS_FEE_RATE_PPM; // 30_000 ppm → 0.75% peak fee
+        let r = sports_ppm(); // 30_000 ppm → 0.75% peak fee
 
         // p=0.50 → rate × 0.5 × 0.5 = 0.0075 $/contract = 0.75¢ → ceil 1¢
         assert_eq!(poly_fee_cents(50, r), 1);
@@ -725,8 +731,8 @@ mod tests {
     #[test]
     fn test_poly_fee_cents_edges() {
         // Price 0 or 100 → no fee (nothing to fill, or certain outcome).
-        assert_eq!(poly_fee_cents(0, SPORTS_FEE_RATE_PPM), 0);
-        assert_eq!(poly_fee_cents(100, SPORTS_FEE_RATE_PPM), 0);
+        assert_eq!(poly_fee_cents(0, sports_ppm()), 0);
+        assert_eq!(poly_fee_cents(100, sports_ppm()), 0);
 
         // Rate 0 (e.g. Geopolitics) → no fee regardless of price.
         assert_eq!(poly_fee_cents(50, 0), 0);
@@ -738,8 +744,8 @@ mod tests {
         // Formula is symmetric around p=50: fee(p) must equal fee(100-p).
         for p in 1..100u16 {
             assert_eq!(
-                poly_fee_cents(p, SPORTS_FEE_RATE_PPM),
-                poly_fee_cents(100 - p, SPORTS_FEE_RATE_PPM),
+                poly_fee_cents(p, sports_ppm()),
+                poly_fee_cents(100 - p, sports_ppm()),
                 "Asymmetry at p={}", p
             );
         }
@@ -766,7 +772,7 @@ mod tests {
         assert!(mask_no_fee & 4 != 0, "Poly-only arb must fire when fee rate unset");
 
         // Apply Sports rate → poly-only arb should disappear.
-        state.set_poly_fee_rate_ppm(SPORTS_FEE_RATE_PPM);
+        state.set_poly_fee_rate_ppm(sports_ppm());
         let mask_with_fee = state.check_arbs(100);
         assert_eq!(
             mask_with_fee & 4, 0,
