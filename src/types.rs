@@ -7,13 +7,11 @@ use serde::{Deserialize, Serialize};
 use std::sync::atomic::{AtomicU32, AtomicU64, Ordering};
 use std::sync::Arc;
 use rustc_hash::FxHashMap;
+use crate::fees::{PolyCategory, MatchSource};
 
-/// Polymarket taker fee rate in parts-per-million for Sports category (3.00% = 30_000 ppm).
-/// Every market tracked by this bot is a sports league, so we hardcode this instead of
-/// fetching per-market. Polymarket's effective fee is probability-scaled:
-///   fee_USD = rate × p × (1-p)  (per $1 contract)
-/// which peaks at p=0.5 (≈¢0.75 here) and falls to zero at the edges.
-pub const SPORTS_FEE_RATE_PPM: u32 = 30_000;
+// Sports peak rate (30_000 ppm → 0.75% peak via `rate_ppm / 40_000`) lives in
+// `fees::category_fee_ppm(PolyCategory::Sports)`. The previous public
+// SPORTS_FEE_RATE_PPM constant has been removed; use the fees module instead.
 
 // === Market Types ===
 
@@ -68,6 +66,13 @@ pub struct MarketPair {
     pub line_value: Option<f64>,
     /// Team suffix for team-specific markets
     pub team_suffix: Option<Arc<str>>,
+    /// Market category — drives Polymarket fee lookup when CLOB meta is
+    /// unavailable. Defaults to Sports for back-compat with pre-PR-1 caches.
+    #[serde(default)]
+    pub category: PolyCategory,
+    /// Who matched this pair. Defaults to `Structured { adapter: "sports" }`.
+    #[serde(default)]
+    pub match_source: MatchSource,
 }
 
 /// Price representation in cents (1-99 for $0.01-$0.99), 0 indicates no price available
@@ -187,7 +192,8 @@ impl AtomicMarketState {
     }
 
     /// Set Polymarket taker fee rate in parts-per-million (called once per market
-    /// after discovery). For Sports, use `SPORTS_FEE_RATE_PPM`.
+    /// after discovery). Per-market values come from `fees::bps_to_ppm` against
+    /// CLOB meta; per-category fallbacks come from `fees::category_fee_ppm`.
     #[inline(always)]
     pub fn set_poly_fee_rate_ppm(&self, ppm: u32) {
         self.poly_fee_rate_ppm.store(ppm, Ordering::Relaxed);
@@ -521,6 +527,15 @@ mod tests {
     use super::*;
     use std::sync::Arc;
     use std::thread;
+    use crate::fees::{category_fee_ppm, PolyCategory};
+
+    /// Local helper so test sites can read as `sports_ppm()` and stay tied to
+    /// the canonical fee table in `fees::category_fee_ppm`. Resolves to 30_000
+    /// ppm; if the table value ever drifts from the formula's 0.75% peak,
+    /// `fees::tests::sports_rate_matches_075pct_peak` catches it.
+    fn sports_ppm() -> u32 {
+        category_fee_ppm(PolyCategory::Sports)
+    }
 
     // =========================================================================
     // Pack/Unpack Tests - Verify bit manipulation correctness
@@ -695,7 +710,7 @@ mod tests {
 
     #[test]
     fn test_poly_fee_cents_sports_formula() {
-        let r = SPORTS_FEE_RATE_PPM; // 30_000 ppm (3.00%)
+        let r = sports_ppm(); // 30_000 ppm → 0.75% peak fee
 
         // p=0.50 → rate × 0.5 × 0.5 = 0.0075 $/contract = 0.75¢ → ceil 1¢
         assert_eq!(poly_fee_cents(50, r), 1);
@@ -716,8 +731,8 @@ mod tests {
     #[test]
     fn test_poly_fee_cents_edges() {
         // Price 0 or 100 → no fee (nothing to fill, or certain outcome).
-        assert_eq!(poly_fee_cents(0, SPORTS_FEE_RATE_PPM), 0);
-        assert_eq!(poly_fee_cents(100, SPORTS_FEE_RATE_PPM), 0);
+        assert_eq!(poly_fee_cents(0, sports_ppm()), 0);
+        assert_eq!(poly_fee_cents(100, sports_ppm()), 0);
 
         // Rate 0 (e.g. Geopolitics) → no fee regardless of price.
         assert_eq!(poly_fee_cents(50, 0), 0);
@@ -729,8 +744,8 @@ mod tests {
         // Formula is symmetric around p=50: fee(p) must equal fee(100-p).
         for p in 1..100u16 {
             assert_eq!(
-                poly_fee_cents(p, SPORTS_FEE_RATE_PPM),
-                poly_fee_cents(100 - p, SPORTS_FEE_RATE_PPM),
+                poly_fee_cents(p, sports_ppm()),
+                poly_fee_cents(100 - p, sports_ppm()),
                 "Asymmetry at p={}", p
             );
         }
@@ -757,7 +772,7 @@ mod tests {
         assert!(mask_no_fee & 4 != 0, "Poly-only arb must fire when fee rate unset");
 
         // Apply Sports rate → poly-only arb should disappear.
-        state.set_poly_fee_rate_ppm(SPORTS_FEE_RATE_PPM);
+        state.set_poly_fee_rate_ppm(sports_ppm());
         let mask_with_fee = state.check_arbs(100);
         assert_eq!(
             mask_with_fee & 4, 0,
@@ -940,6 +955,8 @@ mod tests {
             poly_condition_id: format!("cond_{}", id).into(),
             line_value: None,
             team_suffix: None,
+            category: PolyCategory::default(),
+            match_source: MatchSource::default(),
         }
     }
 
@@ -1224,6 +1241,8 @@ mod tests {
             poly_condition_id: "cond_cfc".into(),
             line_value: None,
             team_suffix: Some("CFC".into()),
+            category: PolyCategory::default(),
+            match_source: MatchSource::default(),
         };
 
         let poly_yes_token = pair.poly_yes_token.clone();
@@ -1310,6 +1329,36 @@ mod tests {
         assert!(k_no > 0 && k_no < 100);
         assert!(p_yes > 0 && p_yes < 100);
         assert!(p_no > 0 && p_no < 100);
+    }
+
+    #[test]
+    fn market_pair_deserializes_pre_pr1_cache() {
+        // Pre-PR-1 cache entries lacked `category` and `match_source`.
+        // Both must default via #[serde(default)] so existing caches
+        // load without a wipe.
+        let legacy = r#"{
+            "pair_id": "test-pair",
+            "league": "epl",
+            "market_type": "Moneyline",
+            "description": "Test",
+            "kalshi_event_ticker": "KXEPLGAME-25DEC27CFCAVL",
+            "kalshi_market_ticker": "KXEPLGAME-25DEC27CFCAVL-CFC",
+            "poly_slug": "epl-cfc-avl-2025-12-27-cfc",
+            "poly_yes_token": "0xabc",
+            "poly_no_token": "0xdef",
+            "poly_condition_id": "0xcond",
+            "line_value": null,
+            "team_suffix": "CFC"
+        }"#;
+        let pair: MarketPair = serde_json::from_str(legacy)
+            .expect("legacy cache entry must deserialize with defaulted fields");
+        assert_eq!(pair.category, crate::fees::PolyCategory::Sports);
+        match pair.match_source {
+            crate::fees::MatchSource::Structured { adapter } => {
+                assert_eq!(adapter, "sports");
+            }
+            other => panic!("expected Structured default, got {:?}", other),
+        }
     }
 }
 
