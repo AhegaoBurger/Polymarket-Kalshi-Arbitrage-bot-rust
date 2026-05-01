@@ -21,7 +21,13 @@ use std::collections::HashMap;
 use std::sync::Arc;
 use std::sync::atomic::{AtomicBool, Ordering};
 
-const USER_AGENT: &str = "py_clob_client";
+/// Cloudflare's WAF in front of clob.polymarket.com blocks requests with
+/// generic SDK-identifier User-Agents (e.g. `py_clob_client`) — observed as
+/// 403 with a Cloudflare HTML challenge page on POST endpoints. Mimic a real
+/// browser to get past the WAF; the underlying request is identical.
+const USER_AGENT: &str =
+    "Mozilla/5.0 (Macintosh; Intel Mac OS X 14_5) AppleWebKit/537.36 \
+     (KHTML, like Gecko) Chrome/126.0.0.0 Safari/537.36";
 const MSG_TO_SIGN: &str = "This message attests that I control the given wallet";
 const ZERO_ADDRESS: &str = "0x0000000000000000000000000000000000000000";
 
@@ -115,6 +121,15 @@ fn current_unix_ts() -> u64 {
 /// per-address uniqueness). The L1 auth `POLY_TIMESTAMP` header stays seconds.
 fn current_unix_ts_ms() -> u64 {
     SystemTime::now().duration_since(UNIX_EPOCH).unwrap().as_millis() as u64
+}
+
+/// L1-auth single-use nonce. Polymarket V2's `derive-api-key` and `api-key`
+/// endpoints reject reused (signer, nonce) pairs — using `0` always (as the
+/// bot did pre-V2) yields a generic "Could not derive api key!" 400 after
+/// the first call. Unix-nanoseconds is monotonically increasing across
+/// process restarts and unique enough that collisions are negligible.
+fn fresh_nonce() -> u64 {
+    SystemTime::now().duration_since(UNIX_EPOCH).unwrap().as_nanos() as u64
 }
 
 /// V2 EIP-712 zero-bytes32 used for `metadata` and `builder` when no value
@@ -547,7 +562,12 @@ impl PolymarketAsyncClient {
         Ok(headers)
     }
 
-    /// Derive API credentials from L1 wallet signature
+    /// Derive API credentials from L1 wallet signature.
+    ///
+    /// On CLOB V2, this endpoint may return 400 if the wallet already has
+    /// API creds — it now strictly creates new ones. Use `get_api_creds`
+    /// first to check for existing creds, then fall back to derive only when
+    /// the wallet has none.
     pub async fn derive_api_key(&self, nonce: u64) -> Result<ApiCreds> {
         let url = format!("{}/auth/derive-api-key", self.host);
         let headers = self.build_l1_headers(nonce)?;
@@ -558,6 +578,56 @@ impl PolymarketAsyncClient {
             return Err(anyhow!("derive-api-key failed: {} {}", status, body));
         }
         Ok(resp.json().await?)
+    }
+
+    /// Create a new API key for this wallet via L1 auth.
+    ///
+    /// POST `/auth/api-key` (this is what py-clob-client calls `create_api_key`).
+    /// Returns the full ApiCreds (api_key + secret + passphrase). Always
+    /// creates a fresh key — does not return existing ones. The wallet can
+    /// hold multiple API keys; orphaned ones can be deleted via the
+    /// Polymarket UI or DELETE `/auth/api-key`.
+    pub async fn create_api_key(&self, nonce: u64) -> Result<ApiCreds> {
+        let url = format!("{}/auth/api-key", self.host);
+        let headers = self.build_l1_headers(nonce)?;
+        let resp = self.http.post(&url).headers(headers).send().await?;
+        if !resp.status().is_success() {
+            let status = resp.status();
+            let body = resp.text().await.unwrap_or_default();
+            return Err(anyhow!("create_api_key failed: {} {}", status, body));
+        }
+        Ok(resp.json().await?)
+    }
+
+    /// Resolve API creds via the V2-friendly path: try `create_api_key` first
+    /// (POST /auth/api-key — works on V2), fall back to `derive_api_key`
+    /// (GET /auth/derive-api-key — V1-idempotent fallback).
+    ///
+    /// **Each call uses a fresh unique nonce.** Polymarket's L1 auth treats
+    /// every (signer, nonce) as single-use; reusing nonce 0 (as the bot did
+    /// pre-V2) returned the same creds in V1 but returns "Could not derive
+    /// api key!" 400 in V2. Nonce is the current unix nanoseconds — unique
+    /// per call across process restarts.
+    pub async fn get_or_derive_api_key(&self) -> Result<ApiCreds> {
+        let nonce = fresh_nonce();
+        match self.create_api_key(nonce).await {
+            Ok(creds) => {
+                tracing::info!(
+                    "[POLYMARKET] Created new API creds via POST /auth/api-key (nonce={})",
+                    nonce
+                );
+                Ok(creds)
+            }
+            Err(e) => {
+                let nonce2 = fresh_nonce();
+                tracing::warn!(
+                    "[POLYMARKET] create_api_key failed ({}), falling back to derive-api-key with new nonce={}",
+                    e,
+                    nonce2
+                );
+                self.derive_api_key(nonce2).await
+            }
+        }
     }
 
     /// Build L2 headers for authenticated requests
