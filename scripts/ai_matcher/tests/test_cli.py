@@ -27,16 +27,25 @@ def test_run_subcommand_passes_flags_through():
     mock_run.assert_called_once_with(loop_mode=True, category="politics", sample=50)
 
 
-def test_audit_subcommand_default_sample(capsys):
-    rc = main(["audit"])
-    captured = capsys.readouterr()
+def test_audit_subcommand_default_sample():
+    with patch("ai_matcher.pipeline.audit_sample_default", return_value=0) as mock_audit:
+        rc = main(["audit"])
     assert rc == 0
-    assert "--sample 20" in captured.out
+    mock_audit.assert_called_once_with(20)
 
 
-def test_review_subcommand(capsys):
-    rc = main(["review"])
+def test_audit_subcommand_custom_sample():
+    with patch("ai_matcher.pipeline.audit_sample_default", return_value=0) as mock_audit:
+        rc = main(["audit", "--sample", "5"])
     assert rc == 0
+    mock_audit.assert_called_once_with(5)
+
+
+def test_review_subcommand():
+    with patch("ai_matcher.pipeline.review_default", return_value=0) as mock_review:
+        rc = main(["review"])
+    assert rc == 0
+    mock_review.assert_called_once_with()
 
 
 def test_no_subcommand_errors():

@@ -207,3 +207,67 @@ def run_pipeline_default(
     summary = run_pipeline(cfg, ingestion=ingestion, embedder=embedder, verifier=verifier)
     print(f"[ai_matcher] run complete: {summary}")
     return 0
+
+
+def review_default() -> int:
+    """Open audit/report.html in the default browser."""
+    import webbrowser
+
+    project_root = _project_root()
+    report = project_root / "audit" / "report.html"
+    if not report.exists():
+        print(f"[ai_matcher] no report found at {report}; "
+              "run `python -m ai_matcher run` first")
+        return 1
+    webbrowser.open(report.as_uri())
+    return 0
+
+
+def audit_sample_default(sample: int) -> int:
+    """Render and open a single-page HTML with N random accepted pairs."""
+    import random
+    import webbrowser
+
+    project_root = _project_root()
+    matches_path = project_root / ".ai_matches.json"
+    if not matches_path.exists():
+        print(f"[ai_matcher] no .ai_matches.json — "
+              "run `python -m ai_matcher run` first")
+        return 1
+    payload = json.loads(matches_path.read_text())
+    pairs = payload.get("pairs", [])
+    if not pairs:
+        print("[ai_matcher] no accepted pairs to audit")
+        return 0
+    # Bias the sample toward low-confidence pairs (the most useful spot-checks).
+    pairs.sort(key=lambda p: p.get("confidence", 1.0))
+    if len(pairs) <= sample:
+        chosen = pairs
+    else:
+        candidate_pool = pairs[: max(sample * 2, sample)]
+        chosen = random.sample(candidate_pool, sample)
+    out = project_root / "audit" / f"audit-sample-{sample}.html"
+    out.parent.mkdir(parents=True, exist_ok=True)
+    out.write_text(_render_audit_sample(chosen, payload))
+    webbrowser.open(out.as_uri())
+    print(f"[ai_matcher] wrote {out} with {len(chosen)} pair(s)")
+    return 0
+
+
+def _render_audit_sample(pairs: list[dict], payload: dict) -> str:
+    lines = [
+        "<!DOCTYPE html><html><body "
+        "style='font-family:sans-serif;max-width:1000px;margin:1em auto;'>",
+        f"<h1>ai_matcher audit — {len(pairs)} samples (model {payload.get('model')})</h1>",
+    ]
+    for p in pairs:
+        lines.append("<hr>")
+        lines.append(f"<h2>{p.get('description', '')}</h2>")
+        lines.append(f"<p>Kalshi: <code>{p.get('kalshi_market_ticker')}</code></p>")
+        lines.append(f"<p>Polymarket conditionId: <code>{p.get('poly_condition_id')}</code></p>")
+        lines.append(
+            f"<p>Category: {p.get('category')} — Event: {p.get('event_type')} — "
+            f"Confidence: {p.get('confidence')}</p>"
+        )
+    lines.append("</body></html>")
+    return "\n".join(lines)

@@ -33,11 +33,11 @@ def main(argv: list[str] | None = None) -> int:
             sample=args.sample,
         )
     if args.command == "review":
-        print("[ai_matcher] review — not yet wired (Task 11)")
-        return 0
+        from ai_matcher.pipeline import review_default
+        return review_default()
     if args.command == "audit":
-        print(f"[ai_matcher] audit --sample {args.sample} — not yet wired (Task 11)")
-        return 0
+        from ai_matcher.pipeline import audit_sample_default
+        return audit_sample_default(args.sample)
     if args.command == "calibrate-fees":
         print("[ai_matcher] calibrate-fees — not yet wired")
         return 0
