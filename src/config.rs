@@ -203,6 +203,21 @@ pub fn fred_api_key() -> Option<String> {
     std::env::var("FRED_API_KEY").ok().filter(|s| !s.is_empty())
 }
 
+/// Detection-only gate for AI-matched pairs (PR 3). Default OFF.
+pub fn exec_allow_ai_matches() -> bool {
+    std::env::var("EXEC_ALLOW_AI_MATCHES")
+        .map(|v| v == "1" || v.to_lowercase() == "true")
+        .unwrap_or(false)
+}
+
+/// Max acceptable age of `.ai_matches.json` in seconds. Default 24h.
+pub fn ai_matches_max_age_secs() -> u64 {
+    std::env::var("AI_MATCHES_MAX_AGE_SEC")
+        .ok()
+        .and_then(|s| s.parse().ok())
+        .unwrap_or(24 * 60 * 60)
+}
+
 // NOTE: tests mutate env; require --test-threads=1
 #[cfg(test)]
 mod tests {
@@ -246,5 +261,24 @@ mod tests {
         env::set_var("FRED_API_KEY", "abc123");
         assert_eq!(fred_api_key().as_deref(), Some("abc123"));
         env::remove_var("FRED_API_KEY");
+    }
+
+    #[test]
+    fn exec_allow_ai_matches_defaults_false() {
+        env::remove_var("EXEC_ALLOW_AI_MATCHES");
+        assert!(!exec_allow_ai_matches());
+    }
+
+    #[test]
+    fn ai_matches_max_age_secs_defaults_to_24h() {
+        env::remove_var("AI_MATCHES_MAX_AGE_SEC");
+        assert_eq!(ai_matches_max_age_secs(), 86_400);
+    }
+
+    #[test]
+    fn ai_matches_max_age_secs_respects_override() {
+        env::set_var("AI_MATCHES_MAX_AGE_SEC", "3600");
+        assert_eq!(ai_matches_max_age_secs(), 3600);
+        env::remove_var("AI_MATCHES_MAX_AGE_SEC");
     }
 }
