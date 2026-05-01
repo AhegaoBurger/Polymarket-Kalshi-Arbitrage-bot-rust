@@ -15,6 +15,12 @@ scripts/ai_matcher/.venv/
 scripts/ai_matcher/.uv-cache/
 scripts/ai_matcher/__pycache__/
 scripts/ai_matcher/**/__pycache__/
+
+# poly_l2_auth diagnostic helpers
+scripts/poly_l2_auth/.venv/
+scripts/poly_l2_auth/.uv-cache/
+scripts/poly_l2_auth/__pycache__/
+scripts/poly_l2_auth/**/__pycache__/
 .ai_matches.json
 .ai_matches.json.tmp
 .ai_matcher_cache.json

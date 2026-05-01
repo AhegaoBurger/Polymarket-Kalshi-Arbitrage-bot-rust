@@ -1,0 +1,25 @@
+[project]
+name = "poly-l2-auth"
+version = "0.1.0"
+description = "Diagnostic helpers for Polymarket CLOB V2 L2 API credentials (derive, fetch, verify)"
+readme = "README.md"
+authors = [
+    { name = "Artur Shirokov", email = "artur.wiseman.co@gmail.com" }
+]
+requires-python = ">=3.12"
+dependencies = [
+    "py-clob-client>=0.34.6",
+    "py-clob-client-v2",
+]
+
+[project.scripts]
+poly-creds-v1 = "poly_l2_auth.get_v1:main"
+poly-creds-v2 = "poly_l2_auth.get_v2:main"
+poly-test-l2  = "poly_l2_auth.test_l2:main"
+
+[build-system]
+requires = ["uv_build>=0.9.7,<0.10.0"]
+build-backend = "uv_build"
+
+[tool.uv.sources]
+py-clob-client-v2 = { git = "https://github.com/Polymarket/py-clob-client-v2" }
