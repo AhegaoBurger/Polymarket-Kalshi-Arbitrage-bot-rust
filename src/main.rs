@@ -31,6 +31,7 @@ mod config;
 mod discovery;
 mod execution;
 mod fees;
+mod fred;
 mod kalshi;
 mod polymarket;
 mod polymarket_clob;
@@ -149,7 +150,28 @@ async fn main() -> Result<()> {
             Arc::new(team_cache),
             ENABLED_LEAGUES.to_vec(),
         ));
-    let discovery = DiscoveryClient::new(vec![sports_adapter]);
+
+    let mut active_adapters: Vec<Arc<dyn adapters::EventAdapter>> = vec![sports_adapter];
+
+    if config::fomc_enabled() {
+        let fomc_http = reqwest::Client::builder()
+            .timeout(std::time::Duration::from_secs(10))
+            .build()
+            .expect("failed to build HTTP client for FomcAdapter");
+        let fomc_adapter: Arc<dyn adapters::EventAdapter> =
+            Arc::new(adapters::fomc::FomcAdapter::new(
+                kalshi_api.clone(),
+                Arc::new(polymarket::GammaClient::new()),
+                fomc_http,
+                config::fred_api_key(),
+            ));
+        active_adapters.push(fomc_adapter);
+        info!("🏛️ FomcAdapter enabled (set FOMC_ENABLED=0 to disable)");
+    } else {
+        info!("🏛️ FomcAdapter disabled via FOMC_ENABLED=0");
+    }
+
+    let discovery = DiscoveryClient::new(active_adapters);
 
     let result = if force_discovery {
         discovery.discover_all_force().await
