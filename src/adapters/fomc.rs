@@ -12,14 +12,13 @@ use crate::adapters::{EventAdapter, NormalizedBatch};
 use crate::canonical::{CanonicalMarket, EventType, Platform, TimeWindow, Underlier, Venue};
 use crate::fees::PolyCategory;
 use crate::kalshi::KalshiApiClient;
-use crate::polymarket::GammaClient;
+use crate::polymarket::{GammaClient, GammaEvent};
 use crate::types::{KalshiEvent, KalshiMarket};
 
 const FOMC_KALSHI_SERIES: &str = "KXFED";
 
 pub struct FomcAdapter {
     kalshi: Arc<KalshiApiClient>,
-    #[allow(dead_code)]
     gamma: Arc<GammaClient>,
     http: reqwest::Client,
     fred_api_key: Option<String>,
@@ -52,20 +51,107 @@ impl EventAdapter for FomcAdapter {
 
     async fn normalize(&self) -> Result<NormalizedBatch> {
         let events = self.kalshi.get_events(FOMC_KALSHI_SERIES, 50).await?;
+        if events.is_empty() {
+            tracing::info!("[FOMC] no open KXFED events; skipping");
+            return Ok(NormalizedBatch { kalshi: vec![], poly: vec![] });
+        }
+
+        let anchor_bps = match self.resolve_anchor_bps(&events).await {
+            Ok(bps) => bps,
+            Err(e) => {
+                tracing::error!("[FOMC] anchor unavailable, emitting zero pairs: {}", e);
+                return Ok(NormalizedBatch { kalshi: vec![], poly: vec![] });
+            }
+        };
+
         let mut kalshi_canon: Vec<CanonicalMarket> = Vec::new();
+        let mut poly_canon: Vec<CanonicalMarket> = Vec::new();
+
         for ev in &events {
             let markets = match self.kalshi.get_markets(&ev.event_ticker).await {
                 Ok(m) => m,
                 Err(e) => {
-                    tracing::warn!("[FOMC] get_markets for {} failed: {}", ev.event_ticker, e);
+                    tracing::warn!("[FOMC] get_markets {} failed: {}", ev.event_ticker, e);
                     continue;
                 }
             };
-            kalshi_canon.extend(normalize_kalshi_markets(ev, &markets));
+            let canon = normalize_kalshi_markets(ev, &markets);
+            let meeting_date = canon.first().and_then(|c| match &c.underlier {
+                Underlier::FomcRateBand { meeting_date, .. } => Some(*meeting_date),
+                _ => None,
+            });
+            kalshi_canon.extend(canon);
+            let Some(meeting_date) = meeting_date else { continue };
+
+            let slug = poly_event_slug_for_meeting(meeting_date);
+            match self.gamma.lookup_event(&slug).await {
+                Ok(Some(poly_ev)) => {
+                    poly_canon.extend(normalize_poly_event(&poly_ev, meeting_date, anchor_bps));
+                }
+                Ok(None) => tracing::warn!("[FOMC] no poly event at slug {}", slug),
+                Err(e) => tracing::warn!("[FOMC] poly event lookup {} failed: {}", slug, e),
+            }
         }
-        // Polymarket side fills in during Task 8.
-        Ok(NormalizedBatch { kalshi: kalshi_canon, poly: vec![] })
+
+        tracing::info!(
+            "[FOMC] normalized: {} kalshi markets, {} poly outcomes (anchor {} bps)",
+            kalshi_canon.len(),
+            poly_canon.len(),
+            anchor_bps
+        );
+        Ok(NormalizedBatch { kalshi: kalshi_canon, poly: poly_canon })
     }
+}
+
+/// Build the Polymarket Gamma event slug for an FOMC meeting.
+/// Pattern: `fomc-decision-<month-name>-<year>` (lowercase month name).
+pub(crate) fn poly_event_slug_for_meeting(date: NaiveDate) -> String {
+    let month = match date.month() {
+        1 => "january", 2 => "february", 3 => "march", 4 => "april",
+        5 => "may", 6 => "june", 7 => "july", 8 => "august",
+        9 => "september", 10 => "october", 11 => "november", 12 => "december",
+        _ => "unknown",
+    };
+    format!("fomc-decision-{}-{}", month, date.year())
+}
+
+/// Build CanonicalMarkets from a Gamma neg-risk event for a given meeting,
+/// using `anchor_bps` to convert each outcome's delta into an absolute floor_bps.
+/// Outcomes whose label `parse_fomc_delta_bps` rejects are logged + skipped.
+pub(crate) fn normalize_poly_event(
+    event: &GammaEvent,
+    meeting_date: NaiveDate,
+    anchor_bps: i32,
+) -> Vec<CanonicalMarket> {
+    let mut out = Vec::with_capacity(event.markets.len());
+    for m in &event.markets {
+        let Some(delta) = parse_fomc_delta_bps(&m.question) else {
+            tracing::warn!("[FOMC] unparseable poly outcome label: {:?}", m.question);
+            continue;
+        };
+        let floor_bps = anchor_bps + delta;
+        let title: Arc<str> = Arc::from(m.question.as_str());
+
+        out.push(CanonicalMarket {
+            event_type: EventType::Fomc,
+            underlier: Underlier::FomcRateBand { meeting_date, floor_bps },
+            time_window: TimeWindow { event_at: None, settles_at: None },
+            venue: Venue {
+                platform: Platform::Polymarket,
+                kalshi_event_ticker: None,
+                kalshi_market_ticker: None,
+                poly_slug: Some(Arc::from(m.slug.as_str())),
+                poly_yes_token: Some(Arc::from(m.yes_token.as_str())),
+                poly_no_token: Some(Arc::from(m.no_token.as_str())),
+                poly_condition_id: Some(Arc::from(m.condition_id.as_str())),
+            },
+            category: PolyCategory::Economics,
+            raw_title: title,
+            raw_description: Arc::from(""),
+            adapter_version: 1,
+        });
+    }
+    out
 }
 
 /// Probe Kalshi event metadata for a current-rate field (bps).
@@ -343,5 +429,76 @@ mod anchor_tests {
             sub_title: Some("Target rate".into()),
         };
         assert_eq!(try_anchor_from_kalshi_event(&ev), None);
+    }
+}
+
+#[cfg(test)]
+mod poly_normalize_tests {
+    use super::*;
+    use crate::polymarket::{GammaEvent, GammaEventMarket};
+
+    #[test]
+    fn builds_event_slug_from_meeting_date() {
+        let date = NaiveDate::from_ymd_opt(2026, 4, 1).unwrap();
+        assert_eq!(poly_event_slug_for_meeting(date), "fomc-decision-april-2026");
+        let dec = NaiveDate::from_ymd_opt(2026, 12, 1).unwrap();
+        assert_eq!(poly_event_slug_for_meeting(dec), "fomc-decision-december-2026");
+    }
+
+    #[test]
+    fn normalizes_poly_outcomes_to_floor_bps() {
+        let meeting_date = NaiveDate::from_ymd_opt(2026, 4, 1).unwrap();
+        let anchor_bps = 425;
+        let event = GammaEvent {
+            slug: "fomc-decision-april-2026".into(),
+            title: "FOMC April 2026".into(),
+            markets: vec![
+                GammaEventMarket {
+                    slug: "fomc-25-bps-cut-april-2026".into(),
+                    question: "25 bps cut".into(),
+                    yes_token: "tA1".into(),
+                    no_token: "tA2".into(),
+                    condition_id: "0xA".into(),
+                },
+                GammaEventMarket {
+                    slug: "fomc-no-change-april-2026".into(),
+                    question: "No change".into(),
+                    yes_token: "tB1".into(),
+                    no_token: "tB2".into(),
+                    condition_id: "0xB".into(),
+                },
+                GammaEventMarket {
+                    slug: "fomc-rates-on-vacation".into(),
+                    question: "rates go to the moon".into(),
+                    yes_token: "tC1".into(),
+                    no_token: "tC2".into(),
+                    condition_id: "0xC".into(),
+                },
+            ],
+        };
+
+        let canon = normalize_poly_event(&event, meeting_date, anchor_bps);
+        assert_eq!(canon.len(), 2, "unparseable label must be skipped, not faked to 0");
+
+        // 25 bps cut → 425 - 25 = 400
+        match &canon[0].underlier {
+            Underlier::FomcRateBand { floor_bps, .. } => assert_eq!(*floor_bps, 400),
+            _ => panic!(),
+        }
+        assert_eq!(canon[0].venue.platform, Platform::Polymarket);
+        assert_eq!(
+            canon[0].venue.poly_slug.as_deref().map(|s| s as &str),
+            Some("fomc-25-bps-cut-april-2026")
+        );
+        assert_eq!(
+            canon[0].venue.poly_condition_id.as_deref().map(|s| s as &str),
+            Some("0xA")
+        );
+
+        // No change → 425
+        match &canon[1].underlier {
+            Underlier::FomcRateBand { floor_bps, .. } => assert_eq!(*floor_bps, 425),
+            _ => panic!(),
+        }
     }
 }
