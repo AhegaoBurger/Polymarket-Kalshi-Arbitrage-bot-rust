@@ -3,6 +3,59 @@
 //!
 //! Spec: docs/superpowers/specs/2026-04-21-multi-category-matching-design.md §4.5.
 
+use anyhow::Result;
+use async_trait::async_trait;
+use std::sync::Arc;
+
+use crate::adapters::{EventAdapter, NormalizedBatch};
+use crate::canonical::EventType;
+use crate::kalshi::KalshiApiClient;
+use crate::polymarket::GammaClient;
+
+const FOMC_KALSHI_SERIES: &str = "KXFED";
+
+pub struct FomcAdapter {
+    #[allow(dead_code)]
+    kalshi: Arc<KalshiApiClient>,
+    #[allow(dead_code)]
+    gamma: Arc<GammaClient>,
+    #[allow(dead_code)]
+    http: reqwest::Client,
+    #[allow(dead_code)]
+    fred_api_key: Option<String>,
+}
+
+impl FomcAdapter {
+    pub fn new(
+        kalshi: Arc<KalshiApiClient>,
+        gamma: Arc<GammaClient>,
+        http: reqwest::Client,
+        fred_api_key: Option<String>,
+    ) -> Self {
+        Self { kalshi, gamma, http, fred_api_key }
+    }
+}
+
+#[async_trait]
+impl EventAdapter for FomcAdapter {
+    fn name(&self) -> &'static str {
+        "fomc"
+    }
+
+    fn event_type(&self) -> EventType {
+        EventType::Fomc
+    }
+
+    fn version(&self) -> u32 {
+        1
+    }
+
+    async fn normalize(&self) -> Result<NormalizedBatch> {
+        // Filled in by Tasks 6–8.
+        Ok(NormalizedBatch { kalshi: vec![], poly: vec![] })
+    }
+}
+
 /// Parse a Polymarket FOMC outcome label like `"25 bps cut"` or `"No change"`
 /// into a signed delta in basis points. Returns `None` for labels we don't
 /// recognize so the caller can log + skip rather than silently default to 0.
