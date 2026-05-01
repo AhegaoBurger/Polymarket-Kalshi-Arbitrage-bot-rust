@@ -19,8 +19,21 @@ uv run python -m ai_matcher audit --sample 20
 ## Required env
 
 - `ANTHROPIC_API_KEY` — for the LLM verification stage (skip with `--no-llm`)
-- `KALSHI_API_KEY_ID` and a `kalshi_private_key.txt` at the project root — for Kalshi REST
+- (No Kalshi credentials required — sidecar uses public browse endpoints.
+  Trade-off: liquidity/volume aren't returned without auth, so the Kalshi
+  liquidity floor only fires when the field is populated; unknown values pass
+  through. The Polymarket-side floor + cosine retrieval still bound the join.)
 - (No OpenAI key required — embeddings run locally on CPU.)
+
+## Tuning
+
+| Env var | Default | What it does |
+|---|---|---|
+| `MIN_LIQUIDITY_USD` | `100.0` | Drops Polymarket markets below this. On Kalshi: drops only when liquidity is known and below; unknown values pass. |
+| `INGEST_KALSHI_MAX_EVENTS` | `200` | Cap on Kalshi events walked per run. Each event = one extra HTTP call. |
+| `INGEST_POLY_LIMIT` | `500` | Polymarket markets to fetch (already sorted by liquidity descending). |
+| `EMBEDDINGS_ACCEPT_COSINE` | `0.85` | Cosine threshold for `--no-llm` acceptance. |
+| `EMBEDDINGS_ONLY` | unset | `1` defaults to `--no-llm` without the flag. |
 
 ## Modes
 
