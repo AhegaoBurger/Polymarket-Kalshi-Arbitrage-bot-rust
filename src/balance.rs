@@ -115,6 +115,16 @@ impl Default for BalanceCache {
     }
 }
 
+fn handle_kalshi_result(cache: &BalanceCache, res: Result<i64>) {
+    match res {
+        Ok(cents) => {
+            cache.set_kalshi_cents(cents);
+            debug!("[BALANCE] Kalshi: {} cents (${:.2})", cents, cents as f64 / 100.0);
+        }
+        Err(e) => warn!("[BALANCE] Kalshi fetch failed: {}", e),
+    }
+}
+
 /// Fetch both exchange balances and store into the cache. Used for the startup
 /// priming call (must succeed) and each tick of the background refresh task
 /// (best-effort — failures are logged but don't abort the loop).
@@ -134,14 +144,7 @@ pub async fn refresh_once(
             kalshi.fetch_balance_cents(),
             poly.fetch_poly_balance_usdc_micros(),
         );
-
-        match kalshi_res {
-            Ok(cents) => {
-                cache.set_kalshi_cents(cents);
-                debug!("[BALANCE] Kalshi: {} cents (${:.2})", cents, cents as f64 / 100.0);
-            }
-            Err(e) => warn!("[BALANCE] Kalshi fetch failed: {}", e),
-        }
+        handle_kalshi_result(cache, kalshi_res);
         match poly_res {
             Ok(micros) => {
                 cache.set_poly_usdc_micros(micros);
@@ -150,13 +153,7 @@ pub async fn refresh_once(
             Err(e) => warn!("[BALANCE] Poly fetch failed: {}", e),
         }
     } else {
-        match kalshi.fetch_balance_cents().await {
-            Ok(cents) => {
-                cache.set_kalshi_cents(cents);
-                debug!("[BALANCE] Kalshi: {} cents (${:.2})", cents, cents as f64 / 100.0);
-            }
-            Err(e) => warn!("[BALANCE] Kalshi fetch failed: {}", e),
-        }
+        handle_kalshi_result(cache, kalshi.fetch_balance_cents().await);
     }
     Ok(())
 }
