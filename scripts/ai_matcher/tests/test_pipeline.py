@@ -8,7 +8,7 @@ import numpy as np
 
 from ai_matcher.ingestion import IngestionResult, Market
 from ai_matcher.pipeline import PipelineConfig, run_pipeline
-from ai_matcher.verifier import Decision
+from ai_matcher.verifier import Decision, EmbeddingsOnlyVerifier
 
 
 def mk_kalshi(t: str) -> Market:
@@ -122,3 +122,52 @@ def test_pipeline_handles_empty_ingestion(tmp_path: Path):
     assert summary == {"accepted": 0, "rejected": 0, "rows": 0}
     matches = json.loads(cfg.matches_path.read_text())
     assert matches["pairs"] == []
+
+
+def test_pipeline_with_embeddings_only_verifier_accepts_high_cosine(tmp_path: Path):
+    """End-to-end: EmbeddingsOnlyVerifier accepts a pair when its cosine clears
+    the threshold, and the acceptance floor is set low enough that
+    Decision.is_accepted agrees."""
+    project_root = tmp_path
+    config_path = project_root / "config"
+    config_path.mkdir()
+    (config_path / "manual_overrides.json").write_text(
+        json.dumps({"version": 1, "whitelist": [], "blacklist": []})
+    )
+
+    ingestion = MagicMock()
+    ingestion.fetch_all.return_value = IngestionResult(
+        kalshi=[mk_kalshi("CPI")],
+        poly=[mk_poly("CPI")],
+    )
+
+    embedder = MagicMock()
+    embedder.dim = 4
+    # Identical vectors → cosine ≈ 1.0
+    embedder.embed.return_value = np.array([1.0, 0.0, 0.0, 0.0], dtype=np.float32)
+    embedder.cache_hits = 0
+    embedder.cache_misses = 0
+    embedder.flush.return_value = None
+
+    cfg = PipelineConfig(
+        project_root=project_root,
+        audit_dir=project_root / "audit",
+        matches_path=project_root / ".ai_matches.json",
+        audit_log_path=project_root / ".ai_matcher_audit.jsonl",
+        overrides_path=config_path / "manual_overrides.json",
+        embedding_model="test-model",
+        llm_model="embeddings-only",
+        min_cosine=0.0,
+        acceptance_min_confidence=0.85,
+    )
+    verifier = EmbeddingsOnlyVerifier(accept_cosine=0.85)
+
+    summary = run_pipeline(cfg, ingestion=ingestion, embedder=embedder, verifier=verifier)
+
+    assert summary["accepted"] == 1
+    matches = json.loads(cfg.matches_path.read_text())
+    assert matches["model"] == "embeddings-only"
+    assert len(matches["pairs"]) == 1
+    # Audit log should record the cosine in the reasoning field.
+    audit_text = cfg.audit_log_path.read_text()
+    assert "embeddings-only" in audit_text

@@ -62,13 +62,22 @@ class Decision:
     category: str
     event_type: str
 
-    @property
-    def accepted(self) -> bool:
+    def is_accepted(self, min_confidence: float = 0.9) -> bool:
+        """Return True if this decision passes acceptance with the given floor.
+
+        Default floor (0.9) matches the LLM-verifier threshold from spec §4.6.3.
+        Embeddings-only mode passes a different floor here.
+        """
         return (
             self.resolution_match
-            and self.confidence >= 0.9
+            and self.confidence >= min_confidence
             and not self.concerns
         )
+
+    @property
+    def accepted(self) -> bool:
+        """Default LLM-mode acceptance check. Use is_accepted() for custom thresholds."""
+        return self.is_accepted(0.9)
 
 
 class Verifier:
@@ -140,3 +149,45 @@ class Verifier:
             if getattr(block, "type", None) == "tool_use":
                 return getattr(block, "input", {}) or {}
         raise ValueError("Anthropic response missing tool_use block")
+
+
+class EmbeddingsOnlyVerifier:
+    """Verifier replacement that skips the LLM and decides purely on cosine similarity.
+
+    Useful for cheap dry runs without an `ANTHROPIC_API_KEY`. Much weaker signal
+    than the LLM verifier — embeddings cluster by topical similarity, NOT by
+    resolution-criteria identity. Markets with the same topic but different
+    resolution dates will look identical to this verifier. Pair acceptance
+    requires `cosine >= accept_cosine` (default 0.85).
+
+    Same interface as `Verifier.verify` but takes the cosine score that
+    `HnswRetrieval.query` already produced — no extra compute.
+    """
+
+    def __init__(self, accept_cosine: float = 0.85) -> None:
+        self.accept_cosine = accept_cosine
+        self.model = "embeddings-only"
+        # Bookkeeping for compatibility with the LLM verifier surface.
+        self.cache_hits = 0
+        self.cache_misses = 0
+
+    def verify(self, kalshi: Market, poly: Market, cosine: float) -> Decision:
+        accepted = cosine >= self.accept_cosine
+        if accepted:
+            concerns: list[str] = []
+        else:
+            concerns = [
+                f"cosine {cosine:.3f} below embeddings-only threshold {self.accept_cosine}"
+            ]
+        return Decision(
+            confidence=cosine,
+            resolution_match=accepted,
+            concerns=concerns,
+            reasoning=(
+                f"embeddings-only: cosine={cosine:.4f}, threshold={self.accept_cosine} "
+                f"(no LLM verification — embeddings only catch topical similarity, "
+                f"not resolution-criteria identity)"
+            ),
+            category="",
+            event_type="Other",
+        )

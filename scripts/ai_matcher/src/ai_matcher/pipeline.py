@@ -16,7 +16,7 @@ from ai_matcher.ingestion import Ingestion, IngestionResult, Market
 from ai_matcher.overrides import OverrideOutcome, OverrideSet
 from ai_matcher.report import PairAuditRow, render_report
 from ai_matcher.retrieval import HnswRetrieval
-from ai_matcher.verifier import Verifier
+from ai_matcher.verifier import EmbeddingsOnlyVerifier, Verifier
 
 
 @dataclass
@@ -30,6 +30,9 @@ class PipelineConfig:
     llm_model: str
     top_k: int = 8
     min_cosine: float = 0.55
+    # Min confidence to accept a pair. LLM verifier defaults to 0.9; embeddings-only
+    # mode lowers this so cosine-based confidence isn't filtered by the LLM-tuned floor.
+    acceptance_min_confidence: float = 0.9
 
 
 def _atomic_write_json(path: Path, payload: dict) -> None:
@@ -43,6 +46,18 @@ def _atomic_write_json(path: Path, payload: dict) -> None:
         if os.path.exists(tmp_name):
             os.unlink(tmp_name)
         raise
+
+
+def _call_verifier(verifier: Any, k: Market, p: Market, cosine: float):
+    """Dispatch to the right verify() signature.
+
+    The LLM `Verifier.verify(k, p)` ignores cosine; the `EmbeddingsOnlyVerifier.verify(k, p, cosine)`
+    requires it. We use an isinstance check (not duck typing) because MagicMock-based
+    test verifiers respond truthfully to any `hasattr` check.
+    """
+    if isinstance(verifier, EmbeddingsOnlyVerifier):
+        return verifier.verify(k, p, cosine)
+    return verifier.verify(k, p)
 
 
 def _kalshi_url(ticker: str) -> str:
@@ -90,13 +105,13 @@ def run_pipeline(
     for k in result.kalshi:
         k_vec = embedder.embed(k)
         candidates = retrieval.query(k_vec) if len(result.poly) > 0 else []
-        for poly_ticker, _cosine in candidates:
+        for poly_ticker, cosine in candidates:
             p = poly_by_ticker.get(poly_ticker)
             if p is None:
                 continue
-            decision = verifier.verify(k, p)
+            decision = _call_verifier(verifier, k, p, cosine)
             override = overrides.lookup(k.ticker, p.condition_id)
-            ai_accept = decision.accepted
+            ai_accept = decision.is_accepted(min_confidence=cfg.acceptance_min_confidence)
             if override == OverrideOutcome.BLACKLIST:
                 final_accepted = False
             elif override == OverrideOutcome.WHITELIST:
@@ -174,12 +189,26 @@ def _project_root() -> Path:
     return Path(__file__).resolve().parents[4]
 
 
+def _embeddings_only_mode(no_llm_flag: bool) -> bool:
+    """Pick mode from CLI flag (priority) or `EMBEDDINGS_ONLY` env var."""
+    if no_llm_flag:
+        return True
+    val = os.environ.get("EMBEDDINGS_ONLY", "").lower()
+    return val in ("1", "true", "yes")
+
+
 def run_pipeline_default(
     loop_mode: bool = False,
     category: str | None = None,
     sample: int | None = None,
+    no_llm: bool = False,
 ) -> int:
-    """Construct real components and run once. Used by the CLI."""
+    """Construct real components and run once. Used by the CLI.
+
+    With `no_llm=True` (or `EMBEDDINGS_ONLY=1`), skip the Claude verification stage
+    and accept pairs purely on embedding cosine similarity. Cheaper but weaker —
+    embeddings cluster by topical similarity, not by resolution-criteria identity.
+    """
     project_root = _project_root()
     cfg = PipelineConfig(
         project_root=project_root,
@@ -191,18 +220,32 @@ def run_pipeline_default(
         llm_model="",
     )
 
-    import anthropic
-
     from ai_matcher.embedder import Embedder
 
     embedder = Embedder(cache_path=project_root / ".ai_matcher_cache.json")
     cfg.embedding_model = embedder.model_name
-    client = anthropic.Anthropic()
-    verifier = Verifier(
-        client=client,
-        cache_path=project_root / ".ai_matcher_verifier_cache.json",
-    )
-    cfg.llm_model = verifier.model
+
+    if _embeddings_only_mode(no_llm):
+        accept_cosine = float(os.environ.get("EMBEDDINGS_ACCEPT_COSINE", "0.85"))
+        verifier: Any = EmbeddingsOnlyVerifier(accept_cosine=accept_cosine)
+        cfg.llm_model = verifier.model
+        # Lower the acceptance floor so cosine-as-confidence isn't filtered by
+        # the LLM-tuned 0.9 default. Tune via EMBEDDINGS_ACCEPT_COSINE.
+        cfg.acceptance_min_confidence = accept_cosine
+        print(
+            f"[ai_matcher] embeddings-only mode (cosine threshold={accept_cosine}, "
+            "no LLM verification)"
+        )
+    else:
+        import anthropic
+
+        client = anthropic.Anthropic()
+        verifier = Verifier(
+            client=client,
+            cache_path=project_root / ".ai_matcher_verifier_cache.json",
+        )
+        cfg.llm_model = verifier.model
+
     ingestion = Ingestion()
 
     summary = run_pipeline(cfg, ingestion=ingestion, embedder=embedder, verifier=verifier)
