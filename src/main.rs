@@ -49,7 +49,7 @@ use config::{ARB_THRESHOLD, ENABLED_LEAGUES, WS_RECONNECT_DELAY_SECS};
 use discovery::DiscoveryClient;
 use execution::{ExecutionEngine, create_execution_channel, run_execution_loop};
 use kalshi::{KalshiConfig, KalshiApiClient};
-use polymarket_clob::{PolymarketAsyncClient, PreparedCreds, SharedAsyncClient};
+use polymarket_clob::{ApiCreds, PolymarketAsyncClient, PreparedCreds, SharedAsyncClient};
 use position_tracker::{PositionTracker, create_position_channel, position_writer_loop};
 use types::{GlobalState, PriceCents};
 
@@ -92,15 +92,38 @@ async fn main() -> Result<()> {
     let poly_funder = std::env::var("POLY_FUNDER")
         .context("POLY_FUNDER not set (your wallet address)")?;
 
-    // Create async Polymarket client and derive API credentials
-    info!("[POLYMARKET] Creating async client and deriving API credentials...");
+    // Create async Polymarket client and obtain API credentials.
+    //
+    // Three paths, in priority order:
+    //   1. Pre-set env vars (POLY_API_KEY/POLY_SECRET/POLY_PASSPHRASE) — fastest
+    //      and survives any CLOB endpoint quirks. Use after a one-time fetch
+    //      via py-clob-client-v2 if CLOB endpoints misbehave.
+    //   2. GET /auth/api-key (existing creds) — V2-friendly for wallets that
+    //      already had creds derived in V1.
+    //   3. POST /auth/derive-api-key (create new) — V2 may 400 if creds exist.
+    info!("[POLYMARKET] Creating async client...");
     let poly_async_client = PolymarketAsyncClient::new(
         POLY_CLOB_HOST,
         POLYGON_CHAIN_ID,
         &poly_private_key,
         &poly_funder,
     )?;
-    let api_creds = poly_async_client.derive_api_key(0).await?;
+
+    let api_creds = if let (Ok(k), Ok(s), Ok(p)) = (
+        std::env::var("POLY_API_KEY"),
+        std::env::var("POLY_SECRET"),
+        std::env::var("POLY_PASSPHRASE"),
+    ) {
+        info!("[POLYMARKET] Using API creds from env (POLY_API_KEY/POLY_SECRET/POLY_PASSPHRASE)");
+        ApiCreds {
+            api_key: k,
+            api_secret: s,
+            api_passphrase: p,
+        }
+    } else {
+        info!("[POLYMARKET] Resolving API creds via CLOB (try existing → derive new)...");
+        poly_async_client.get_or_derive_api_key().await?
+    };
     let prepared_creds = PreparedCreds::from_api_creds(&api_creds)?;
     let poly_async = Arc::new(SharedAsyncClient::new(poly_async_client, prepared_creds, POLYGON_CHAIN_ID));
 

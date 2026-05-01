@@ -547,7 +547,12 @@ impl PolymarketAsyncClient {
         Ok(headers)
     }
 
-    /// Derive API credentials from L1 wallet signature
+    /// Derive API credentials from L1 wallet signature.
+    ///
+    /// On CLOB V2, this endpoint may return 400 if the wallet already has
+    /// API creds — it now strictly creates new ones. Use `get_api_creds`
+    /// first to check for existing creds, then fall back to derive only when
+    /// the wallet has none.
     pub async fn derive_api_key(&self, nonce: u64) -> Result<ApiCreds> {
         let url = format!("{}/auth/derive-api-key", self.host);
         let headers = self.build_l1_headers(nonce)?;
@@ -558,6 +563,47 @@ impl PolymarketAsyncClient {
             return Err(anyhow!("derive-api-key failed: {} {}", status, body));
         }
         Ok(resp.json().await?)
+    }
+
+    /// Retrieve existing API credentials for this wallet via L1 auth.
+    ///
+    /// V2-friendly path: `/auth/api-key` (singular GET) returns the wallet's
+    /// existing creds if any. Different from `derive-api-key` which creates new.
+    /// Returns Ok(None) when the wallet has no existing creds (404 response),
+    /// Err on any other failure.
+    pub async fn get_api_creds(&self, nonce: u64) -> Result<Option<ApiCreds>> {
+        let url = format!("{}/auth/api-key", self.host);
+        let headers = self.build_l1_headers(nonce)?;
+        let resp = self.http.get(&url).headers(headers).send().await?;
+        let status = resp.status();
+        if status == reqwest::StatusCode::NOT_FOUND {
+            return Ok(None);
+        }
+        if !status.is_success() {
+            let body = resp.text().await.unwrap_or_default();
+            return Err(anyhow!("get_api_creds failed: {} {}", status, body));
+        }
+        Ok(Some(resp.json().await?))
+    }
+
+    /// Get existing API creds, falling back to deriving new ones if none exist.
+    /// This is the V2-safe path that handles both fresh and pre-existing wallets.
+    pub async fn get_or_derive_api_key(&self) -> Result<ApiCreds> {
+        match self.get_api_creds(0).await {
+            Ok(Some(creds)) => {
+                tracing::info!("[POLYMARKET] Using existing API creds via GET /auth/api-key");
+                Ok(creds)
+            }
+            Ok(None) => {
+                tracing::info!("[POLYMARKET] No existing creds; deriving new ones");
+                self.derive_api_key(0).await
+            }
+            Err(e) => {
+                // GET /auth/api-key failed with non-404 — log and try derive as a fallback.
+                tracing::warn!("[POLYMARKET] get_api_creds failed ({}), trying derive-api-key", e);
+                self.derive_api_key(0).await
+            }
+        }
     }
 
     /// Build L2 headers for authenticated requests
