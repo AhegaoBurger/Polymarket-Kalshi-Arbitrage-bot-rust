@@ -1,0 +1,75 @@
+<!DOCTYPE html>
+<html lang="en">
+<head>
+<meta charset="utf-8">
+<title>ai_matcher — {{ title }}</title>
+<style>
+  body { font-family: -apple-system, sans-serif; max-width: 1400px; margin: 1em auto; padding: 0 1em; }
+  table { border-collapse: collapse; width: 100%; }
+  th, td { border: 1px solid #ccc; padding: 0.5em; vertical-align: top; font-size: 0.9em; }
+  th { background: #f4f4f4; text-align: left; }
+  .accept { background: #e8f5e9; }
+  .reject { background: #ffebee; }
+  .conf { font-weight: bold; font-variant-numeric: tabular-nums; }
+  pre.snippet { background: #fafafa; padding: 0.4em; font-size: 0.8em; white-space: pre-wrap; }
+  .filters a { margin-right: 1em; }
+</style>
+</head>
+<body>
+<h1>{{ title }}</h1>
+<p class="filters">
+  <a href="report.html">all</a>
+  <a href="report-accepted.html">accepted only</a>
+  <a href="report-rejected.html">rejected only</a>
+  {% for cat in categories %}
+  <a href="report-by-category-{{ cat | lower }}.html">{{ cat }}</a>
+  {% endfor %}
+</p>
+<p>{{ rows | length }} pair(s).</p>
+<table>
+<thead>
+<tr>
+  <th>Decision</th>
+  <th>Kalshi</th>
+  <th>Polymarket</th>
+  <th>LLM analysis</th>
+  <th>Override snippet</th>
+</tr>
+</thead>
+<tbody>
+{% for row in rows %}
+<tr class="{{ 'accept' if row.accepted else 'reject' }}">
+  <td>
+    {{ '✅' if row.accepted else '❌' }}
+    <span class="conf">{{ '%.2f' | format(row.decision.confidence) }}</span><br>
+    {{ row.decision.event_type }}
+  </td>
+  <td>
+    <a href="{{ row.kalshi_url }}">{{ row.kalshi_ticker }}</a><br>
+    <strong>{{ row.kalshi_title }}</strong><br>
+    {{ row.kalshi_description }}<br>
+    <em>{{ row.kalshi_resolution }}</em><br>
+    Outcomes: {{ row.kalshi_outcomes | join(', ') }}
+  </td>
+  <td>
+    <a href="{{ row.poly_url }}">{{ row.poly_slug }}</a><br>
+    <strong>{{ row.poly_title }}</strong><br>
+    {{ row.poly_description }}<br>
+    <em>{{ row.poly_resolution }}</em><br>
+    Outcomes: {{ row.poly_outcomes | join(', ') }}
+  </td>
+  <td>
+    Category: {{ row.decision.category }}<br>
+    Concerns:
+    <ul>
+      {% for c in row.decision.concerns %}<li>{{ c }}</li>{% else %}<li>None</li>{% endfor %}
+    </ul>
+    Reasoning: {{ row.decision.reasoning }}
+  </td>
+  <td><pre class="snippet">{{ row.override_snippet }}</pre></td>
+</tr>
+{% endfor %}
+</tbody>
+</table>
+</body>
+</html>

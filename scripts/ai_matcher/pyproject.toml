@@ -22,6 +22,9 @@ build-backend = "hatchling.build"
 [tool.hatch.build.targets.wheel]
 packages = ["src/ai_matcher"]
 
+[tool.hatch.build.targets.wheel.force-include]
+"src/ai_matcher/templates" = "ai_matcher/templates"
+
 [tool.ruff]
 line-length = 100
 target-version = "py311"
