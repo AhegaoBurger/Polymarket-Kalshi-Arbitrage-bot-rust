@@ -134,6 +134,50 @@ impl DiscoveryClient {
                 }
             }
         }
+
+        // Merge AI-matched pairs from the standalone sidecar's `.ai_matches.json`.
+        // Structured pairs win on collision (spec §4.8 safety gate 7).
+        let max_age = crate::config::ai_matches_max_age_secs();
+        match crate::adapters::ai_reader::load_ai_matches(None, max_age, chrono::Utc::now()) {
+            Ok(ai_pairs) => {
+                let structured_keys: rustc_hash::FxHashSet<(String, String)> = result
+                    .pairs
+                    .iter()
+                    .map(|p| {
+                        (
+                            p.kalshi_market_ticker.to_string(),
+                            p.poly_condition_id.to_string(),
+                        )
+                    })
+                    .collect();
+                let mut added = 0usize;
+                let mut collisions = 0usize;
+                for ai in ai_pairs {
+                    let key = (
+                        ai.kalshi_market_ticker.to_string(),
+                        ai.poly_condition_id.to_string(),
+                    );
+                    if structured_keys.contains(&key) {
+                        collisions += 1;
+                        info!(
+                            "[AI] collision with structured pair, AI dropped: {}",
+                            ai.pair_id
+                        );
+                        continue;
+                    }
+                    result.pairs.push(ai);
+                    added += 1;
+                }
+                if added > 0 || collisions > 0 {
+                    info!(
+                        "[AI] merged {} pairs ({} collisions skipped)",
+                        added, collisions
+                    );
+                }
+            }
+            Err(e) => warn!("[AI] failed to load .ai_matches.json: {}", e),
+        }
+
         result.kalshi_events_found = result.pairs.len();
         result
     }
