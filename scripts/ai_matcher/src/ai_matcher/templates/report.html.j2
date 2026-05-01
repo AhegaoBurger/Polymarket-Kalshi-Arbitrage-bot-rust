@@ -10,6 +10,11 @@
   th { background: #f4f4f4; text-align: left; }
   .accept { background: #e8f5e9; }
   .reject { background: #ffebee; }
+  .override-whitelist { background: #fff3cd; border-left: 4px solid #ffa000; }
+  .override-blacklist { background: #f0e0f8; border-left: 4px solid #6a1b9a; }
+  .override-label { display: inline-block; padding: 0.1em 0.4em; border-radius: 3px;
+                    background: #444; color: white; font-size: 0.75em;
+                    font-weight: bold; margin-top: 0.3em; }
   .conf { font-weight: bold; font-variant-numeric: tabular-nums; }
   pre.snippet { background: #fafafa; padding: 0.4em; font-size: 0.8em; white-space: pre-wrap; }
   .filters a { margin-right: 1em; }
@@ -38,11 +43,21 @@
 </thead>
 <tbody>
 {% for row in rows %}
-<tr class="{{ 'accept' if row.accepted else 'reject' }}">
+{% set base_class = 'accept' if row.accepted else 'reject' %}
+{% set override_class = 'override-whitelist' if row.override_outcome == 'whitelist'
+                        else ('override-blacklist' if row.override_outcome == 'blacklist' else '') %}
+<tr class="{{ base_class }} {{ override_class }}">
   <td>
     {{ '✅' if row.accepted else '❌' }}
     <span class="conf">{{ '%.2f' | format(row.decision.confidence) }}</span><br>
     {{ row.decision.event_type }}
+    {% if row.override_outcome == 'whitelist' %}
+    <br><span class="override-label">⚠ WHITELIST OVERRIDE</span>
+    <br><small>Forced accept — LLM said {{ '%.2f' | format(row.decision.confidence) }}</small>
+    {% elif row.override_outcome == 'blacklist' %}
+    <br><span class="override-label">⚠ BLACKLIST OVERRIDE</span>
+    <br><small>Forced reject — LLM said {{ '%.2f' | format(row.decision.confidence) }}</small>
+    {% endif %}
   </td>
   <td>
     <a href="{{ row.kalshi_url }}">{{ row.kalshi_ticker }}</a><br>

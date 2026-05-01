@@ -28,6 +28,9 @@ class PairAuditRow:
     decision: Decision
     accepted: bool
     override_snippet: str
+    # "none" | "whitelist" | "blacklist" — surfaced visually so the auditor
+    # can tell at a glance when manual_overrides.json flipped the LLM verdict.
+    override_outcome: str = "none"
 
 
 def _env() -> Environment:

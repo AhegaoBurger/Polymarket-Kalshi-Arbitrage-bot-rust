@@ -54,3 +54,24 @@ def test_renders_filter_variants(tmp_path: Path):
     rejected = (tmp_path / "report-rejected.html").read_text()
     assert "0.97" in accepted and "0.6" not in accepted
     assert "0.6" in rejected
+
+
+def test_whitelist_override_is_visible_in_report(tmp_path: Path):
+    """Spec §4.6.4: an auditor must be able to tell from the HTML when a
+    whitelist override flipped an LLM rejection to accepted."""
+    row = mk_row("accept", confidence=0.6, category="Politics")
+    row.override_outcome = "whitelist"
+    render_report([row], tmp_path)
+    main = (tmp_path / "report.html").read_text()
+    assert "WHITELIST OVERRIDE" in main
+    assert "Forced accept" in main
+
+
+def test_blacklist_override_is_visible_in_report(tmp_path: Path):
+    row = mk_row("accept", confidence=0.97, category="Economics")
+    row.accepted = False
+    row.override_outcome = "blacklist"
+    render_report([row], tmp_path)
+    main = (tmp_path / "report.html").read_text()
+    assert "BLACKLIST OVERRIDE" in main
+    assert "Forced reject" in main

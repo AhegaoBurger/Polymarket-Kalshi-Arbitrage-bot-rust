@@ -162,9 +162,13 @@ impl ExecutionEngine {
 
         // Detection-only gate for adapters still in soak-test rollout.
         if should_block_for_detection_only(pair) {
+            let env_var = match &pair.match_source {
+                crate::fees::MatchSource::Ai { .. } => "EXEC_ALLOW_AI_MATCHES",
+                _ => "EXEC_ALLOW_FOMC",
+            };
             info!(
-                "[EXEC] 🛑 detection-only: dropping pair {} (adapter={:?}). Set EXEC_ALLOW_FOMC=1 to enable.",
-                pair.pair_id, pair.match_source
+                "[EXEC] 🛑 detection-only: dropping pair {} (source={:?}). Set {}=1 to enable.",
+                pair.pair_id, pair.match_source, env_var
             );
             self.release_in_flight(market_id);
             return Ok(ExecutionResult {

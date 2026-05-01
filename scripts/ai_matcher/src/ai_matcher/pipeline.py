@@ -135,6 +135,7 @@ def run_pipeline(
                 decision=decision,
                 accepted=final_accepted,
                 override_snippet=_override_snippet(k.ticker, p.condition_id),
+                override_outcome=override.value,
             ))
 
             audit_log_lines.append(json.dumps({
