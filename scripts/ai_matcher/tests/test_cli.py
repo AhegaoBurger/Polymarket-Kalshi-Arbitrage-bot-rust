@@ -17,14 +17,27 @@ def test_run_subcommand_returns_zero_via_pipeline():
     with patch("ai_matcher.pipeline.run_pipeline_default", return_value=0) as mock_run:
         rc = main(["run"])
     assert rc == 0
-    mock_run.assert_called_once_with(loop_mode=False, category=None, sample=None)
+    mock_run.assert_called_once_with(
+        loop_mode=False, category=None, sample=None, no_llm=False
+    )
 
 
 def test_run_subcommand_passes_flags_through():
     with patch("ai_matcher.pipeline.run_pipeline_default", return_value=0) as mock_run:
         rc = main(["run", "--loop", "--category", "politics", "--sample", "50"])
     assert rc == 0
-    mock_run.assert_called_once_with(loop_mode=True, category="politics", sample=50)
+    mock_run.assert_called_once_with(
+        loop_mode=True, category="politics", sample=50, no_llm=False
+    )
+
+
+def test_run_subcommand_no_llm_flag():
+    with patch("ai_matcher.pipeline.run_pipeline_default", return_value=0) as mock_run:
+        rc = main(["run", "--no-llm"])
+    assert rc == 0
+    mock_run.assert_called_once_with(
+        loop_mode=False, category=None, sample=None, no_llm=True
+    )
 
 
 def test_audit_subcommand_default_sample():

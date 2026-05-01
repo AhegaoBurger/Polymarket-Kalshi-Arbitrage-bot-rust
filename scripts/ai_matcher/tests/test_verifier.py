@@ -4,7 +4,7 @@ from pathlib import Path
 from unittest.mock import MagicMock
 
 from ai_matcher.ingestion import Market
-from ai_matcher.verifier import Verifier
+from ai_matcher.verifier import Decision, EmbeddingsOnlyVerifier, Verifier
 
 
 def mk_pair():
@@ -70,3 +70,67 @@ def test_verifier_caches_decision(tmp_path: Path):
     v.verify(k, p)
     assert client.messages.create.call_count == 1
     assert v.cache_hits == 1
+
+
+# === EmbeddingsOnlyVerifier =================================================
+
+
+def test_embeddings_only_accepts_when_cosine_clears_threshold():
+    v = EmbeddingsOnlyVerifier(accept_cosine=0.85)
+    k, p = mk_pair()
+    d = v.verify(k, p, cosine=0.91)
+    assert d.confidence == 0.91
+    assert d.resolution_match
+    assert d.concerns == []
+    assert d.is_accepted(min_confidence=0.85)
+    assert "embeddings-only" in d.reasoning
+
+
+def test_embeddings_only_rejects_when_cosine_below_threshold():
+    v = EmbeddingsOnlyVerifier(accept_cosine=0.85)
+    k, p = mk_pair()
+    d = v.verify(k, p, cosine=0.7)
+    assert not d.resolution_match
+    assert d.concerns
+    assert not d.is_accepted(min_confidence=0.85)
+
+
+def test_embeddings_only_no_api_key_required():
+    """The whole point: no Anthropic client involved."""
+    v = EmbeddingsOnlyVerifier()
+    assert v.model == "embeddings-only"
+    # Smoke check: verify() runs without any client at all.
+    k, p = mk_pair()
+    d = v.verify(k, p, cosine=0.99)
+    assert d.is_accepted(min_confidence=0.85)
+
+
+# === Decision.is_accepted ===================================================
+
+
+def test_decision_is_accepted_respects_custom_floor():
+    d = Decision(
+        confidence=0.72,
+        resolution_match=True,
+        concerns=[],
+        reasoning="x",
+        category="",
+        event_type="Other",
+    )
+    # Default LLM floor (0.9) rejects 0.72.
+    assert not d.is_accepted()
+    assert not d.accepted
+    # Embeddings floor (0.7) accepts.
+    assert d.is_accepted(min_confidence=0.7)
+
+
+def test_decision_is_accepted_requires_no_concerns():
+    d = Decision(
+        confidence=0.99,
+        resolution_match=True,
+        concerns=["something"],
+        reasoning="x",
+        category="",
+        event_type="Other",
+    )
+    assert not d.is_accepted(min_confidence=0.0)

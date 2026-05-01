@@ -14,6 +14,9 @@ def build_parser() -> argparse.ArgumentParser:
                      help="Loop with per-category TTLs")
     run.add_argument("--category", help="Restrict to a single category")
     run.add_argument("--sample", type=int, help="Cap sample size per category")
+    run.add_argument("--no-llm", dest="no_llm", action="store_true",
+                     help="Skip Claude verification; decide pairs on cosine similarity alone "
+                          "(cheaper, much weaker — embeddings can't catch resolution-criteria mismatches)")
 
     sub.add_parser("review", help="Open audit/report.html")
     audit = sub.add_parser("audit", help="Random spot-check accepted pairs")
@@ -31,6 +34,7 @@ def main(argv: list[str] | None = None) -> int:
             loop_mode=args.loop_mode,
             category=args.category,
             sample=args.sample,
+            no_llm=args.no_llm,
         )
     if args.command == "review":
         from ai_matcher.pipeline import review_default
