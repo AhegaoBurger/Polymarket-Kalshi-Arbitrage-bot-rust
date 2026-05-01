@@ -26,9 +26,12 @@ def build_parser() -> argparse.ArgumentParser:
 def main(argv: list[str] | None = None) -> int:
     args = build_parser().parse_args(argv)
     if args.command == "run":
-        print(f"[ai_matcher] run (loop={args.loop_mode}, "
-              f"category={args.category}, sample={args.sample})")
-        return 0
+        from ai_matcher.pipeline import run_pipeline_default
+        return run_pipeline_default(
+            loop_mode=args.loop_mode,
+            category=args.category,
+            sample=args.sample,
+        )
     if args.command == "review":
         print("[ai_matcher] review — not yet wired (Task 11)")
         return 0
