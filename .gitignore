@@ -9,3 +9,16 @@ claude.md
 positions.json
 .discovery_cache.json
 .worktrees/
+
+# ai_matcher sidecar
+scripts/ai_matcher/.venv/
+scripts/ai_matcher/.uv-cache/
+scripts/ai_matcher/__pycache__/
+scripts/ai_matcher/**/__pycache__/
+.ai_matches.json
+.ai_matches.json.tmp
+.ai_matcher_cache.json
+.ai_matcher_verifier_cache.json
+.ai_matcher_audit.jsonl
+.ai_matcher_schedule.json
+audit/
