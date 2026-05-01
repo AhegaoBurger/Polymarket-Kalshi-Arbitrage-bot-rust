@@ -163,3 +163,66 @@ pub fn spawn_refresh_task(
         }
     });
 }
+
+/// Parse the `POLY_BALANCE_USDC` env-var value into USDC micros.
+///
+/// Returns `None` for missing or unparseable values. Whitespace around the
+/// number is tolerated. Negative values are clamped to 0 so the cache never
+/// holds a value that would underflow `commit_poly`.
+pub fn parse_poly_balance_env(raw: Option<&str>) -> Option<u64> {
+    let s = raw?.trim();
+    if s.is_empty() {
+        return None;
+    }
+    let usdc = s.parse::<f64>().ok()?;
+    if !usdc.is_finite() {
+        return None;
+    }
+    let micros = (usdc.max(0.0) * 1_000_000.0).round();
+    Some(micros as u64)
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    #[test]
+    fn parse_none_when_unset() {
+        assert_eq!(parse_poly_balance_env(None), None);
+    }
+
+    #[test]
+    fn parse_none_when_empty_or_whitespace() {
+        assert_eq!(parse_poly_balance_env(Some("")), None);
+        assert_eq!(parse_poly_balance_env(Some("   ")), None);
+    }
+
+    #[test]
+    fn parse_decimal_dollars_to_micros() {
+        assert_eq!(parse_poly_balance_env(Some("23.87")), Some(23_870_000));
+        assert_eq!(parse_poly_balance_env(Some("10")), Some(10_000_000));
+        assert_eq!(parse_poly_balance_env(Some("0.000001")), Some(1));
+    }
+
+    #[test]
+    fn parse_tolerates_surrounding_whitespace() {
+        assert_eq!(parse_poly_balance_env(Some("  10.00  ")), Some(10_000_000));
+    }
+
+    #[test]
+    fn parse_returns_none_for_garbage() {
+        assert_eq!(parse_poly_balance_env(Some("nope")), None);
+        assert_eq!(parse_poly_balance_env(Some("1.2.3")), None);
+    }
+
+    #[test]
+    fn parse_clamps_negative_to_zero() {
+        assert_eq!(parse_poly_balance_env(Some("-5.00")), Some(0));
+    }
+
+    #[test]
+    fn parse_rejects_nan_and_inf() {
+        assert_eq!(parse_poly_balance_env(Some("NaN")), None);
+        assert_eq!(parse_poly_balance_env(Some("inf")), None);
+    }
+}
