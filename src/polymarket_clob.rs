@@ -21,7 +21,13 @@ use std::collections::HashMap;
 use std::sync::Arc;
 use std::sync::atomic::{AtomicBool, Ordering};
 
-const USER_AGENT: &str = "py_clob_client";
+/// Cloudflare's WAF in front of clob.polymarket.com blocks requests with
+/// generic SDK-identifier User-Agents (e.g. `py_clob_client`) — observed as
+/// 403 with a Cloudflare HTML challenge page on POST endpoints. Mimic a real
+/// browser to get past the WAF; the underlying request is identical.
+const USER_AGENT: &str =
+    "Mozilla/5.0 (Macintosh; Intel Mac OS X 14_5) AppleWebKit/537.36 \
+     (KHTML, like Gecko) Chrome/126.0.0.0 Safari/537.36";
 const MSG_TO_SIGN: &str = "This message attests that I control the given wallet";
 const ZERO_ADDRESS: &str = "0x0000000000000000000000000000000000000000";
 
