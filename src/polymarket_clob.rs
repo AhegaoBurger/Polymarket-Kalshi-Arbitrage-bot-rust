@@ -117,6 +117,15 @@ fn current_unix_ts_ms() -> u64 {
     SystemTime::now().duration_since(UNIX_EPOCH).unwrap().as_millis() as u64
 }
 
+/// L1-auth single-use nonce. Polymarket V2's `derive-api-key` and `api-key`
+/// endpoints reject reused (signer, nonce) pairs — using `0` always (as the
+/// bot did pre-V2) yields a generic "Could not derive api key!" 400 after
+/// the first call. Unix-nanoseconds is monotonically increasing across
+/// process restarts and unique enough that collisions are negligible.
+fn fresh_nonce() -> u64 {
+    SystemTime::now().duration_since(UNIX_EPOCH).unwrap().as_nanos() as u64
+}
+
 /// V2 EIP-712 zero-bytes32 used for `metadata` and `builder` when no value
 /// is being attached (which is the bot's default — we're not a builder).
 const ZERO_BYTES32: &str = "0x0000000000000000000000000000000000000000000000000000000000000000";
@@ -586,19 +595,31 @@ impl PolymarketAsyncClient {
 
     /// Resolve API creds via the V2-friendly path: try `create_api_key` first
     /// (POST /auth/api-key — works on V2), fall back to `derive_api_key`
-    /// (GET /auth/derive-api-key — may 400 on V2 if creds already exist).
+    /// (GET /auth/derive-api-key — V1-idempotent fallback).
+    ///
+    /// **Each call uses a fresh unique nonce.** Polymarket's L1 auth treats
+    /// every (signer, nonce) as single-use; reusing nonce 0 (as the bot did
+    /// pre-V2) returned the same creds in V1 but returns "Could not derive
+    /// api key!" 400 in V2. Nonce is the current unix nanoseconds — unique
+    /// per call across process restarts.
     pub async fn get_or_derive_api_key(&self) -> Result<ApiCreds> {
-        match self.create_api_key(0).await {
+        let nonce = fresh_nonce();
+        match self.create_api_key(nonce).await {
             Ok(creds) => {
-                tracing::info!("[POLYMARKET] Created new API creds via POST /auth/api-key");
+                tracing::info!(
+                    "[POLYMARKET] Created new API creds via POST /auth/api-key (nonce={})",
+                    nonce
+                );
                 Ok(creds)
             }
             Err(e) => {
+                let nonce2 = fresh_nonce();
                 tracing::warn!(
-                    "[POLYMARKET] create_api_key failed ({}), falling back to derive-api-key",
-                    e
+                    "[POLYMARKET] create_api_key failed ({}), falling back to derive-api-key with new nonce={}",
+                    e,
+                    nonce2
                 );
-                self.derive_api_key(0).await
+                self.derive_api_key(nonce2).await
             }
         }
     }
