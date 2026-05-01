@@ -118,48 +118,71 @@ impl Default for BalanceCache {
 /// Fetch both exchange balances and store into the cache. Used for the startup
 /// priming call (must succeed) and each tick of the background refresh task
 /// (best-effort — failures are logged but don't abort the loop).
+///
+/// `refresh_poly` controls whether the Polymarket leg is fetched. Pass `false`
+/// when the Polymarket value is being managed manually (via
+/// `POLY_BALANCE_USDC`) — the cache value is then owned exclusively by
+/// `commit_poly` and survives across refresh ticks.
 pub async fn refresh_once(
     cache: &BalanceCache,
     kalshi: &KalshiApiClient,
     poly: &SharedAsyncClient,
+    refresh_poly: bool,
 ) -> Result<()> {
-    let (kalshi_res, poly_res) = tokio::join!(
-        kalshi.fetch_balance_cents(),
-        poly.fetch_poly_balance_usdc_micros(),
-    );
+    if refresh_poly {
+        let (kalshi_res, poly_res) = tokio::join!(
+            kalshi.fetch_balance_cents(),
+            poly.fetch_poly_balance_usdc_micros(),
+        );
 
-    match kalshi_res {
-        Ok(cents) => {
-            cache.set_kalshi_cents(cents);
-            debug!("[BALANCE] Kalshi: {} cents (${:.2})", cents, cents as f64 / 100.0);
+        match kalshi_res {
+            Ok(cents) => {
+                cache.set_kalshi_cents(cents);
+                debug!("[BALANCE] Kalshi: {} cents (${:.2})", cents, cents as f64 / 100.0);
+            }
+            Err(e) => warn!("[BALANCE] Kalshi fetch failed: {}", e),
         }
-        Err(e) => warn!("[BALANCE] Kalshi fetch failed: {}", e),
-    }
-    match poly_res {
-        Ok(micros) => {
-            cache.set_poly_usdc_micros(micros);
-            debug!("[BALANCE] Poly: {} micros (${:.2})", micros, micros as f64 / 1_000_000.0);
+        match poly_res {
+            Ok(micros) => {
+                cache.set_poly_usdc_micros(micros);
+                debug!("[BALANCE] Poly: {} micros (${:.2})", micros, micros as f64 / 1_000_000.0);
+            }
+            Err(e) => warn!("[BALANCE] Poly fetch failed: {}", e),
         }
-        Err(e) => warn!("[BALANCE] Poly fetch failed: {}", e),
+    } else {
+        match kalshi.fetch_balance_cents().await {
+            Ok(cents) => {
+                cache.set_kalshi_cents(cents);
+                debug!("[BALANCE] Kalshi: {} cents (${:.2})", cents, cents as f64 / 100.0);
+            }
+            Err(e) => warn!("[BALANCE] Kalshi fetch failed: {}", e),
+        }
     }
     Ok(())
 }
 
 /// Spawn a background task that refreshes the balance cache every
 /// `REFRESH_INTERVAL`. Non-fatal: failures are warned and the loop continues.
+///
+/// `refresh_poly` is forwarded to `refresh_once` on every tick — see its docs
+/// for manual-mode semantics.
 pub fn spawn_refresh_task(
     cache: Arc<BalanceCache>,
     kalshi: Arc<KalshiApiClient>,
     poly: Arc<SharedAsyncClient>,
+    refresh_poly: bool,
 ) {
     tokio::spawn(async move {
-        info!("[BALANCE] Refresh task started ({:?} interval)", REFRESH_INTERVAL);
+        info!(
+            "[BALANCE] Refresh task started ({:?} interval, refresh_poly={})",
+            REFRESH_INTERVAL, refresh_poly,
+        );
         let mut ticker = tokio::time::interval(REFRESH_INTERVAL);
         ticker.set_missed_tick_behavior(tokio::time::MissedTickBehavior::Skip);
         ticker.tick().await;
         loop {
             ticker.tick().await;
-            let _ = refresh_once(&cache, &kalshi, &poly).await;
+            let _ = refresh_once(&cache, &kalshi, &poly, refresh_poly).await;
         }
     });
 }

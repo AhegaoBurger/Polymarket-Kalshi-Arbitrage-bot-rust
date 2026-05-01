@@ -145,7 +145,7 @@ async fn main() -> Result<()> {
     // Balance cache: prime at startup (blocking) so the first opportunity
     // doesn't see zeros; then spawn a background refresh task.
     let balance_cache = Arc::new(balance::BalanceCache::new());
-    match balance::refresh_once(&balance_cache, &kalshi_api, &poly_async).await {
+    match balance::refresh_once(&balance_cache, &kalshi_api, &poly_async, true).await {
         Ok(()) => info!(
             "[BALANCE] Primed at startup: Kalshi=${:.2}, Poly=${:.2}",
             balance_cache.kalshi_cents() as f64 / 100.0,
@@ -157,6 +157,7 @@ async fn main() -> Result<()> {
         balance_cache.clone(),
         kalshi_api.clone(),
         poly_async.clone(),
+        true,
     );
 
     // Run discovery (with caching support)
