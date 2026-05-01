@@ -18,6 +18,7 @@ use crate::fees::MatchSource;
 use crate::types::{MarketPair, MarketType};
 
 pub mod sports;
+pub mod fomc;
 
 /// A pair of CanonicalMarket vectors ready for the shared pair-join.
 /// Adapters produce this; they never emit `MarketPair` directly.

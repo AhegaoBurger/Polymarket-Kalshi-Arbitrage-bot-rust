@@ -180,3 +180,71 @@ pub fn get_league_config(league: &str) -> Option<LeagueConfig> {
         .into_iter()
         .find(|c| c.league_code == league || c.poly_prefix == league)
 }
+
+/// FOMC adapter master switch. Default ON; set `FOMC_ENABLED=0` to disable
+/// (e.g. if FRED is down and we want to roll back without redeploying).
+pub fn fomc_enabled() -> bool {
+    std::env::var("FOMC_ENABLED")
+        .map(|v| v != "0" && v.to_lowercase() != "false")
+        .unwrap_or(true)
+}
+
+/// Detection-only gate for FOMC pairs. Default OFF — the first live meeting
+/// is a soak test. Flip to `1` once we've verified pair quality post-meeting.
+pub fn exec_allow_fomc() -> bool {
+    std::env::var("EXEC_ALLOW_FOMC")
+        .map(|v| v == "1" || v.to_lowercase() == "true")
+        .unwrap_or(false)
+}
+
+/// Optional FRED API key. Without it the FRED endpoint still works but is
+/// rate-limited; with it we get a per-key quota. See spec §4.5.
+pub fn fred_api_key() -> Option<String> {
+    std::env::var("FRED_API_KEY").ok().filter(|s| !s.is_empty())
+}
+
+// NOTE: tests mutate env; require --test-threads=1
+#[cfg(test)]
+mod tests {
+    use super::*;
+    use std::env;
+
+    #[test]
+    fn fomc_enabled_defaults_to_true() {
+        env::remove_var("FOMC_ENABLED");
+        assert!(fomc_enabled());
+    }
+
+    #[test]
+    fn fomc_enabled_respects_zero() {
+        env::set_var("FOMC_ENABLED", "0");
+        assert!(!fomc_enabled());
+        env::remove_var("FOMC_ENABLED");
+    }
+
+    #[test]
+    fn exec_allow_fomc_defaults_to_false() {
+        env::remove_var("EXEC_ALLOW_FOMC");
+        assert!(!exec_allow_fomc());
+    }
+
+    #[test]
+    fn exec_allow_fomc_true_when_set_to_one() {
+        env::set_var("EXEC_ALLOW_FOMC", "1");
+        assert!(exec_allow_fomc());
+        env::remove_var("EXEC_ALLOW_FOMC");
+    }
+
+    #[test]
+    fn fred_api_key_returns_none_when_unset() {
+        env::remove_var("FRED_API_KEY");
+        assert!(fred_api_key().is_none());
+    }
+
+    #[test]
+    fn fred_api_key_returns_some_when_set() {
+        env::set_var("FRED_API_KEY", "abc123");
+        assert_eq!(fred_api_key().as_deref(), Some("abc123"));
+        env::remove_var("FRED_API_KEY");
+    }
+}

@@ -160,6 +160,22 @@ impl ExecutionEngine {
         let pair = market.pair.as_ref()
             .ok_or_else(|| anyhow!("No pair for market_id {}", market_id))?;
 
+        // Detection-only gate for adapters still in soak-test rollout.
+        if should_block_for_detection_only(pair) {
+            info!(
+                "[EXEC] 🛑 detection-only: dropping pair {} (adapter={:?}). Set EXEC_ALLOW_FOMC=1 to enable.",
+                pair.pair_id, pair.match_source
+            );
+            self.release_in_flight(market_id);
+            return Ok(ExecutionResult {
+                market_id,
+                success: false,
+                profit_cents: 0,
+                latency_ns: self.clock.now_ns() - req.detected_ns,
+                error: Some("detection-only adapter"),
+            });
+        }
+
         // Calculate profit
         let profit_cents = req.profit_cents();
         if profit_cents < 1 {
@@ -759,4 +775,66 @@ pub async fn run_execution_loop(
     }
 
     info!("[EXEC] Execution engine stopped");
+}
+
+/// Returns true if a pair should be silently dropped at execution time
+/// because it comes from an adapter still in detection-only rollout.
+///
+/// Today: `fomc` is detection-only unless `EXEC_ALLOW_FOMC=1`.
+pub(crate) fn should_block_for_detection_only(pair: &MarketPair) -> bool {
+    use crate::fees::MatchSource;
+    let MatchSource::Structured { adapter } = &pair.match_source else {
+        return false;
+    };
+    if adapter == "fomc" && !crate::config::exec_allow_fomc() {
+        return true;
+    }
+    false
+}
+
+#[cfg(test)]
+mod gate_tests {
+    use super::*;
+    use crate::fees::{MatchSource, PolyCategory};
+
+    fn mk_pair(adapter: &str) -> MarketPair {
+        MarketPair {
+            pair_id: std::sync::Arc::from("test-pair"),
+            league: std::sync::Arc::from("fomc"),
+            market_type: crate::types::MarketType::Moneyline,
+            description: std::sync::Arc::from("desc"),
+            kalshi_event_ticker: std::sync::Arc::from("KXFED-26APR"),
+            kalshi_market_ticker: std::sync::Arc::from("KXFED-26APR-T425"),
+            poly_slug: std::sync::Arc::from("slug"),
+            poly_yes_token: std::sync::Arc::from("yes"),
+            poly_no_token: std::sync::Arc::from("no"),
+            poly_condition_id: std::sync::Arc::from("0xCID"),
+            line_value: None,
+            team_suffix: None,
+            category: PolyCategory::Economics,
+            match_source: MatchSource::Structured { adapter: adapter.into() },
+        }
+    }
+
+    #[test]
+    fn fomc_pair_is_blocked_by_default() {
+        std::env::remove_var("EXEC_ALLOW_FOMC");
+        let pair = mk_pair("fomc");
+        assert!(should_block_for_detection_only(&pair));
+    }
+
+    #[test]
+    fn fomc_pair_passes_when_gate_enabled() {
+        std::env::set_var("EXEC_ALLOW_FOMC", "1");
+        let pair = mk_pair("fomc");
+        assert!(!should_block_for_detection_only(&pair));
+        std::env::remove_var("EXEC_ALLOW_FOMC");
+    }
+
+    #[test]
+    fn sports_pair_is_never_blocked() {
+        std::env::remove_var("EXEC_ALLOW_FOMC");
+        let pair = mk_pair("sports");
+        assert!(!should_block_for_detection_only(&pair));
+    }
 }

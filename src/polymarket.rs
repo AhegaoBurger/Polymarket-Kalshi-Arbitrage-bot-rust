@@ -128,6 +128,18 @@ impl GammaClient {
             Ok(None)
         }
     }
+
+    /// Fetch a Gamma event by slug, returning the event with its child markets.
+    /// Used by `FomcAdapter` to walk neg-risk outcomes.
+    pub async fn lookup_event(&self, slug: &str) -> Result<Option<GammaEvent>> {
+        let url = format!("{}/events?slug={}", GAMMA_API_BASE, slug);
+        let resp = self.http.get(&url).send().await?;
+        if !resp.status().is_success() {
+            return Ok(None);
+        }
+        let body = resp.text().await?;
+        parse_gamma_event_response(&body)
+    }
 }
 
 #[derive(Debug, Deserialize)]
@@ -138,6 +150,195 @@ struct GammaMarket {
     condition_id: Option<String>,
     active: Option<bool>,
     closed: Option<bool>,
+}
+
+/// A Gamma event with its child markets — used for neg-risk events like FOMC
+/// where each rate outcome is its own market.
+#[derive(Debug, Clone)]
+pub struct GammaEvent {
+    pub slug: String,
+    pub title: String,
+    pub markets: Vec<GammaEventMarket>,
+}
+
+#[derive(Debug, Clone)]
+pub struct GammaEventMarket {
+    pub slug: String,
+    pub question: String,
+    pub yes_token: String,
+    pub no_token: String,
+    pub condition_id: String,
+}
+
+#[derive(Debug, Deserialize)]
+struct GammaEventRaw {
+    slug: Option<String>,
+    title: Option<String>,
+    #[allow(dead_code)]
+    neg_risk: Option<bool>,
+    closed: Option<bool>,
+    active: Option<bool>,
+    markets: Option<Vec<GammaEventMarketRaw>>,
+}
+
+#[derive(Debug, Deserialize)]
+struct GammaEventMarketRaw {
+    slug: Option<String>,
+    question: Option<String>,
+    #[serde(rename = "clobTokenIds")]
+    clob_token_ids: Option<String>,
+    #[serde(rename = "conditionId")]
+    condition_id: Option<String>,
+    active: Option<bool>,
+    closed: Option<bool>,
+}
+
+/// Parse a Gamma `/events?slug=...` response body. Returns `Ok(None)` when
+/// the array is empty (event not found or not yet published). Filters out
+/// closed/inactive/incomplete child markets defensively.
+pub(crate) fn parse_gamma_event_response(body: &str) -> Result<Option<GammaEvent>> {
+    let events: Vec<GammaEventRaw> =
+        serde_json::from_str(body).context("Gamma event response not valid JSON")?;
+    let raw = match events.into_iter().next() {
+        Some(e) => e,
+        None => return Ok(None),
+    };
+    if raw.closed == Some(true) || raw.active == Some(false) {
+        return Ok(None);
+    }
+
+    let markets: Vec<GammaEventMarket> = raw
+        .markets
+        .unwrap_or_default()
+        .into_iter()
+        .filter_map(|m| {
+            if m.closed == Some(true) || m.active == Some(false) {
+                return None;
+            }
+            let cid = m.condition_id.as_ref().filter(|s| !s.is_empty())?.clone();
+            let toks: Vec<String> = m
+                .clob_token_ids
+                .as_deref()
+                .and_then(|s| serde_json::from_str(s).ok())
+                .unwrap_or_default();
+            if toks.len() < 2 {
+                return None;
+            }
+            Some(GammaEventMarket {
+                slug: m.slug.unwrap_or_default(),
+                question: m.question.unwrap_or_default(),
+                yes_token: toks[0].clone(),
+                no_token: toks[1].clone(),
+                condition_id: cid,
+            })
+        })
+        .collect();
+
+    Ok(Some(GammaEvent {
+        slug: raw.slug.unwrap_or_default(),
+        title: raw.title.unwrap_or_default(),
+        markets,
+    }))
+}
+
+#[cfg(test)]
+mod gamma_event_tests {
+    use super::*;
+
+    #[test]
+    fn parses_event_with_negrisk_markets() {
+        let body = r#"[
+            {
+                "slug": "fomc-decision-april-2026",
+                "title": "FOMC Decision — April 2026",
+                "neg_risk": true,
+                "closed": false,
+                "active": true,
+                "markets": [
+                    {
+                        "slug": "fomc-25-bps-cut-april-2026",
+                        "question": "25 bps cut",
+                        "clobTokenIds": "[\"tokA1\",\"tokA2\"]",
+                        "conditionId": "0xCONDA",
+                        "active": true,
+                        "closed": false
+                    },
+                    {
+                        "slug": "fomc-no-change-april-2026",
+                        "question": "No change",
+                        "clobTokenIds": "[\"tokB1\",\"tokB2\"]",
+                        "conditionId": "0xCONDB",
+                        "active": true,
+                        "closed": false
+                    }
+                ]
+            }
+        ]"#;
+
+        let event = parse_gamma_event_response(body).unwrap().expect("event present");
+        assert_eq!(event.slug, "fomc-decision-april-2026");
+        assert_eq!(event.markets.len(), 2);
+        assert_eq!(event.markets[0].question, "25 bps cut");
+        assert_eq!(event.markets[0].yes_token, "tokA1");
+        assert_eq!(event.markets[0].no_token, "tokA2");
+        assert_eq!(event.markets[0].condition_id, "0xCONDA");
+    }
+
+    #[test]
+    fn returns_none_for_empty_response() {
+        assert!(parse_gamma_event_response("[]").unwrap().is_none());
+    }
+
+    #[test]
+    fn skips_closed_child_markets() {
+        let body = r#"[
+            {
+                "slug": "fomc-decision-april-2026",
+                "title": "x",
+                "neg_risk": true,
+                "closed": false,
+                "active": true,
+                "markets": [
+                    {
+                        "slug": "fomc-25-bps-cut-april-2026",
+                        "question": "25 bps cut",
+                        "clobTokenIds": "[\"tokA1\",\"tokA2\"]",
+                        "conditionId": "0xCONDA",
+                        "active": true,
+                        "closed": true
+                    }
+                ]
+            }
+        ]"#;
+
+        let event = parse_gamma_event_response(body).unwrap().unwrap();
+        assert!(event.markets.is_empty(), "closed child markets must be filtered out");
+    }
+
+    #[test]
+    fn skips_child_markets_with_missing_condition_id() {
+        let body = r#"[
+            {
+                "slug": "x",
+                "title": "x",
+                "neg_risk": true,
+                "closed": false,
+                "active": true,
+                "markets": [
+                    {
+                        "slug": "no-cid",
+                        "question": "25 bps cut",
+                        "clobTokenIds": "[\"tokA1\",\"tokA2\"]",
+                        "active": true,
+                        "closed": false
+                    }
+                ]
+            }
+        ]"#;
+
+        let event = parse_gamma_event_response(body).unwrap().unwrap();
+        assert!(event.markets.is_empty());
+    }
 }
 
 /// Increment the date in a Polymarket slug by 1 day

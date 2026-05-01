@@ -12,6 +12,7 @@ pub mod config;
 pub mod discovery;
 pub mod execution;
 pub mod fees;
+pub mod fred;
 pub mod kalshi;
 pub mod polymarket;
 pub mod polymarket_clob;
