@@ -490,6 +490,7 @@ mod fill_accuracy_tests {
 // ============================================================================
 
 mod infra_integration_tests {
+    use prediction_market_arbitrage::fees::{MatchSource, PolyCategory};
     use prediction_market_arbitrage::types::*;
 
     /// Helper to create market state with prices
@@ -514,6 +515,10 @@ mod infra_integration_tests {
             poly_condition_id: "cond_arb".into(),
             line_value: None,
             team_suffix: Some("CFC".into()),
+            category: PolyCategory::Sports,
+            match_source: MatchSource::Structured {
+                adapter: "sports".into(),
+            },
         };
 
         let market_id = state.add_pair(pair).unwrap();
@@ -742,6 +747,10 @@ mod infra_integration_tests {
                 poly_condition_id: format!("cond_{}", i).into(),
                 line_value: None,
                 team_suffix: None,
+                category: PolyCategory::Sports,
+                match_source: MatchSource::Structured {
+                    adapter: "sports".into(),
+                },
             };
 
             let id = state.add_pair(pair).unwrap();
@@ -1302,6 +1311,7 @@ mod mismatched_fill_tests {
 
 mod process_mock_tests {
     use prediction_market_arbitrage::circuit_breaker::*;
+    use prediction_market_arbitrage::fees::{MatchSource, PolyCategory};
     use prediction_market_arbitrage::position_tracker::*;
     use prediction_market_arbitrage::types::*;
     use std::sync::Arc;
@@ -1402,6 +1412,10 @@ mod process_mock_tests {
             poly_condition_id: "cond_pf".into(),
             line_value: None,
             team_suffix: None,
+            category: PolyCategory::Sports,
+            match_source: MatchSource::Structured {
+                adapter: "sports".into(),
+            },
         }
     }
 
