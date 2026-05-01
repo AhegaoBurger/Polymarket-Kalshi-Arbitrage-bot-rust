@@ -251,11 +251,14 @@ pub(crate) fn parse_fomc_delta_bps(label: &str) -> Option<i32> {
     if lower.is_empty() {
         return None;
     }
-    if lower == "no change" || lower == "hold" {
+
+    // Normalize internal whitespace before equality checks so labels like
+    // "no  change" (double space, plausible from the Gamma API) still match.
+    let tokens: Vec<&str> = lower.split_whitespace().collect();
+    let normalized = tokens.join(" ");
+    if normalized == "no change" || normalized == "hold" {
         return Some(0);
     }
-
-    let tokens: Vec<&str> = lower.split_whitespace().collect();
     if tokens.len() < 3 {
         return None;
     }
@@ -296,6 +299,14 @@ mod parser_tests {
     #[test]
     fn parses_no_change() {
         assert_eq!(parse_fomc_delta_bps("No change"), Some(0));
+    }
+
+    #[test]
+    fn parses_no_change_with_internal_double_space() {
+        // Realistic Gamma API quirk — extra internal whitespace must not
+        // demote a "no change" outcome to None and silently drop the pair.
+        assert_eq!(parse_fomc_delta_bps("no  change"), Some(0));
+        assert_eq!(parse_fomc_delta_bps("  No   Change  "), Some(0));
     }
 
     #[test]
