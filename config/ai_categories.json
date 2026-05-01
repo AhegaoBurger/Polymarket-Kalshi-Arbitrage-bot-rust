@@ -1,0 +1,6 @@
+[
+  { "name": "macro_econ",    "ttl_secs": 43200 },
+  { "name": "elections",     "ttl_secs": 7200 },
+  { "name": "crypto_hourly", "ttl_secs": 900 },
+  { "name": "long_tail",     "ttl_secs": 21600 }
+]
