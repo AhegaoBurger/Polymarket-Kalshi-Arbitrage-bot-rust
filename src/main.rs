@@ -144,8 +144,26 @@ async fn main() -> Result<()> {
 
     // Balance cache: prime at startup (blocking) so the first opportunity
     // doesn't see zeros; then spawn a background refresh task.
+    //
+    // POLY_BALANCE_USDC is an escape hatch for the CLOB v2 auth outage: when
+    // set, the Polymarket value is taken from the env var and never refreshed
+    // — commit_poly owns it for the rest of the process. Unset to restore
+    // live refresh.
     let balance_cache = Arc::new(balance::BalanceCache::new());
-    match balance::refresh_once(&balance_cache, &kalshi_api, &poly_async, true).await {
+    let manual_poly_micros = balance::parse_poly_balance_env(
+        std::env::var("POLY_BALANCE_USDC").ok().as_deref(),
+    );
+    let refresh_poly = manual_poly_micros.is_none();
+
+    if let Some(micros) = manual_poly_micros {
+        balance_cache.set_poly_usdc_micros(micros);
+        info!(
+            "[BALANCE] Polymarket: manual mode from POLY_BALANCE_USDC = ${:.2} (auto-refresh disabled)",
+            micros as f64 / 1_000_000.0,
+        );
+    }
+
+    match balance::refresh_once(&balance_cache, &kalshi_api, &poly_async, refresh_poly).await {
         Ok(()) => info!(
             "[BALANCE] Primed at startup: Kalshi=${:.2}, Poly=${:.2}",
             balance_cache.kalshi_cents() as f64 / 100.0,
@@ -157,7 +175,7 @@ async fn main() -> Result<()> {
         balance_cache.clone(),
         kalshi_api.clone(),
         poly_async.clone(),
-        true,
+        refresh_poly,
     );
 
     // Run discovery (with caching support)
