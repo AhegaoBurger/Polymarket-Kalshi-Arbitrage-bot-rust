@@ -565,42 +565,39 @@ impl PolymarketAsyncClient {
         Ok(resp.json().await?)
     }
 
-    /// Retrieve existing API credentials for this wallet via L1 auth.
+    /// Create a new API key for this wallet via L1 auth.
     ///
-    /// V2-friendly path: `/auth/api-key` (singular GET) returns the wallet's
-    /// existing creds if any. Different from `derive-api-key` which creates new.
-    /// Returns Ok(None) when the wallet has no existing creds (404 response),
-    /// Err on any other failure.
-    pub async fn get_api_creds(&self, nonce: u64) -> Result<Option<ApiCreds>> {
+    /// POST `/auth/api-key` (this is what py-clob-client calls `create_api_key`).
+    /// Returns the full ApiCreds (api_key + secret + passphrase). Always
+    /// creates a fresh key — does not return existing ones. The wallet can
+    /// hold multiple API keys; orphaned ones can be deleted via the
+    /// Polymarket UI or DELETE `/auth/api-key`.
+    pub async fn create_api_key(&self, nonce: u64) -> Result<ApiCreds> {
         let url = format!("{}/auth/api-key", self.host);
         let headers = self.build_l1_headers(nonce)?;
-        let resp = self.http.get(&url).headers(headers).send().await?;
-        let status = resp.status();
-        if status == reqwest::StatusCode::NOT_FOUND {
-            return Ok(None);
-        }
-        if !status.is_success() {
+        let resp = self.http.post(&url).headers(headers).send().await?;
+        if !resp.status().is_success() {
+            let status = resp.status();
             let body = resp.text().await.unwrap_or_default();
-            return Err(anyhow!("get_api_creds failed: {} {}", status, body));
+            return Err(anyhow!("create_api_key failed: {} {}", status, body));
         }
-        Ok(Some(resp.json().await?))
+        Ok(resp.json().await?)
     }
 
-    /// Get existing API creds, falling back to deriving new ones if none exist.
-    /// This is the V2-safe path that handles both fresh and pre-existing wallets.
+    /// Resolve API creds via the V2-friendly path: try `create_api_key` first
+    /// (POST /auth/api-key — works on V2), fall back to `derive_api_key`
+    /// (GET /auth/derive-api-key — may 400 on V2 if creds already exist).
     pub async fn get_or_derive_api_key(&self) -> Result<ApiCreds> {
-        match self.get_api_creds(0).await {
-            Ok(Some(creds)) => {
-                tracing::info!("[POLYMARKET] Using existing API creds via GET /auth/api-key");
+        match self.create_api_key(0).await {
+            Ok(creds) => {
+                tracing::info!("[POLYMARKET] Created new API creds via POST /auth/api-key");
                 Ok(creds)
             }
-            Ok(None) => {
-                tracing::info!("[POLYMARKET] No existing creds; deriving new ones");
-                self.derive_api_key(0).await
-            }
             Err(e) => {
-                // GET /auth/api-key failed with non-404 — log and try derive as a fallback.
-                tracing::warn!("[POLYMARKET] get_api_creds failed ({}), trying derive-api-key", e);
+                tracing::warn!(
+                    "[POLYMARKET] create_api_key failed ({}), falling back to derive-api-key",
+                    e
+                );
                 self.derive_api_key(0).await
             }
         }
