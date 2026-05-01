@@ -582,7 +582,7 @@ Three independently-valuable PRs, each reversible without the others:
 ## 8. Open Questions
 
 1. **`feeSchedule` shape.** To resolve in Task A. Sample response JSON will dictate the exact field path.
-2. **Fed anchor via Kalshi metadata.** Does Kalshi's `KXFED` event expose a current-rate field? If yes, we skip FRED; if no, FRED + `FRED_API_KEY` becomes a documented soft-requirement for FOMC.
+2. **Fed anchor via Kalshi metadata.** ✅ Resolved 2026-04-29 during PR 2 implementation: the `KXFED` event schema does not currently expose a current-rate field. `try_anchor_from_kalshi_event` returns None as a stub and FRED `DFEDTARL` is the load-bearing anchor source. Re-evaluate if Kalshi's event schema gains a rate field; the stub is intentionally kept so a future change is one-line.
 3. **pmxt field completeness.** Confirm pmxt exposes Polymarket `condition_id`, neg-risk flag, and full outcome tokens. If any are missing we'll fall through the facade to direct REST for those fields — flag and document per-field during PR 3.
 4. **Long-tail category whitelist.** Which non-structured categories does the AI matcher actually attempt? Start narrow (Politics + Elections + Mentions) to contain cost and audit surface; widen once the review UI is being used.
 5. **AI matcher on sports as a shadow verifier.** Run AI in parallel over sports and alert on disagreement with `SportsAdapter`? Out of scope for PR 3; potentially valuable in follow-up.
