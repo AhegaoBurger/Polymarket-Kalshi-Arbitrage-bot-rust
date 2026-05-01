@@ -162,9 +162,13 @@ impl ExecutionEngine {
 
         // Detection-only gate for adapters still in soak-test rollout.
         if should_block_for_detection_only(pair) {
+            let env_var = match &pair.match_source {
+                crate::fees::MatchSource::Ai { .. } => "EXEC_ALLOW_AI_MATCHES",
+                _ => "EXEC_ALLOW_FOMC",
+            };
             info!(
-                "[EXEC] 🛑 detection-only: dropping pair {} (adapter={:?}). Set EXEC_ALLOW_FOMC=1 to enable.",
-                pair.pair_id, pair.match_source
+                "[EXEC] 🛑 detection-only: dropping pair {} (source={:?}). Set {}=1 to enable.",
+                pair.pair_id, pair.match_source, env_var
             );
             self.release_in_flight(market_id);
             return Ok(ExecutionResult {
@@ -780,16 +784,20 @@ pub async fn run_execution_loop(
 /// Returns true if a pair should be silently dropped at execution time
 /// because it comes from an adapter still in detection-only rollout.
 ///
-/// Today: `fomc` is detection-only unless `EXEC_ALLOW_FOMC=1`.
+/// Today: `fomc` is detection-only unless `EXEC_ALLOW_FOMC=1`; AI-matched
+/// pairs are detection-only unless `EXEC_ALLOW_AI_MATCHES=1`.
 pub(crate) fn should_block_for_detection_only(pair: &MarketPair) -> bool {
     use crate::fees::MatchSource;
-    let MatchSource::Structured { adapter } = &pair.match_source else {
-        return false;
-    };
-    if adapter == "fomc" && !crate::config::exec_allow_fomc() {
-        return true;
+    match &pair.match_source {
+        MatchSource::Structured { adapter } => {
+            if adapter == "fomc" && !crate::config::exec_allow_fomc() {
+                return true;
+            }
+            false
+        }
+        MatchSource::Ai { .. } => !crate::config::exec_allow_ai_matches(),
+        MatchSource::ManualOverride => false,
     }
-    false
 }
 
 #[cfg(test)]
@@ -836,5 +844,28 @@ mod gate_tests {
         std::env::remove_var("EXEC_ALLOW_FOMC");
         let pair = mk_pair("sports");
         assert!(!should_block_for_detection_only(&pair));
+    }
+
+    #[test]
+    fn ai_pair_is_blocked_by_default() {
+        std::env::remove_var("EXEC_ALLOW_AI_MATCHES");
+        let mut pair = mk_pair("ignored");
+        pair.match_source = MatchSource::Ai {
+            confidence: 0.95,
+            model: std::sync::Arc::from("claude-opus-4-7"),
+        };
+        assert!(should_block_for_detection_only(&pair));
+    }
+
+    #[test]
+    fn ai_pair_passes_when_gate_enabled() {
+        std::env::set_var("EXEC_ALLOW_AI_MATCHES", "1");
+        let mut pair = mk_pair("ignored");
+        pair.match_source = MatchSource::Ai {
+            confidence: 0.95,
+            model: std::sync::Arc::from("claude-opus-4-7"),
+        };
+        assert!(!should_block_for_detection_only(&pair));
+        std::env::remove_var("EXEC_ALLOW_AI_MATCHES");
     }
 }

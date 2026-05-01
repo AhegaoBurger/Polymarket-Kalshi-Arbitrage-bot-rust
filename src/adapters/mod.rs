@@ -19,6 +19,7 @@ use crate::types::{MarketPair, MarketType};
 
 pub mod sports;
 pub mod fomc;
+pub mod ai_reader;
 
 /// A pair of CanonicalMarket vectors ready for the shared pair-join.
 /// Adapters produce this; they never emit `MarketPair` directly.

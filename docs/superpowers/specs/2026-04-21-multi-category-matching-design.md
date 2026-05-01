@@ -327,7 +327,12 @@ Tail bands with no Polymarket counterpart (e.g. "above 6.00%") are simply skippe
 
 ### 4.6 AI Matcher Sidecar
 
-Located at `scripts/ai_matcher.py`. **Fully standalone**: runs without any Rust process, without the bot's Rust data files, and without any service from the rest of the codebase. It reads configs, hits APIs, writes outputs. Rust reads its output file and trusts it.
+> **PR 3 deviations from this spec section** (resolved 2026-05-01 during impl):
+> 1. Embedding model is local **`sentence-transformers/all-MiniLM-L6-v2`** instead of OpenAI `text-embedding-3-small`. Avoids a second vendor key; CPU-only inference is fast enough for our scale (tens of thousands of markets).
+> 2. Python project uses **`uv`** (not raw `pip install -r requirements.txt`). Layout: `scripts/ai_matcher/` as a uv-managed package; entry is `uv run python -m ai_matcher`. The `requirements.txt` reference in this spec section is superseded by `pyproject.toml` + `uv.lock`.
+> 3. Ingestion uses **direct `httpx` REST calls** (Kalshi v2 + Polymarket Gamma) instead of `pmxt`. The Ingestion facade boundary stays — pmxt can be slotted in behind it later if the project matures. This is the "direct-REST fallback" that Appendix C already anticipated.
+
+Located at `scripts/ai_matcher/` (uv package). **Fully standalone**: runs without any Rust process, without the bot's Rust data files, and without any service from the rest of the codebase. It reads configs, hits APIs, writes outputs. Rust reads its output file and trusts it.
 
 Command-line surface:
 ```
