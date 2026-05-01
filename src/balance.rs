@@ -179,6 +179,11 @@ pub fn parse_poly_balance_env(raw: Option<&str>) -> Option<u64> {
         return None;
     }
     let micros = (usdc.max(0.0) * 1_000_000.0).round();
+    // `as u64` saturates on overflow — reject values that would saturate so
+    // the cache never holds a fictitious near-u64::MAX balance.
+    if micros > u64::MAX as f64 {
+        return None;
+    }
     Some(micros as u64)
 }
 
@@ -224,5 +229,13 @@ mod tests {
     fn parse_rejects_nan_and_inf() {
         assert_eq!(parse_poly_balance_env(Some("NaN")), None);
         assert_eq!(parse_poly_balance_env(Some("inf")), None);
+    }
+
+    #[test]
+    fn parse_rejects_overflowing_values() {
+        // Values that would saturate the f64 → u64 cast (≈ $18.4T+) must be rejected
+        // so the atomic cache never holds a fictitious balance.
+        assert_eq!(parse_poly_balance_env(Some("1e30")), None);
+        assert_eq!(parse_poly_balance_env(Some("18446744073710")), None); // > u64::MAX micros / 1e6
     }
 }
