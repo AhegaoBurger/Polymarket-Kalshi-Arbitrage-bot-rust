@@ -111,6 +111,16 @@ fn current_unix_ts() -> u64 {
     SystemTime::now().duration_since(UNIX_EPOCH).unwrap().as_secs()
 }
 
+/// CLOB V2 order `timestamp` is in milliseconds (replaces V1's `nonce` for
+/// per-address uniqueness). The L1 auth `POLY_TIMESTAMP` header stays seconds.
+fn current_unix_ts_ms() -> u64 {
+    SystemTime::now().duration_since(UNIX_EPOCH).unwrap().as_millis() as u64
+}
+
+/// V2 EIP-712 zero-bytes32 used for `metadata` and `builder` when no value
+/// is being attached (which is the bot's default — we're not a builder).
+const ZERO_BYTES32: &str = "0x0000000000000000000000000000000000000000000000000000000000000000";
+
 fn clob_auth_digest(chain_id: u64, address_str: &str, timestamp: u64, nonce: u64) -> Result<H256> {
     let typed_json = json!({
         "types": {
@@ -147,41 +157,57 @@ pub struct OrderArgs {
     pub taker: Option<String>,
 }
 
-/// Order data for EIP712 signing (references to avoid clones in hot path)
+/// CLOB V2 EIP-712 sign payload. References to avoid clones in the hot path.
+///
+/// V2 (vs V1) drops `taker`, `expiration`, `nonce`, `feeRateBps` from the
+/// signed struct and adds `timestamp` (ms), `metadata` (bytes32), `builder`
+/// (bytes32). See spec at docs.polymarket.com/migration §"For API users".
 struct OrderData<'a> {
     maker: &'a str,
-    taker: &'a str,
+    signer: &'a str,
     token_id: &'a str,
     maker_amount: &'a str,
     taker_amount: &'a str,
     side: i32,
-    fee_rate_bps: &'a str,
-    nonce: &'a str,
-    signer: &'a str,
-    expiration: &'a str,
     signature_type: i32,
-    salt: u128
+    salt: u128,
+    /// Order creation time in **milliseconds**. Replaces V1's `nonce` for
+    /// per-address uniqueness. Not an expiration.
+    timestamp_ms: u64,
+    /// V2 bytes32. Default `ZERO_BYTES32` — no semantics attached.
+    metadata: &'a str,
+    /// V2 bytes32 builder code. Default `ZERO_BYTES32` — bot is not a builder.
+    builder: &'a str,
 }
 
+/// CLOB V2 wire-body order struct. V2 keeps `expiration` in the POST body for
+/// GTD/order-expiry handling but it is NOT part of the EIP-712 signed struct.
+/// `nonce` and `feeRateBps` are gone; `timestamp` (ms), `metadata`, `builder`
+/// are added.
 #[derive(Debug, Clone, Serialize)]
 pub struct OrderStruct {
-    pub salt: u128, 
-    pub maker: String, 
-    pub signer: String, 
+    pub salt: u128,
+    pub maker: String,
+    pub signer: String,
     pub taker: String,
-    #[serde(rename = "tokenId")] 
+    #[serde(rename = "tokenId")]
     pub token_id: String,
-    #[serde(rename = "makerAmount")] 
+    #[serde(rename = "makerAmount")]
     pub maker_amount: String,
-    #[serde(rename = "takerAmount")] 
+    #[serde(rename = "takerAmount")]
     pub taker_amount: String,
-    pub expiration: String, 
-    pub nonce: String,
-    #[serde(rename = "feeRateBps")] 
-    pub fee_rate_bps: String,
+    /// Order expiration timestamp (seconds). `"0"` means GTC.
+    /// Stays in the wire body but no longer in the EIP-712 sign payload.
+    pub expiration: String,
     pub side: i32,
-    #[serde(rename = "signatureType")] 
+    #[serde(rename = "signatureType")]
     pub signature_type: i32,
+    /// V2: order creation time in milliseconds (replaces V1 `nonce`).
+    pub timestamp: String,
+    /// V2 bytes32. Default zeros.
+    pub metadata: String,
+    /// V2 bytes32 builder code. Default zeros.
+    pub builder: String,
 }
 
 #[derive(Debug, Clone, Serialize)]
@@ -191,9 +217,12 @@ pub struct SignedOrder {
 }
 
 impl SignedOrder {
+    /// Render a V2 POST /order body. `taker` and `expiration` stay in the body
+    /// (per docs) but are absent from the EIP-712 sign struct. `nonce` and
+    /// `feeRateBps` are gone entirely. `timestamp`/`metadata`/`builder` are new.
     pub fn post_body(&self, owner: &str, order_type: &str) -> String {
         let side_str = if self.order.side == 0 { "BUY" } else { "SELL" };
-        let mut buf = String::with_capacity(512);
+        let mut buf = String::with_capacity(640);
         buf.push_str(r#"{"order":{"salt":"#);
         buf.push_str(&self.order.salt.to_string());
         buf.push_str(r#","maker":""#);
@@ -210,15 +239,17 @@ impl SignedOrder {
         buf.push_str(&self.order.taker_amount);
         buf.push_str(r#"","expiration":""#);
         buf.push_str(&self.order.expiration);
-        buf.push_str(r#"","nonce":""#);
-        buf.push_str(&self.order.nonce);
-        buf.push_str(r#"","feeRateBps":""#);
-        buf.push_str(&self.order.fee_rate_bps);
         buf.push_str(r#"","side":""#);
         buf.push_str(side_str);
         buf.push_str(r#"","signatureType":"#);
         buf.push_str(&self.order.signature_type.to_string());
-        buf.push_str(r#","signature":""#);
+        buf.push_str(r#","timestamp":""#);
+        buf.push_str(&self.order.timestamp);
+        buf.push_str(r#"","metadata":""#);
+        buf.push_str(&self.order.metadata);
+        buf.push_str(r#"","builder":""#);
+        buf.push_str(&self.order.builder);
+        buf.push_str(r#"","signature":""#);
         buf.push_str(&self.signature);
         buf.push_str(r#""},"owner":""#);
         buf.push_str(owner);
@@ -284,6 +315,9 @@ pub fn price_valid(price_bps: u64) -> bool {
 }
 
 fn order_typed_data(chain_id: u64, exchange: &str, data: &OrderData<'_>) -> Result<TypedData> {
+    // CLOB V2 EIP-712 — Exchange domain version "2" (V1 was "1"). The Order
+    // struct drops taker/expiration/nonce/feeRateBps and adds
+    // timestamp/metadata/builder. See: docs.polymarket.com/migration.
     let typed_json = json!({
         "types": {
             "EIP712Domain": [
@@ -296,43 +330,53 @@ fn order_typed_data(chain_id: u64, exchange: &str, data: &OrderData<'_>) -> Resu
                 {"name":"salt","type":"uint256"},
                 {"name":"maker","type":"address"},
                 {"name":"signer","type":"address"},
-                {"name":"taker","type":"address"},
                 {"name":"tokenId","type":"uint256"},
                 {"name":"makerAmount","type":"uint256"},
                 {"name":"takerAmount","type":"uint256"},
-                {"name":"expiration","type":"uint256"},
-                {"name":"nonce","type":"uint256"},
-                {"name":"feeRateBps","type":"uint256"},
                 {"name":"side","type":"uint8"},
-                {"name":"signatureType","type":"uint8"}
+                {"name":"signatureType","type":"uint8"},
+                {"name":"timestamp","type":"uint256"},
+                {"name":"metadata","type":"bytes32"},
+                {"name":"builder","type":"bytes32"}
             ]
         },
         "primaryType": "Order",
-        "domain": { "name": "Polymarket CTF Exchange", "version": "1", "chainId": chain_id, "verifyingContract": exchange },
+        "domain": {
+            "name": "Polymarket CTF Exchange",
+            "version": "2",
+            "chainId": chain_id,
+            "verifyingContract": exchange
+        },
         "message": {
             "salt": U256::from(data.salt),
             "maker": data.maker,
             "signer": data.signer,
-            "taker": data.taker,
             "tokenId": U256::from_dec_str(data.token_id)?,
             "makerAmount": U256::from_dec_str(data.maker_amount)?,
             "takerAmount": U256::from_dec_str(data.taker_amount)?,
-            "expiration": U256::from_dec_str(data.expiration)?,
-            "nonce": U256::from_dec_str(data.nonce)?,
-            "feeRateBps": U256::from_dec_str(data.fee_rate_bps)?,
             "side": data.side,
             "signatureType": data.signature_type,
+            "timestamp": U256::from(data.timestamp_ms),
+            "metadata": data.metadata,
+            "builder": data.builder,
         }
     });
     Ok(serde_json::from_value(typed_json)?)
 }
 
+/// CLOB V2 Exchange `verifyingContract` addresses. V1 addresses are no longer
+/// accepted by the V2 backend (live since 2026-04-28).
+/// See: docs.polymarket.com/resources/contracts.
 fn get_exchange_address(chain_id: u64, neg_risk: bool) -> Result<String> {
     match (chain_id, neg_risk) {
-        (137, true) => Ok("0xC5d563A36AE78145C45a50134d48A1215220f80a".into()),
-        (137, false) => Ok("0x4bFb41d5B3570DeFd03C39a9A4D8dE6Bd8B8982E".into()),
-        (80002, true) => Ok("0xd91E80cF2E7be2e162c6513ceD06f1dD0dA35296".into()),
-        (80002, false) => Ok("0xdFE02Eb6733538f8Ea35D585af8DE5958AD99E40".into()),
+        // Polygon mainnet — V2
+        (137, false) => Ok("0xE111180000d2663C0091e4f400237545B87B996B".into()),
+        (137, true)  => Ok("0xe2222d279d744050d28e00520010520000310F59".into()),
+        // Amoy testnet — V2 addresses not yet documented; fall back to error
+        // until Polymarket publishes them. The bot doesn't run on testnet today.
+        (80002, _) => Err(anyhow!(
+            "Polygon Amoy V2 Exchange address not configured — see docs.polymarket.com/resources/contracts"
+        )),
         _ => Err(anyhow!("unsupported chain")),
     }
 }
@@ -828,11 +872,13 @@ impl SharedAsyncClient {
     }
 
     async fn execute_order(&self, token_id: &str, condition_id: &str, price: f64, size: f64, side: &str) -> Result<PolyFillAsync> {
-        let (neg_risk, fee_bps) = self.get_market_meta(token_id, condition_id).await?;
+        // V2: only `neg_risk` is consulted at signing time (chooses the
+        // verifyingContract). Fees are operator-set at match time and don't
+        // flow into the signed order. `fee_bps` from `get_market_meta` is
+        // still useful elsewhere for arb-threshold math, but not here.
+        let (neg_risk, _fee_bps_unused_in_v2) = self.get_market_meta(token_id, condition_id).await?;
 
-        // Build signed order — fee_bps must match market's current taker fee
-        // (CLOB validates this against the EIP-712 signed value).
-        let signed = self.build_signed_order(token_id, price, size, side, neg_risk, fee_bps)?;
+        let signed = self.build_signed_order(token_id, price, size, side, neg_risk)?;
         // Owner must be the API key (not wallet address or funder!)
         let body = signed.post_body(&self.creds.api_key, PolyOrderType::FAK.as_str());
 
@@ -878,9 +924,11 @@ impl SharedAsyncClient {
         })
     }
 
-    /// Build a signed order. `fee_rate_bps` must match the market's current taker fee —
-    /// the value is baked into both the EIP-712 signature (consensus-critical) and
-    /// the JSON body (rejected by CLOB if the two don't match).
+    /// Build a signed CLOB V2 order.
+    ///
+    /// V2 removes `feeRateBps` from the signed struct — fees are operator-set
+    /// at match time. Per-market fees are still tracked elsewhere for arb-math
+    /// but no longer flow into the order body.
     fn build_signed_order(
         &self,
         token_id: &str,
@@ -888,7 +936,6 @@ impl SharedAsyncClient {
         size: f64,
         side: &str,
         neg_risk: bool,
-        fee_rate_bps: i64,
     ) -> Result<SignedOrder> {
         let price_bps = price_to_bps(price);
         let size_micro = size_to_micro(size);
@@ -908,22 +955,22 @@ impl SharedAsyncClient {
         let salt = generate_seed();
         let maker_amount_str = maker_amt.to_string();
         let taker_amount_str = taker_amt.to_string();
-        let fee_rate_str = fee_rate_bps.to_string();
+        let timestamp_ms = current_unix_ts_ms();
+        let timestamp_ms_str = timestamp_ms.to_string();
 
-        // Use references for EIP712 signing
+        // EIP-712 sign payload. References to avoid clones in the hot path.
         let data = OrderData {
             maker: &self.inner.funder,
-            taker: ZERO_ADDRESS,
+            signer: &self.inner.wallet_address_str,
             token_id,
             maker_amount: &maker_amount_str,
             taker_amount: &taker_amount_str,
             side: side_code,
-            fee_rate_bps: &fee_rate_str,
-            nonce: "0",
-            signer: &self.inner.wallet_address_str,
-            expiration: "0",
             signature_type: self.inner.signature_type,
             salt,
+            timestamp_ms,
+            metadata: ZERO_BYTES32,
+            builder: ZERO_BYTES32,
         };
         let exchange = get_exchange_address(self.chain_id, neg_risk)?;
         let typed = order_typed_data(self.chain_id, &exchange, &data)?;
@@ -931,7 +978,8 @@ impl SharedAsyncClient {
 
         let sig = self.inner.wallet.sign_hash(H256::from(digest))?;
 
-        // Only allocate strings once for the final OrderStruct (serialization needs owned)
+        // Allocate owned strings once for the final OrderStruct (the JSON
+        // post body needs owned data).
         Ok(SignedOrder {
             order: OrderStruct {
                 salt,
@@ -942,10 +990,11 @@ impl SharedAsyncClient {
                 maker_amount: maker_amount_str,
                 taker_amount: taker_amount_str,
                 expiration: "0".to_string(),
-                nonce: "0".to_string(),
-                fee_rate_bps: fee_rate_str,
                 side: side_code,
                 signature_type: self.inner.signature_type,
+                timestamp: timestamp_ms_str,
+                metadata: ZERO_BYTES32.to_string(),
+                builder: ZERO_BYTES32.to_string(),
             },
             signature: format!("0x{}", sig),
         })
@@ -1025,5 +1074,112 @@ mod meta_parse_tests {
         // Zero is a valid fee value, not "missing".
         let v = json!({ "taker_base_fee": 0 });
         assert_eq!(parse_fee(&v), Some(0));
+    }
+}
+
+#[cfg(test)]
+mod v2_sign_payload_tests {
+    //! Tests pin the V2 EIP-712 sign payload shape and the wire body shape so
+    //! a future regression to V1 fields fails loudly. Live live signing is
+    //! exercised in PR5-T5 smoke; these are pure unit checks.
+
+    use super::*;
+
+    #[test]
+    fn v2_exchange_address_polygon_standard() {
+        // Live since 2026-04-28 — see docs.polymarket.com/resources/contracts.
+        let addr = get_exchange_address(137, false).unwrap();
+        assert_eq!(addr, "0xE111180000d2663C0091e4f400237545B87B996B");
+    }
+
+    #[test]
+    fn v2_exchange_address_polygon_neg_risk() {
+        let addr = get_exchange_address(137, true).unwrap();
+        assert_eq!(addr, "0xe2222d279d744050d28e00520010520000310F59");
+    }
+
+    #[test]
+    fn v2_typed_data_uses_domain_version_2() {
+        let data = OrderData {
+            maker: "0x0000000000000000000000000000000000000001",
+            signer: "0x0000000000000000000000000000000000000002",
+            token_id: "100",
+            maker_amount: "1000000",
+            taker_amount: "2000000",
+            side: 0,
+            signature_type: 2,
+            salt: 12345,
+            timestamp_ms: 1714000000_000,
+            metadata: ZERO_BYTES32,
+            builder: ZERO_BYTES32,
+        };
+        let exchange = get_exchange_address(137, false).unwrap();
+        let typed = order_typed_data(137, &exchange, &data).unwrap();
+        // Round-trip via the underlying serde value to reach the domain.
+        let serialized = serde_json::to_value(&typed).unwrap();
+        assert_eq!(serialized["domain"]["version"], "2",
+                   "V2 Exchange domain version must be \"2\" — V1 (\"1\") will be rejected");
+        // ethers-rs normalizes addresses to lowercase during EIP-712 encoding;
+        // they're equivalent to the EIP-55 mixed-case form for hashing purposes.
+        assert_eq!(
+            serialized["domain"]["verifyingContract"].as_str().unwrap().to_lowercase(),
+            "0xe111180000d2663c0091e4f400237545b87b996b"
+        );
+        let order_fields: Vec<String> = serialized["types"]["Order"].as_array().unwrap()
+            .iter().map(|f| f["name"].as_str().unwrap().to_string()).collect();
+        // V2: timestamp/metadata/builder added; nonce/feeRateBps/taker/expiration gone.
+        assert!(order_fields.contains(&"timestamp".to_string()));
+        assert!(order_fields.contains(&"metadata".to_string()));
+        assert!(order_fields.contains(&"builder".to_string()));
+        assert!(!order_fields.contains(&"nonce".to_string()),
+                "V2 Order struct must not carry `nonce`");
+        assert!(!order_fields.contains(&"feeRateBps".to_string()),
+                "V2 Order struct must not carry `feeRateBps`");
+        assert!(!order_fields.contains(&"taker".to_string()),
+                "V2 Order struct must not carry `taker`");
+        assert!(!order_fields.contains(&"expiration".to_string()),
+                "V2 EIP-712 sign struct drops `expiration` (it stays in the body only)");
+    }
+
+    #[test]
+    fn v2_post_body_includes_v2_fields_and_omits_v1_fields() {
+        let signed = SignedOrder {
+            order: OrderStruct {
+                salt: 12345,
+                maker: "0xMAKER".into(),
+                signer: "0xSIGNER".into(),
+                taker: ZERO_ADDRESS.to_string(),
+                token_id: "100".into(),
+                maker_amount: "1000000".into(),
+                taker_amount: "2000000".into(),
+                expiration: "0".into(),
+                side: 0,
+                signature_type: 2,
+                timestamp: "1714000000000".into(),
+                metadata: ZERO_BYTES32.into(),
+                builder: ZERO_BYTES32.into(),
+            },
+            signature: "0xDEAD".into(),
+        };
+        let body = signed.post_body("api-key", "FAK");
+        // V2 wire fields present:
+        assert!(body.contains(r#""timestamp":"1714000000000""#));
+        assert!(body.contains(r#""metadata":"0x000"#));
+        assert!(body.contains(r#""builder":"0x000"#));
+        assert!(body.contains(r#""side":"BUY""#));
+        // V1 fields absent:
+        assert!(!body.contains("\"nonce\""),
+                "V2 wire body must not include `nonce`");
+        assert!(!body.contains("feeRateBps"),
+                "V2 wire body must not include `feeRateBps`");
+        // Owner + orderType envelope unchanged:
+        assert!(body.contains(r#""owner":"api-key""#));
+        assert!(body.contains(r#""orderType":"FAK""#));
+    }
+
+    #[test]
+    fn v2_amoy_chain_returns_helpful_error() {
+        let err = get_exchange_address(80002, false).unwrap_err().to_string();
+        assert!(err.contains("Amoy"), "Amoy error should name the chain explicitly");
     }
 }
