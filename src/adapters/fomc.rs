@@ -21,9 +21,7 @@ pub struct FomcAdapter {
     kalshi: Arc<KalshiApiClient>,
     #[allow(dead_code)]
     gamma: Arc<GammaClient>,
-    #[allow(dead_code)]
     http: reqwest::Client,
-    #[allow(dead_code)]
     fred_api_key: Option<String>,
 }
 
@@ -67,6 +65,33 @@ impl EventAdapter for FomcAdapter {
         }
         // Polymarket side fills in during Task 8.
         Ok(NormalizedBatch { kalshi: kalshi_canon, poly: vec![] })
+    }
+}
+
+/// Probe Kalshi event metadata for a current-rate field (bps).
+///
+/// As of 2026-04-29 the `KXFED` event schema does not expose a current-rate
+/// field. This stub returns None and the caller falls back to FRED. When
+/// Kalshi adds the field, replace the body and the FRED dependency becomes
+/// best-effort instead of load-bearing. Spec §8 open question 2.
+pub(crate) fn try_anchor_from_kalshi_event(_ev: &KalshiEvent) -> Option<i32> {
+    None
+}
+
+impl FomcAdapter {
+    /// Resolve the current fed-funds target lower bound in basis points.
+    /// Tries Kalshi metadata first; falls back to FRED.
+    async fn resolve_anchor_bps(&self, events: &[KalshiEvent]) -> Result<i32> {
+        if let Some(ev) = events.first() {
+            if let Some(bps) = try_anchor_from_kalshi_event(ev) {
+                tracing::info!("[FOMC] anchor {} bps from Kalshi metadata", bps);
+                return Ok(bps);
+            }
+        }
+        let bps = crate::fred::fetch_fed_lower_bound_bps(&self.http, self.fred_api_key.as_deref())
+            .await?;
+        tracing::info!("[FOMC] anchor {} bps from FRED DFEDTARL", bps);
+        Ok(bps)
     }
 }
 
@@ -300,5 +325,23 @@ mod kalshi_normalize_tests {
             Some("KXFED-26APR")
         );
         assert!(canon[0].venue.poly_slug.is_none());
+    }
+}
+
+#[cfg(test)]
+mod anchor_tests {
+    use super::*;
+
+    #[test]
+    fn kalshi_event_anchor_returns_none_today() {
+        // The Kalshi `KXFED` event schema does not currently expose a
+        // current-rate field. This test pins that fact — when Kalshi adds
+        // such a field and we wire it up, this test changes shape.
+        let ev = KalshiEvent {
+            event_ticker: "KXFED-26APR".into(),
+            title: "FOMC April 2026".into(),
+            sub_title: Some("Target rate".into()),
+        };
+        assert_eq!(try_anchor_from_kalshi_event(&ev), None);
     }
 }
