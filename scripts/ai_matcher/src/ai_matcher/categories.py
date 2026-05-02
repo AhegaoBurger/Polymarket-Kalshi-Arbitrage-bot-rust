@@ -55,3 +55,33 @@ def load_category_config(path: Path) -> CategoryConfig:
             continue
     default_tol = int(raw.get("default_tolerance_days", 30))
     return CategoryConfig(buckets=buckets, default_tolerance_days=default_tol)
+
+
+def resolve_bucket(
+    config: CategoryConfig,
+    *,
+    platform: str,            # "kalshi" or "polymarket"
+    category: str,
+    tags: list[str],
+) -> str:
+    """Resolve a market's platform-specific category (and Polymarket tags) to a bucket name.
+
+    Returns the bucket name (e.g., "Politics") or "Unknown" if no bucket matches.
+    Case-insensitive, whitespace-trimmed. Polymarket falls back to tags when category is empty;
+    Kalshi does not (Kalshi tags are folded into category upstream).
+    """
+    candidates: list[str] = []
+    if category:
+        candidates.append(category)
+    if platform == "polymarket" and tags:
+        candidates.extend(tags)
+    candidates = [c.strip().lower() for c in candidates if c and c.strip()]
+    if not candidates:
+        return "Unknown"
+
+    for bucket_name, bucket_def in config.buckets.items():
+        platform_aliases = bucket_def.kalshi if platform == "kalshi" else bucket_def.poly
+        aliases_lc = [a.strip().lower() for a in platform_aliases]
+        if any(c in aliases_lc for c in candidates):
+            return bucket_name
+    return "Unknown"
