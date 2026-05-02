@@ -28,9 +28,13 @@ class CategoryConfig:
 
 
 def load_category_config(path: Path) -> CategoryConfig:
-    """Load the category equivalence JSON at `path`. Missing or malformed → empty config (no prefilter)."""
+    """Load the category equivalence JSON at `path`.
+
+    Missing file → empty config (documented rollback path; logged at INFO).
+    Malformed JSON or per-bucket shape errors → bucket(s) skipped (WARNING).
+    """
     if not path.exists():
-        logger.warning("category_equivalence config not found at %s; prefilter disabled", path)
+        logger.info("category_equivalence config not found at %s; prefilter disabled", path)
         return CategoryConfig()
     try:
         raw = json.loads(path.read_text())
@@ -40,10 +44,14 @@ def load_category_config(path: Path) -> CategoryConfig:
 
     buckets: dict[str, BucketDef] = {}
     for name, cfg in (raw.get("buckets") or {}).items():
-        buckets[name] = BucketDef(
-            kalshi=list(cfg.get("kalshi") or []),
-            poly=list(cfg.get("poly") or []),
-            tolerance_days=int(cfg.get("tolerance_days", 30)),
-        )
+        try:
+            buckets[name] = BucketDef(
+                kalshi=list(cfg.get("kalshi") or []),
+                poly=list(cfg.get("poly") or []),
+                tolerance_days=int(cfg.get("tolerance_days", 30)),
+            )
+        except (AttributeError, TypeError, ValueError) as e:
+            logger.warning("category_equivalence bucket '%s' skipped: %s", name, e)
+            continue
     default_tol = int(raw.get("default_tolerance_days", 30))
     return CategoryConfig(buckets=buckets, default_tolerance_days=default_tol)
