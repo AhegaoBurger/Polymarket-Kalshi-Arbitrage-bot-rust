@@ -18,7 +18,7 @@ import hashlib
 import json
 import os
 from dataclasses import dataclass, field
-from datetime import datetime
+from datetime import datetime, timezone
 
 import httpx
 
@@ -31,6 +31,27 @@ DEFAULT_TIMEOUT = 15.0
 DEFAULT_MIN_LIQUIDITY_USD = 100.0       # MIN_LIQUIDITY_USD
 DEFAULT_MAX_KALSHI_EVENTS = 200         # INGEST_KALSHI_MAX_EVENTS
 DEFAULT_POLY_FETCH_LIMIT = 500          # INGEST_POLY_LIMIT
+
+
+def parse_close_time_utc(raw: dict, platform: str) -> datetime | None:
+    """Parse a raw market dict's expiry timestamp to a tz-aware UTC datetime.
+
+    Returns None for missing, malformed, or naive (timezone-less) inputs.
+    Caller drops the market when None is returned.
+    """
+    if platform == "kalshi":
+        s = raw.get("close_time")
+    else:  # polymarket
+        s = raw.get("endDateIso") or raw.get("endDate")
+    if not s:
+        return None
+    try:
+        dt = datetime.fromisoformat(s.replace("Z", "+00:00"))
+    except (ValueError, TypeError):
+        return None
+    if dt.tzinfo is None:
+        return None
+    return dt.astimezone(timezone.utc)
 
 
 @dataclass

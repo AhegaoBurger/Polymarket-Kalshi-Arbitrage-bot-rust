@@ -166,3 +166,49 @@ def test_market_dataclass_has_bucket_close_time_tags_fields():
     assert m.bucket == "Politics"
     assert m.close_time_utc == datetime(2026, 6, 1, tzinfo=timezone.utc)
     assert m.tags == ["Politics", "Election"]
+
+
+from ai_matcher.ingestion import parse_close_time_utc
+
+
+def test_parses_iso_with_offset():
+    raw = {"close_time": "2026-06-01T12:00:00+00:00"}
+    dt = parse_close_time_utc(raw, "kalshi")
+    assert dt is not None
+    assert dt.tzinfo is not None
+    assert dt == datetime(2026, 6, 1, 12, 0, 0, tzinfo=timezone.utc)
+
+
+def test_parses_iso_with_z_suffix():
+    raw = {"close_time": "2026-06-01T12:00:00Z"}
+    dt = parse_close_time_utc(raw, "kalshi")
+    assert dt == datetime(2026, 6, 1, 12, 0, 0, tzinfo=timezone.utc)
+
+
+def test_returns_none_for_missing_field():
+    assert parse_close_time_utc({}, "kalshi") is None
+    assert parse_close_time_utc({"close_time": ""}, "kalshi") is None
+    assert parse_close_time_utc({"close_time": None}, "kalshi") is None
+
+
+def test_returns_none_for_naive_datetime():
+    """Refuse to guess timezone — naive datetime is a parse failure."""
+    raw = {"close_time": "2026-06-01T12:00:00"}
+    assert parse_close_time_utc(raw, "kalshi") is None
+
+
+def test_returns_none_for_garbage():
+    raw = {"close_time": "not a date"}
+    assert parse_close_time_utc(raw, "kalshi") is None
+
+
+def test_polymarket_prefers_endDateIso_over_endDate():
+    raw = {"endDateIso": "2026-06-01T12:00:00Z", "endDate": "2099-01-01"}
+    dt = parse_close_time_utc(raw, "polymarket")
+    assert dt == datetime(2026, 6, 1, 12, 0, 0, tzinfo=timezone.utc)
+
+
+def test_polymarket_falls_back_to_endDate():
+    raw = {"endDate": "2026-06-01T12:00:00Z"}
+    dt = parse_close_time_utc(raw, "polymarket")
+    assert dt == datetime(2026, 6, 1, 12, 0, 0, tzinfo=timezone.utc)
