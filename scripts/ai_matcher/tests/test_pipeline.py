@@ -171,3 +171,65 @@ def test_pipeline_with_embeddings_only_verifier_accepts_high_cosine(tmp_path: Pa
     # Audit log should record the cosine in the reasoning field.
     audit_text = cfg.audit_log_path.read_text()
     assert "embeddings-only" in audit_text
+
+
+from datetime import datetime, timedelta, timezone
+
+from ai_matcher.categories import BucketDef, CategoryConfig
+from ai_matcher.ingestion import Market
+from ai_matcher.pipeline import date_overlap_ok
+
+
+def _cfg() -> CategoryConfig:
+    return CategoryConfig(
+        buckets={
+            "Politics": BucketDef(kalshi=["Politics"], poly=["Politics"], tolerance_days=60),
+            "Sports":   BucketDef(kalshi=["Sports"],   poly=["Sports"],   tolerance_days=2),
+        },
+        default_tolerance_days=30,
+    )
+
+
+def _market(bucket: str, days_offset: int) -> Market:
+    return Market(
+        platform="kalshi", ticker="t", title="t",
+        bucket=bucket,
+        close_time_utc=datetime(2026, 6, 1, tzinfo=timezone.utc) + timedelta(days=days_offset),
+    )
+
+
+def test_within_tolerance_passes():
+    k = _market("Politics", 0)
+    p = _market("Politics", 30)
+    assert date_overlap_ok(k, p, _cfg(), scale=1.0) is True
+
+
+def test_beyond_tolerance_fails():
+    k = _market("Politics", 0)
+    p = _market("Politics", 90)
+    assert date_overlap_ok(k, p, _cfg(), scale=1.0) is False
+
+
+def test_scale_widens_tolerance():
+    k = _market("Politics", 0)
+    p = _market("Politics", 90)
+    assert date_overlap_ok(k, p, _cfg(), scale=2.0) is True
+
+
+def test_sports_tolerance_is_strict():
+    k = _market("Sports", 0)
+    p = _market("Sports", 5)
+    assert date_overlap_ok(k, p, _cfg(), scale=1.0) is False
+
+
+def test_unknown_bucket_uses_default_tolerance():
+    """Both Unknown → default_tolerance_days (30 in fixture)."""
+    k = Market(platform="kalshi", ticker="k", title="t",
+               bucket="Unknown",
+               close_time_utc=datetime(2026, 6, 1, tzinfo=timezone.utc))
+    p = Market(platform="polymarket", ticker="p", title="t",
+               bucket="Unknown", condition_id="0xC1",
+               close_time_utc=datetime(2026, 6, 28, tzinfo=timezone.utc))
+    assert date_overlap_ok(k, p, _cfg(), scale=1.0) is True
+    p.close_time_utc = datetime(2026, 7, 5, tzinfo=timezone.utc)
+    assert date_overlap_ok(k, p, _cfg(), scale=1.0) is False

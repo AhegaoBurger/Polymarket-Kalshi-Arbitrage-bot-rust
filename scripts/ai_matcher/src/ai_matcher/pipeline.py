@@ -12,11 +12,35 @@ from typing import Any
 
 import numpy as np
 
+from ai_matcher.categories import CategoryConfig
 from ai_matcher.ingestion import Ingestion, IngestionResult, Market
 from ai_matcher.overrides import OverrideOutcome, OverrideSet
 from ai_matcher.report import PairAuditRow, render_report
 from ai_matcher.retrieval import BucketedHnswRetrieval as HnswRetrieval
 from ai_matcher.verifier import EmbeddingsOnlyVerifier, Verifier
+
+
+def date_overlap_ok(
+    k: Market,
+    p: Market,
+    cfg: CategoryConfig,
+    scale: float,
+) -> bool:
+    """Return True iff the two markets' UTC expiries are within the bucket's tolerance.
+
+    Bucket selection: the Kalshi-side bucket if known; otherwise the Polymarket
+    bucket; otherwise default_tolerance_days. Both Unknown → default_tolerance_days.
+    """
+    bucket = k.bucket if k.bucket != "Unknown" else p.bucket
+    tol_days = (
+        cfg.buckets[bucket].tolerance_days
+        if bucket in cfg.buckets
+        else cfg.default_tolerance_days
+    )
+    if k.close_time_utc is None or p.close_time_utc is None:
+        return False
+    delta_seconds = abs((k.close_time_utc - p.close_time_utc).total_seconds())
+    return delta_seconds <= tol_days * scale * 86_400
 
 
 @dataclass
