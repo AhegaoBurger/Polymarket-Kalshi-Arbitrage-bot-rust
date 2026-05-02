@@ -139,14 +139,18 @@ def parse_kalshi_markets_response(
     min_liquidity_usd: float = 0.0,
     min_volume_usd: float = 0.0,
     category_config: CategoryConfig | None = None,
-) -> list[Market]:
+) -> tuple[list[Market], dict[str, int]]:
     """Parse a `/markets?event_ticker=...` response into our Market objects.
 
     Markets without a parseable UTC close_time are dropped. When `category_config`
     is None, every market is bucketed Unknown (prefilter disabled).
     Liquidity floor: drop if known and below; if unknown, fall back to volume floor.
+
+    Returns a tuple of (markets, drops) where drops is per-reason drop counts:
+    {"missing_date": int, "low_volume": int, "low_liquidity": int}.
     """
     out: list[Market] = []
+    drops: dict[str, int] = {"missing_date": 0, "low_volume": 0, "low_liquidity": 0}
     for m in body.get("markets", []) or []:
         if not m.get("ticker"):
             continue
@@ -159,13 +163,16 @@ def parse_kalshi_markets_response(
         liq_known = liq_cents is not None
         vol_known = vol_cents is not None
         if liq_known and liq_usd < min_liquidity_usd:
+            drops["low_liquidity"] += 1
             continue
         if not liq_known and vol_known and vol_usd < min_volume_usd:
+            drops["low_volume"] += 1
             continue
         # both unknown → pass through (rare; verifier catches obvious junk)
 
         close_utc = parse_close_time_utc(m, platform="kalshi")
         if close_utc is None:
+            drops["missing_date"] += 1
             continue
 
         title = m.get("title", "") or ""
@@ -193,7 +200,7 @@ def parse_kalshi_markets_response(
             liquidity_usd=liq_usd,
             volume_usd=vol_usd,
         ))
-    return out
+    return out, drops
 
 
 def _parse_poly_tags(raw: list | None) -> list[str]:
@@ -213,13 +220,17 @@ def parse_poly_gamma_markets_response(
     body: list[dict],
     min_liquidity_usd: float = 0.0,
     category_config: CategoryConfig | None = None,
-) -> list[Market]:
+) -> tuple[list[Market], dict[str, int]]:
     """Parse a Polymarket Gamma `/markets` response.
 
     Markets without a parseable UTC end date are dropped. When `category_config`
     is None, every market is bucketed Unknown (prefilter disabled).
+
+    Returns a tuple of (markets, drops) where drops is per-reason drop counts:
+    {"missing_date": int, "low_liquidity": int}.
     """
     out: list[Market] = []
+    drops: dict[str, int] = {"missing_date": 0, "low_liquidity": 0}
     for m in body:
         if m.get("closed") is True or m.get("active") is False:
             continue
@@ -228,11 +239,13 @@ def parse_poly_gamma_markets_response(
             continue
         liq = _to_float(m.get("liquidity") or m.get("liquidityNum") or 0)
         if liq < min_liquidity_usd:
+            drops["low_liquidity"] += 1
             continue
         vol = _to_float(m.get("volume") or m.get("volumeNum") or 0)
 
         close_utc = parse_close_time_utc(m, platform="polymarket")
         if close_utc is None:
+            drops["missing_date"] += 1
             continue
 
         outcomes_str = m.get("outcomes") or "[]"
@@ -271,7 +284,7 @@ def parse_poly_gamma_markets_response(
             poly_yes_token=toks[0] if len(toks) > 0 else "",
             poly_no_token=toks[1] if len(toks) > 1 else "",
         ))
-    return out
+    return out, drops
 
 
 def _to_float(v) -> float:
@@ -326,6 +339,10 @@ class Ingestion:
             else int(os.environ.get("INGEST_POLY_LIMIT", DEFAULT_POLY_FETCH_LIMIT))
         )
         self.category_config = category_config
+        self.last_drops: dict[str, int] = {
+            "kalshi_missing_date": 0, "kalshi_low_volume": 0, "kalshi_low_liquidity": 0,
+            "poly_missing_date": 0, "poly_low_liquidity": 0,
+        }
 
     def fetch_all(self) -> IngestionResult:
         return IngestionResult(
@@ -360,6 +377,9 @@ class Ingestion:
         kept_events = kept_events[: self.max_kalshi_events]
 
         out: list[Market] = []
+        self.last_drops["kalshi_missing_date"] = 0
+        self.last_drops["kalshi_low_volume"] = 0
+        self.last_drops["kalshi_low_liquidity"] = 0
         for ev in kept_events:
             try:
                 m_resp = self._http.get(
@@ -369,21 +389,24 @@ class Ingestion:
                 m_resp.raise_for_status()
             except httpx.HTTPError:
                 continue
-            out.extend(
-                parse_kalshi_markets_response(
-                    m_resp.json(),
-                    event_title=ev["title"],
-                    event_category=ev.get("category", "") or "",
-                    min_liquidity_usd=self.min_liquidity_usd,
-                    min_volume_usd=self.min_volume_usd,
-                    category_config=self.category_config,
-                )
+            markets, drops = parse_kalshi_markets_response(
+                m_resp.json(),
+                event_title=ev["title"],
+                event_category=ev.get("category", "") or "",
+                min_liquidity_usd=self.min_liquidity_usd,
+                min_volume_usd=self.min_volume_usd,
+                category_config=self.category_config,
             )
+            out.extend(markets)
+            for k in drops:
+                self.last_drops[f"kalshi_{k}"] += drops[k]
         return out
 
     def fetch_poly(self) -> list[Market]:
         """Fetch Polymarket markets sorted by liquidity desc, paginate via offset."""
         out: list[Market] = []
+        self.last_drops["poly_missing_date"] = 0
+        self.last_drops["poly_low_liquidity"] = 0
         page_size = 500
         for offset in range(0, self.poly_fetch_limit, page_size):
             resp = self._http.get(
@@ -396,9 +419,12 @@ class Ingestion:
             body = resp.json() if isinstance(resp.json(), list) else []
             if not body:
                 break
-            out.extend(parse_poly_gamma_markets_response(
+            markets, drops = parse_poly_gamma_markets_response(
                 body,
                 min_liquidity_usd=self.min_liquidity_usd,
                 category_config=self.category_config,
-            ))
+            )
+            out.extend(markets)
+            for k in drops:
+                self.last_drops[f"poly_{k}"] += drops[k]
         return out

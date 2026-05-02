@@ -112,10 +112,10 @@ def run_pipeline(
 ) -> dict:
     result: IngestionResult = ingestion.fetch_all()
 
-    counters_drops_ingest = {
+    counters_drops_ingest = getattr(ingestion, "last_drops", {
         "kalshi_missing_date": 0, "poly_missing_date": 0,
         "kalshi_low_volume": 0, "poly_low_liquidity": 0,
-    }
+    })
     bucketed_counts: dict[str, int] = defaultdict(int)
 
     polys_by_bucket: dict[str, list[tuple[np.ndarray, str]]] = defaultdict(list)
@@ -171,7 +171,7 @@ def run_pipeline(
                     else cfg.category_config.default_tolerance_days
                 )
                 delta_days = (
-                    abs((k.close_time_utc - p.close_time_utc).days)
+                    int(abs((k.close_time_utc - p.close_time_utc).total_seconds()) // 86_400)
                     if (k.close_time_utc and p.close_time_utc) else None
                 )
                 audit_log_lines.append(json.dumps({
@@ -186,8 +186,11 @@ def run_pipeline(
                 continue
 
             verifier_calls += 1
+            hits_before = getattr(verifier, "cache_hits", 0)
             decision = _call_verifier(verifier, k, p, cosine)
-            verifier_cost_usd += getattr(decision, "cost_usd", 0.0) or 0.0
+            was_cache_hit = getattr(verifier, "cache_hits", 0) > hits_before
+            if not was_cache_hit:
+                verifier_cost_usd += getattr(decision, "cost_usd", 0.0) or 0.0
             override = overrides.lookup(k.ticker, p.condition_id)
             ai_accept = decision.is_accepted(min_confidence=cfg.acceptance_min_confidence)
             if override == OverrideOutcome.BLACKLIST:
@@ -196,6 +199,16 @@ def run_pipeline(
                 final_accepted = True
             else:
                 final_accepted = ai_accept
+
+            tol_resolved = (
+                cfg.category_config.buckets[k.bucket].tolerance_days
+                if cfg.category_config and k.bucket in cfg.category_config.buckets
+                else (cfg.category_config.default_tolerance_days if cfg.category_config else None)
+            )
+            delta_days_resolved = (
+                int(abs((k.close_time_utc - p.close_time_utc).total_seconds()) // 86_400)
+                if (k.close_time_utc and p.close_time_utc) else None
+            )
 
             if final_accepted:
                 accepted += 1
@@ -208,19 +221,13 @@ def run_pipeline(
                     "event_type": decision.event_type,
                     "confidence": decision.confidence,
                     "description": f"{k.title} ↔ {p.title}",
+                    "bucket_kalshi": k.bucket,
+                    "bucket_poly": p.bucket,
+                    "cosine": round(float(cosine), 4),
+                    "delta_days": delta_days_resolved,
                 })
             else:
                 rejected += 1
-
-            tol_resolved = (
-                cfg.category_config.buckets[k.bucket].tolerance_days
-                if cfg.category_config and k.bucket in cfg.category_config.buckets
-                else (cfg.category_config.default_tolerance_days if cfg.category_config else None)
-            )
-            delta_days_resolved = (
-                abs((k.close_time_utc - p.close_time_utc).days)
-                if (k.close_time_utc and p.close_time_utc) else None
-            )
             rows.append(PairAuditRow(
                 kalshi_ticker=k.ticker, kalshi_title=k.title,
                 kalshi_description=k.description, kalshi_resolution=k.resolution_criteria,
@@ -431,6 +438,10 @@ def _render_audit_sample(pairs: list[dict], payload: dict) -> str:
                 cost_usd=0.0,
             ),
             accepted=True, override_snippet="{}", override_outcome="none",
+            bucket_kalshi=p.get("bucket_kalshi", "Unknown"),
+            bucket_poly=p.get("bucket_poly", "Unknown"),
+            cosine=float(p.get("cosine", 0.0)),
+            delta_days=p.get("delta_days"),
         ))
     return tpl.render(
         title=f"audit sample — model {payload.get('model')}",

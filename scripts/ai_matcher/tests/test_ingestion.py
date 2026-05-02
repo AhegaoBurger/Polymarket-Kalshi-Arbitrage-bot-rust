@@ -27,7 +27,7 @@ def test_kalshi_response_parses_to_markets():
             }
         ]
     }
-    markets = parse_kalshi_markets_response(body, event_title="CPI YoY April 2026")
+    markets, _ = parse_kalshi_markets_response(body, event_title="CPI YoY April 2026")
     assert len(markets) == 1
     m = markets[0]
     assert m.platform == "kalshi"
@@ -47,7 +47,7 @@ def test_kalshi_response_filters_below_liquidity_floor():
             {"ticker": "K2", "title": "poor", "liquidity": 1_000, "close_time": "2026-06-01T12:00:00Z"},    # $10
         ]
     }
-    markets = parse_kalshi_markets_response(body, min_liquidity_usd=100.0)
+    markets, _ = parse_kalshi_markets_response(body, min_liquidity_usd=100.0)
     assert [m.ticker for m in markets] == ["K1"]
 
 
@@ -63,7 +63,7 @@ def test_kalshi_response_keeps_markets_with_unknown_liquidity():
             {"ticker": "K3", "title": "low known", "liquidity": 1, "close_time": "2026-06-01T12:00:00Z"},  # $0.01
         ]
     }
-    markets = parse_kalshi_markets_response(body, min_liquidity_usd=100.0)
+    markets, _ = parse_kalshi_markets_response(body, min_liquidity_usd=100.0)
     # K1 + K2 (unknown) survive. K3 (known, below floor) drops.
     assert sorted(m.ticker for m in markets) == ["K1", "K2"]
 
@@ -95,7 +95,7 @@ def test_poly_gamma_response_parses_to_markets():
             "endDateIso": "2026-06-01T12:00:00Z",
         }
     ]
-    markets = parse_poly_gamma_markets_response(body)
+    markets, _ = parse_poly_gamma_markets_response(body)
     assert len(markets) == 1
     m = markets[0]
     assert m.platform == "polymarket"
@@ -121,7 +121,8 @@ def test_poly_skips_closed_markets():
             "closed": True,
         }
     ]
-    assert parse_poly_gamma_markets_response(body) == []
+    result, _ = parse_poly_gamma_markets_response(body)
+    assert result == []
 
 
 def test_poly_filters_below_liquidity_floor():
@@ -141,7 +142,7 @@ def test_poly_filters_below_liquidity_floor():
             "endDateIso": "2026-06-01T12:00:00Z",
         },
     ]
-    markets = parse_poly_gamma_markets_response(body, min_liquidity_usd=100.0)
+    markets, _ = parse_poly_gamma_markets_response(body, min_liquidity_usd=100.0)
     assert [m.ticker for m in markets] == ["rich"]
 
 
@@ -248,7 +249,7 @@ def test_kalshi_parser_assigns_bucket():
             }
         ]
     }
-    markets = parse_kalshi_markets_response(body, category_config=_kalshi_cfg())
+    markets, _ = parse_kalshi_markets_response(body, category_config=_kalshi_cfg())
     assert len(markets) == 1
     assert markets[0].bucket == "Politics"
     assert markets[0].close_time_utc == datetime(2026, 6, 1, 12, 0, 0, tzinfo=timezone.utc)
@@ -262,7 +263,7 @@ def test_kalshi_parser_drops_market_with_missing_close_time():
              "close_time": "2026-06-01T12:00:00Z"},
         ]
     }
-    markets = parse_kalshi_markets_response(body, category_config=_kalshi_cfg())
+    markets, _ = parse_kalshi_markets_response(body, category_config=_kalshi_cfg())
     assert [m.ticker for m in markets] == ["K2"]
 
 
@@ -273,7 +274,7 @@ def test_kalshi_parser_drops_market_with_unparseable_close_time():
              "close_time": "not a date"},
         ]
     }
-    markets = parse_kalshi_markets_response(body, category_config=_kalshi_cfg())
+    markets, _ = parse_kalshi_markets_response(body, category_config=_kalshi_cfg())
     assert markets == []
 
 
@@ -284,7 +285,7 @@ def test_kalshi_parser_assigns_unknown_when_category_missing():
              "close_time": "2026-06-01T12:00:00Z"},
         ]
     }
-    markets = parse_kalshi_markets_response(body, category_config=_kalshi_cfg())
+    markets, _ = parse_kalshi_markets_response(body, category_config=_kalshi_cfg())
     assert markets[0].bucket == "Unknown"
 
 
@@ -296,7 +297,7 @@ def test_kalshi_parser_works_without_category_config():
              "close_time": "2026-06-01T12:00:00Z"},
         ]
     }
-    markets = parse_kalshi_markets_response(body)
+    markets, _ = parse_kalshi_markets_response(body)
     assert markets[0].bucket == "Unknown"
 
 
@@ -316,7 +317,7 @@ def test_poly_parser_assigns_bucket_from_category():
         "category": "Politics",
         "endDateIso": "2026-06-01T12:00:00Z",
     }]
-    markets = parse_poly_gamma_markets_response(body, category_config=_poly_cfg())
+    markets, _ = parse_poly_gamma_markets_response(body, category_config=_poly_cfg())
     assert markets[0].bucket == "Politics"
 
 
@@ -327,7 +328,7 @@ def test_poly_parser_falls_back_to_tags_when_category_empty():
         "tags": ["Politics", "Election"],
         "endDateIso": "2026-06-01T12:00:00Z",
     }]
-    markets = parse_poly_gamma_markets_response(body, category_config=_poly_cfg())
+    markets, _ = parse_poly_gamma_markets_response(body, category_config=_poly_cfg())
     assert markets[0].bucket == "Politics"
     assert markets[0].tags == ["Politics", "Election"]
 
@@ -340,7 +341,7 @@ def test_poly_parser_handles_object_shaped_tags():
         "tags": [{"label": "Politics"}, {"label": "Trump"}],
         "endDateIso": "2026-06-01T12:00:00Z",
     }]
-    markets = parse_poly_gamma_markets_response(body, category_config=_poly_cfg())
+    markets, _ = parse_poly_gamma_markets_response(body, category_config=_poly_cfg())
     assert markets[0].bucket == "Politics"
     assert markets[0].tags == ["Politics", "Trump"]
 
@@ -351,7 +352,7 @@ def test_poly_parser_drops_market_with_missing_endDate():
         {"conditionId": "0xC2", "slug": "p2", "question": "q2",
          "endDateIso": "2026-06-01T12:00:00Z"},
     ]
-    markets = parse_poly_gamma_markets_response(body, category_config=_poly_cfg())
+    markets, _ = parse_poly_gamma_markets_response(body, category_config=_poly_cfg())
     assert [m.condition_id for m in markets] == ["0xC2"]
 
 
@@ -362,7 +363,7 @@ def test_poly_parser_assigns_economics_bucket_from_finance_category():
         "category": "Finance",
         "endDateIso": "2026-06-01T12:00:00Z",
     }]
-    markets = parse_poly_gamma_markets_response(body, category_config=_poly_cfg())
+    markets, _ = parse_poly_gamma_markets_response(body, category_config=_poly_cfg())
     assert markets[0].bucket == "Economics"
 
 
@@ -481,7 +482,7 @@ def test_kalshi_volume_proxy_drops_when_liquidity_unknown_and_volume_low():
          "close_time": "2026-06-01T12:00:00Z",
          "liquidity": None, "volume": 200_000},
     ]}
-    markets = parse_kalshi_markets_response(
+    markets, _ = parse_kalshi_markets_response(
         body, min_liquidity_usd=0.0, min_volume_usd=1000.0,
         category_config=_kalshi_cfg(),
     )
@@ -494,7 +495,7 @@ def test_kalshi_volume_proxy_passes_when_both_unknown():
          "close_time": "2026-06-01T12:00:00Z",
          "liquidity": None, "volume": None},
     ]}
-    markets = parse_kalshi_markets_response(
+    markets, _ = parse_kalshi_markets_response(
         body, min_liquidity_usd=0.0, min_volume_usd=1000.0,
         category_config=_kalshi_cfg(),
     )
@@ -508,7 +509,7 @@ def test_kalshi_volume_proxy_does_not_apply_when_liquidity_known():
          "close_time": "2026-06-01T12:00:00Z",
          "liquidity": 50_000, "volume": 100},
     ]}
-    markets = parse_kalshi_markets_response(
+    markets, _ = parse_kalshi_markets_response(
         body, min_liquidity_usd=100.0, min_volume_usd=1000.0,
         category_config=_kalshi_cfg(),
     )
@@ -527,7 +528,7 @@ def test_kalshi_parser_uses_event_category_when_market_has_none():
         buckets={"Politics": BucketDef(kalshi=["Elections"], poly=["Politics"], tolerance_days=60)},
         default_tolerance_days=30,
     )
-    markets = parse_kalshi_markets_response(
+    markets, _ = parse_kalshi_markets_response(
         body, event_category="Elections", category_config=cfg,
     )
     assert markets[0].bucket == "Politics"
@@ -548,7 +549,7 @@ def test_kalshi_parser_market_category_wins_over_event_category():
         },
         default_tolerance_days=30,
     )
-    markets = parse_kalshi_markets_response(
+    markets, _ = parse_kalshi_markets_response(
         body, event_category="Elections", category_config=cfg,
     )
     assert markets[0].bucket == "Sports"
@@ -558,3 +559,33 @@ def test_parse_kalshi_event_extracts_category():
     raw = {"event_ticker": "E1", "title": "Some event", "category": "Elections"}
     parsed = parse_kalshi_event(raw)
     assert parsed["category"] == "Elections"
+
+
+def test_kalshi_parser_counts_dropped_markets():
+    body = {"markets": [
+        {"ticker": "K1", "title": "no date", "category": "Politics"},  # missing date → drop
+        {"ticker": "K2", "title": "low vol", "category": "Politics",
+         "close_time": "2026-06-01T12:00:00Z",
+         "liquidity": None, "volume": 100},  # low volume → drop
+        {"ticker": "K3", "title": "good", "category": "Politics",
+         "close_time": "2026-06-01T12:00:00Z"},  # good
+    ]}
+    markets, drops = parse_kalshi_markets_response(
+        body, min_volume_usd=1000.0, category_config=_kalshi_cfg(),
+    )
+    assert [m.ticker for m in markets] == ["K3"]
+    assert drops["missing_date"] == 1
+    assert drops["low_volume"] == 1
+
+
+def test_poly_parser_counts_dropped_markets():
+    body = [
+        {"conditionId": "0xC1", "slug": "p1", "question": "q1"},  # missing date → drop
+        {"conditionId": "0xC2", "slug": "p2", "question": "q2",
+         "endDate": "2026-06-01T12:00:00Z"},
+    ]
+    markets, drops = parse_poly_gamma_markets_response(
+        body, min_liquidity_usd=0.0, category_config=_poly_cfg(),
+    )
+    assert [m.condition_id for m in markets] == ["0xC2"]
+    assert drops["missing_date"] == 1

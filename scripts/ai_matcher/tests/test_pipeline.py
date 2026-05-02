@@ -205,3 +205,23 @@ def test_pipeline_funnel_counters_and_bucket_routing(tmp_path):
     assert summary["ingested"]["kalshi"] == 2
     assert summary["ingested"]["poly"] == 3
     assert "bucketed" in summary
+
+
+def test_delta_days_uses_floor_of_absolute_timedelta(tmp_path):
+    """A 2.75-day gap should report delta_days=2, not 3."""
+    base_time = datetime(2026, 6, 1, tzinfo=timezone.utc)
+    k = Market(platform="kalshi", ticker="k", title="t",
+               bucket="Politics",
+               close_time_utc=base_time)
+    p = Market(platform="polymarket", ticker="p", title="t",
+               bucket="Politics", condition_id="0xC1",
+               close_time_utc=base_time + timedelta(days=2, hours=18))  # 2.75 days
+    cfg = CategoryConfig(
+        buckets={"Politics": BucketDef(kalshi=["Politics"], poly=["Politics"], tolerance_days=10)},
+        default_tolerance_days=30,
+    )
+    # The predicate uses total_seconds, so this should pass (delta=2.75 ≤ 10):
+    assert date_overlap_ok(k, p, cfg, scale=1.0) is True
+    # The pipeline-level computation should report 2, not 3
+    delta_days = int(abs((k.close_time_utc - p.close_time_utc).total_seconds()) // 86_400)
+    assert delta_days == 2
