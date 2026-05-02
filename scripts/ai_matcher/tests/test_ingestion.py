@@ -462,3 +462,46 @@ def test_kalshi_pagination_stops_at_cap():
     ing.fetch_kalshi()
     events_calls = [c for c in stub.call_log if "/events" in c]
     assert len(events_calls) == 1
+
+
+def test_kalshi_volume_proxy_drops_when_liquidity_unknown_and_volume_low():
+    body = {"markets": [
+        {"ticker": "K1", "title": "low vol", "category": "Politics",
+         "close_time": "2026-06-01T12:00:00Z",
+         "liquidity": None, "volume": 50_000},
+        {"ticker": "K2", "title": "high vol", "category": "Politics",
+         "close_time": "2026-06-01T12:00:00Z",
+         "liquidity": None, "volume": 200_000},
+    ]}
+    markets = parse_kalshi_markets_response(
+        body, min_liquidity_usd=0.0, min_volume_usd=1000.0,
+        category_config=_kalshi_cfg(),
+    )
+    assert [m.ticker for m in markets] == ["K2"]
+
+
+def test_kalshi_volume_proxy_passes_when_both_unknown():
+    body = {"markets": [
+        {"ticker": "K1", "title": "both unknown", "category": "Politics",
+         "close_time": "2026-06-01T12:00:00Z",
+         "liquidity": None, "volume": None},
+    ]}
+    markets = parse_kalshi_markets_response(
+        body, min_liquidity_usd=0.0, min_volume_usd=1000.0,
+        category_config=_kalshi_cfg(),
+    )
+    assert [m.ticker for m in markets] == ["K1"]
+
+
+def test_kalshi_volume_proxy_does_not_apply_when_liquidity_known():
+    """If liquidity is known and above floor, volume floor doesn't matter."""
+    body = {"markets": [
+        {"ticker": "K1", "title": "rich liquidity", "category": "Politics",
+         "close_time": "2026-06-01T12:00:00Z",
+         "liquidity": 50_000, "volume": 100},
+    ]}
+    markets = parse_kalshi_markets_response(
+        body, min_liquidity_usd=100.0, min_volume_usd=1000.0,
+        category_config=_kalshi_cfg(),
+    )
+    assert [m.ticker for m in markets] == ["K1"]

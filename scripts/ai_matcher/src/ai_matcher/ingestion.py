@@ -31,6 +31,7 @@ DEFAULT_TIMEOUT = 15.0
 
 # Defaults (override via env vars in production):
 DEFAULT_MIN_LIQUIDITY_USD = 100.0       # MIN_LIQUIDITY_USD
+DEFAULT_MIN_VOLUME_USD = 1000.0         # MIN_VOLUME_USD — Kalshi liquidity proxy
 DEFAULT_MAX_KALSHI_EVENTS = 2000        # was 200 — INGEST_KALSHI_MAX_EVENTS
 DEFAULT_POLY_FETCH_LIMIT = 10000        # was 500 — INGEST_POLY_LIMIT
 
@@ -134,12 +135,14 @@ def parse_kalshi_markets_response(
     body: dict,
     event_title: str = "",
     min_liquidity_usd: float = 0.0,
+    min_volume_usd: float = 0.0,
     category_config: CategoryConfig | None = None,
 ) -> list[Market]:
     """Parse a `/markets?event_ticker=...` response into our Market objects.
 
     Markets without a parseable UTC close_time are dropped. When `category_config`
     is None, every market is bucketed Unknown (prefilter disabled).
+    Liquidity floor: drop if known and below; if unknown, fall back to volume floor.
     """
     out: list[Market] = []
     for m in body.get("markets", []) or []:
@@ -150,12 +153,18 @@ def parse_kalshi_markets_response(
         vol_cents = m.get("volume")
         liq_usd = float(liq_cents) / 100.0 if liq_cents is not None else 0.0
         vol_usd = float(vol_cents) / 100.0 if vol_cents is not None else 0.0
-        if liq_cents is not None and liq_usd < min_liquidity_usd:
+
+        liq_known = liq_cents is not None
+        vol_known = vol_cents is not None
+        if liq_known and liq_usd < min_liquidity_usd:
             continue
+        if not liq_known and vol_known and vol_usd < min_volume_usd:
+            continue
+        # both unknown → pass through (rare; verifier catches obvious junk)
 
         close_utc = parse_close_time_utc(m, platform="kalshi")
         if close_utc is None:
-            continue  # drop on missing/malformed/naive expiry
+            continue
 
         title = m.get("title", "") or ""
         sub = m.get("subtitle") or m.get("yes_sub_title") or ""
@@ -288,6 +297,7 @@ class Ingestion:
         self,
         http: httpx.Client | None = None,
         min_liquidity_usd: float | None = None,
+        min_volume_usd: float | None = None,
         max_kalshi_events: int | None = None,
         poly_fetch_limit: int | None = None,
         category_config: CategoryConfig | None = None,
@@ -297,6 +307,11 @@ class Ingestion:
             min_liquidity_usd
             if min_liquidity_usd is not None
             else float(os.environ.get("MIN_LIQUIDITY_USD", DEFAULT_MIN_LIQUIDITY_USD))
+        )
+        self.min_volume_usd = (
+            min_volume_usd
+            if min_volume_usd is not None
+            else float(os.environ.get("MIN_VOLUME_USD", DEFAULT_MIN_VOLUME_USD))
         )
         self.max_kalshi_events = (
             max_kalshi_events
@@ -357,6 +372,7 @@ class Ingestion:
                     m_resp.json(),
                     event_title=ev["title"],
                     min_liquidity_usd=self.min_liquidity_usd,
+                    min_volume_usd=self.min_volume_usd,
                     category_config=self.category_config,
                 )
             )
