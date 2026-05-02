@@ -92,6 +92,7 @@ def test_poly_gamma_response_parses_to_markets():
             "closed": False,
             "liquidity": "1234.56",
             "volume": 50_000,
+            "endDateIso": "2026-06-01T12:00:00Z",
         }
     ]
     markets = parse_poly_gamma_markets_response(body)
@@ -130,12 +131,14 @@ def test_poly_filters_below_liquidity_floor():
             "outcomes": "[\"Y\",\"N\"]", "clobTokenIds": "[\"a\",\"b\"]",
             "active": True, "closed": False,
             "liquidity": 5000.0,
+            "endDateIso": "2026-06-01T12:00:00Z",
         },
         {
             "slug": "poor", "question": "poor", "conditionId": "0xP",
             "outcomes": "[\"Y\",\"N\"]", "clobTokenIds": "[\"c\",\"d\"]",
             "active": True, "closed": False,
             "liquidity": 5.0,
+            "endDateIso": "2026-06-01T12:00:00Z",
         },
     ]
     markets = parse_poly_gamma_markets_response(body, min_liquidity_usd=100.0)
@@ -287,3 +290,69 @@ def test_kalshi_parser_works_without_category_config():
     }
     markets = parse_kalshi_markets_response(body)
     assert markets[0].bucket == "Unknown"
+
+
+def _poly_cfg() -> CategoryConfig:
+    return CategoryConfig(
+        buckets={
+            "Politics":  BucketDef(kalshi=["Politics"], poly=["Politics"], tolerance_days=60),
+            "Economics": BucketDef(kalshi=["Economics"], poly=["Finance", "Economics"], tolerance_days=14),
+        },
+        default_tolerance_days=30,
+    )
+
+
+def test_poly_parser_assigns_bucket_from_category():
+    body = [{
+        "conditionId": "0xC1", "slug": "p1", "question": "q",
+        "category": "Politics",
+        "endDateIso": "2026-06-01T12:00:00Z",
+    }]
+    markets = parse_poly_gamma_markets_response(body, category_config=_poly_cfg())
+    assert markets[0].bucket == "Politics"
+
+
+def test_poly_parser_falls_back_to_tags_when_category_empty():
+    body = [{
+        "conditionId": "0xC1", "slug": "p1", "question": "q",
+        "category": "",
+        "tags": ["Politics", "Election"],
+        "endDateIso": "2026-06-01T12:00:00Z",
+    }]
+    markets = parse_poly_gamma_markets_response(body, category_config=_poly_cfg())
+    assert markets[0].bucket == "Politics"
+    assert markets[0].tags == ["Politics", "Election"]
+
+
+def test_poly_parser_handles_object_shaped_tags():
+    """Gamma sometimes returns tags as [{"label": "X"}, ...] instead of ["X", ...]."""
+    body = [{
+        "conditionId": "0xC1", "slug": "p1", "question": "q",
+        "category": "",
+        "tags": [{"label": "Politics"}, {"label": "Trump"}],
+        "endDateIso": "2026-06-01T12:00:00Z",
+    }]
+    markets = parse_poly_gamma_markets_response(body, category_config=_poly_cfg())
+    assert markets[0].bucket == "Politics"
+    assert markets[0].tags == ["Politics", "Trump"]
+
+
+def test_poly_parser_drops_market_with_missing_endDate():
+    body = [
+        {"conditionId": "0xC1", "slug": "p1", "question": "q1"},
+        {"conditionId": "0xC2", "slug": "p2", "question": "q2",
+         "endDateIso": "2026-06-01T12:00:00Z"},
+    ]
+    markets = parse_poly_gamma_markets_response(body, category_config=_poly_cfg())
+    assert [m.condition_id for m in markets] == ["0xC2"]
+
+
+def test_poly_parser_assigns_economics_bucket_from_finance_category():
+    """Cross-platform alias: Polymarket 'Finance' maps to the Economics bucket."""
+    body = [{
+        "conditionId": "0xC1", "slug": "p1", "question": "q",
+        "category": "Finance",
+        "endDateIso": "2026-06-01T12:00:00Z",
+    }]
+    markets = parse_poly_gamma_markets_response(body, category_config=_poly_cfg())
+    assert markets[0].bucket == "Economics"

@@ -185,12 +185,29 @@ def parse_kalshi_markets_response(
     return out
 
 
+def _parse_poly_tags(raw: list | None) -> list[str]:
+    """Tolerate either ['Politics', ...] or [{'label': 'Politics'}, ...]."""
+    out: list[str] = []
+    for t in raw or []:
+        if isinstance(t, dict):
+            label = t.get("label") or t.get("name")
+            if label:
+                out.append(str(label))
+        elif isinstance(t, str) and t:
+            out.append(t)
+    return out
+
+
 def parse_poly_gamma_markets_response(
     body: list[dict],
     min_liquidity_usd: float = 0.0,
+    category_config: CategoryConfig | None = None,
 ) -> list[Market]:
-    """Parse a Polymarket Gamma `/markets` response. Polymarket reports
-    liquidity and volume directly in USD (as floats or numeric strings)."""
+    """Parse a Polymarket Gamma `/markets` response.
+
+    Markets without a parseable UTC end date are dropped. When `category_config`
+    is None, every market is bucketed Unknown (prefilter disabled).
+    """
     out: list[Market] = []
     for m in body:
         if m.get("closed") is True or m.get("active") is False:
@@ -203,6 +220,10 @@ def parse_poly_gamma_markets_response(
             continue
         vol = _to_float(m.get("volume") or m.get("volumeNum") or 0)
 
+        close_utc = parse_close_time_utc(m, platform="polymarket")
+        if close_utc is None:
+            continue
+
         outcomes_str = m.get("outcomes") or "[]"
         try:
             outcomes = json.loads(outcomes_str) if isinstance(outcomes_str, str) else outcomes_str
@@ -213,6 +234,15 @@ def parse_poly_gamma_markets_response(
             toks = json.loads(toks_str) if isinstance(toks_str, str) else toks_str
         except json.JSONDecodeError:
             toks = []
+
+        category = m.get("category", "") or ""
+        tags = _parse_poly_tags(m.get("tags"))
+        bucket = (
+            resolve_bucket(category_config, platform="polymarket", category=category, tags=tags)
+            if category_config is not None
+            else "Unknown"
+        )
+
         out.append(Market(
             platform="polymarket",
             ticker=m.get("slug", "") or "",
@@ -220,7 +250,10 @@ def parse_poly_gamma_markets_response(
             description=m.get("description", "") or "",
             resolution_criteria=m.get("description", "") or "",
             outcomes=outcomes if isinstance(outcomes, list) else [],
-            category=m.get("category", "") or "",
+            category=category,
+            tags=tags,
+            bucket=bucket,
+            close_time_utc=close_utc,
             liquidity_usd=liq,
             volume_usd=vol,
             condition_id=cid,
