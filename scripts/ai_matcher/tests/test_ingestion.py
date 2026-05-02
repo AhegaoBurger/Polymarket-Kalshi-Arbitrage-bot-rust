@@ -23,6 +23,7 @@ def test_kalshi_response_parses_to_markets():
                 "category": "Economics",
                 "liquidity": 50_000,  # cents → $500
                 "volume": 1_000_000,  # cents → $10,000
+                "close_time": "2026-06-01T12:00:00Z",
             }
         ]
     }
@@ -42,8 +43,8 @@ def test_kalshi_response_parses_to_markets():
 def test_kalshi_response_filters_below_liquidity_floor():
     body = {
         "markets": [
-            {"ticker": "K1", "title": "rich", "liquidity": 50_000},   # $500
-            {"ticker": "K2", "title": "poor", "liquidity": 1_000},    # $10
+            {"ticker": "K1", "title": "rich", "liquidity": 50_000, "close_time": "2026-06-01T12:00:00Z"},   # $500
+            {"ticker": "K2", "title": "poor", "liquidity": 1_000, "close_time": "2026-06-01T12:00:00Z"},    # $10
         ]
     }
     markets = parse_kalshi_markets_response(body, min_liquidity_usd=100.0)
@@ -57,9 +58,9 @@ def test_kalshi_response_keeps_markets_with_unknown_liquidity():
     disappears whenever the sidecar runs without Kalshi credentials."""
     body = {
         "markets": [
-            {"ticker": "K1", "title": "unknown liq", "liquidity": None},
-            {"ticker": "K2", "title": "no liq field at all"},  # missing key entirely
-            {"ticker": "K3", "title": "low known", "liquidity": 1},  # $0.01
+            {"ticker": "K1", "title": "unknown liq", "liquidity": None, "close_time": "2026-06-01T12:00:00Z"},
+            {"ticker": "K2", "title": "no liq field at all", "close_time": "2026-06-01T12:00:00Z"},  # missing key entirely
+            {"ticker": "K3", "title": "low known", "liquidity": 1, "close_time": "2026-06-01T12:00:00Z"},  # $0.01
         ]
     }
     markets = parse_kalshi_markets_response(body, min_liquidity_usd=100.0)
@@ -212,3 +213,77 @@ def test_polymarket_falls_back_to_endDate():
     raw = {"endDate": "2026-06-01T12:00:00Z"}
     dt = parse_close_time_utc(raw, "polymarket")
     assert dt == datetime(2026, 6, 1, 12, 0, 0, tzinfo=timezone.utc)
+
+
+from ai_matcher.categories import BucketDef, CategoryConfig
+
+
+def _kalshi_cfg() -> CategoryConfig:
+    return CategoryConfig(
+        buckets={
+            "Politics":  BucketDef(kalshi=["Politics"],  poly=["Politics"],  tolerance_days=60),
+            "Economics": BucketDef(kalshi=["Economics"], poly=["Finance"],   tolerance_days=14),
+        },
+        default_tolerance_days=30,
+    )
+
+
+def test_kalshi_parser_assigns_bucket():
+    body = {
+        "markets": [
+            {
+                "ticker": "K1", "title": "t", "category": "Politics",
+                "close_time": "2026-06-01T12:00:00Z",
+            }
+        ]
+    }
+    markets = parse_kalshi_markets_response(body, category_config=_kalshi_cfg())
+    assert len(markets) == 1
+    assert markets[0].bucket == "Politics"
+    assert markets[0].close_time_utc == datetime(2026, 6, 1, 12, 0, 0, tzinfo=timezone.utc)
+
+
+def test_kalshi_parser_drops_market_with_missing_close_time():
+    body = {
+        "markets": [
+            {"ticker": "K1", "title": "no date", "category": "Politics"},
+            {"ticker": "K2", "title": "good",    "category": "Politics",
+             "close_time": "2026-06-01T12:00:00Z"},
+        ]
+    }
+    markets = parse_kalshi_markets_response(body, category_config=_kalshi_cfg())
+    assert [m.ticker for m in markets] == ["K2"]
+
+
+def test_kalshi_parser_drops_market_with_unparseable_close_time():
+    body = {
+        "markets": [
+            {"ticker": "K1", "title": "bad", "category": "Politics",
+             "close_time": "not a date"},
+        ]
+    }
+    markets = parse_kalshi_markets_response(body, category_config=_kalshi_cfg())
+    assert markets == []
+
+
+def test_kalshi_parser_assigns_unknown_when_category_missing():
+    body = {
+        "markets": [
+            {"ticker": "K1", "title": "t", "category": "Astronomy",
+             "close_time": "2026-06-01T12:00:00Z"},
+        ]
+    }
+    markets = parse_kalshi_markets_response(body, category_config=_kalshi_cfg())
+    assert markets[0].bucket == "Unknown"
+
+
+def test_kalshi_parser_works_without_category_config():
+    """Backward compat: when no config is passed, bucket defaults to Unknown but markets still parse."""
+    body = {
+        "markets": [
+            {"ticker": "K1", "title": "t", "category": "Politics",
+             "close_time": "2026-06-01T12:00:00Z"},
+        ]
+    }
+    markets = parse_kalshi_markets_response(body)
+    assert markets[0].bucket == "Unknown"

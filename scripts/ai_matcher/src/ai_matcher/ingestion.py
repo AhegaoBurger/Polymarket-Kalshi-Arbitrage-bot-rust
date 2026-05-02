@@ -22,6 +22,8 @@ from datetime import datetime, timezone
 
 import httpx
 
+from ai_matcher.categories import CategoryConfig, resolve_bucket
+
 KALSHI_API_BASE = "https://api.elections.kalshi.com/trade-api/v2"
 GAMMA_API_BASE = "https://gamma-api.polymarket.com"
 
@@ -132,21 +134,18 @@ def parse_kalshi_markets_response(
     body: dict,
     event_title: str = "",
     min_liquidity_usd: float = 0.0,
+    category_config: CategoryConfig | None = None,
 ) -> list[Market]:
     """Parse a `/markets?event_ticker=...` response into our Market objects.
 
-    `event_title` is folded into description so per-event context survives
-    embedding even when individual markets share a generic ticker template.
+    Markets without a parseable UTC close_time are dropped. When `category_config`
+    is None, every market is bucketed Unknown (prefilter disabled).
     """
     out: list[Market] = []
     for m in body.get("markets", []) or []:
         if not m.get("ticker"):
             continue
-        # Kalshi returns liquidity/volume in cents — but only over authenticated
-        # sessions. The public browse endpoint always returns null. When the
-        # field is *known* and below threshold, drop; when unknown, pass through
-        # (the Polymarket-side liquidity filter + cosine retrieval will still
-        # bound the join).
+
         liq_cents = m.get("liquidity")
         vol_cents = m.get("volume")
         liq_usd = float(liq_cents) / 100.0 if liq_cents is not None else 0.0
@@ -154,10 +153,20 @@ def parse_kalshi_markets_response(
         if liq_cents is not None and liq_usd < min_liquidity_usd:
             continue
 
-        # Compose embedding text from every field that carries semantic content.
+        close_utc = parse_close_time_utc(m, platform="kalshi")
+        if close_utc is None:
+            continue  # drop on missing/malformed/naive expiry
+
         title = m.get("title", "") or ""
         sub = m.get("subtitle") or m.get("yes_sub_title") or ""
         rules = m.get("rules_primary", "") or ""
+        category = m.get("category", "") or ""
+        bucket = (
+            resolve_bucket(category_config, platform="kalshi", category=category, tags=[])
+            if category_config is not None
+            else "Unknown"
+        )
+
         out.append(Market(
             platform="kalshi",
             ticker=m["ticker"],
@@ -166,7 +175,10 @@ def parse_kalshi_markets_response(
             description=(event_title + ((" — " + sub) if sub else "")).strip(" —"),
             resolution_criteria=rules,
             outcomes=[sub] if sub else [],
-            category=m.get("category", "") or "",
+            category=category,
+            tags=[],
+            bucket=bucket,
+            close_time_utc=close_utc,
             liquidity_usd=liq_usd,
             volume_usd=vol_usd,
         ))
