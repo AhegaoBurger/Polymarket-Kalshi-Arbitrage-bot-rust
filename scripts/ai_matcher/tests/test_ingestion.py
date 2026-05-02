@@ -356,3 +356,64 @@ def test_poly_parser_assigns_economics_bucket_from_finance_category():
     }]
     markets = parse_poly_gamma_markets_response(body, category_config=_poly_cfg())
     assert markets[0].bucket == "Economics"
+
+
+import httpx
+
+from ai_matcher.ingestion import Ingestion
+
+
+class _StubHttp:
+    """Minimal httpx.Client stand-in: maps URL → list-of-responses."""
+
+    def __init__(self, responses_by_url: dict[str, list[dict | list]]):
+        self._responses = {url: list(rs) for url, rs in responses_by_url.items()}
+        self.call_log: list[str] = []
+
+    def get(self, url: str):
+        self.call_log.append(url)
+        for prefix, queue in self._responses.items():
+            if url.startswith(prefix) and queue:
+                body = queue.pop(0)
+                return _StubResponse(body)
+        # Default: empty body so loops terminate.
+        return _StubResponse([] if "polymarket" in url else {})
+
+
+class _StubResponse:
+    def __init__(self, body):
+        self._body = body
+    def raise_for_status(self):
+        pass
+    def json(self):
+        return self._body
+
+
+def test_poly_pagination_walks_offset():
+    page1 = [{"conditionId": f"0xA{i}", "slug": f"a{i}", "question": "q",
+              "endDateIso": "2026-06-01T12:00:00Z"} for i in range(500)]
+    page2 = [{"conditionId": f"0xB{i}", "slug": f"b{i}", "question": "q",
+              "endDateIso": "2026-06-01T12:00:00Z"} for i in range(500)]
+    page3 = []
+    stub = _StubHttp({
+        "https://gamma-api.polymarket.com/markets": [page1, page2, page3],
+    })
+    ing = Ingestion(http=stub, poly_fetch_limit=2000, min_liquidity_usd=0.0)
+    markets = ing.fetch_poly()
+    assert len(markets) == 1000
+    assert len(stub.call_log) == 3
+    assert "offset=0" in stub.call_log[0]
+    assert "offset=500" in stub.call_log[1]
+    assert "offset=1000" in stub.call_log[2]
+
+
+def test_poly_pagination_stops_when_cap_reached():
+    page1 = [{"conditionId": f"0xA{i}", "slug": f"a{i}", "question": "q",
+              "endDateIso": "2026-06-01T12:00:00Z"} for i in range(500)]
+    stub = _StubHttp({
+        "https://gamma-api.polymarket.com/markets": [page1, page1, page1],
+    })
+    ing = Ingestion(http=stub, poly_fetch_limit=500, min_liquidity_usd=0.0)
+    markets = ing.fetch_poly()
+    assert len(stub.call_log) == 1
+    assert len(markets) == 500

@@ -32,7 +32,7 @@ DEFAULT_TIMEOUT = 15.0
 # Defaults (override via env vars in production):
 DEFAULT_MIN_LIQUIDITY_USD = 100.0       # MIN_LIQUIDITY_USD
 DEFAULT_MAX_KALSHI_EVENTS = 200         # INGEST_KALSHI_MAX_EVENTS
-DEFAULT_POLY_FETCH_LIMIT = 500          # INGEST_POLY_LIMIT
+DEFAULT_POLY_FETCH_LIMIT = 10000        # was 500 — INGEST_POLY_LIMIT
 
 
 def parse_close_time_utc(raw: dict, platform: str) -> datetime | None:
@@ -290,6 +290,7 @@ class Ingestion:
         min_liquidity_usd: float | None = None,
         max_kalshi_events: int | None = None,
         poly_fetch_limit: int | None = None,
+        category_config: CategoryConfig | None = None,
     ) -> None:
         self._http = http or httpx.Client(timeout=DEFAULT_TIMEOUT)
         self.min_liquidity_usd = (
@@ -307,6 +308,7 @@ class Ingestion:
             if poly_fetch_limit is not None
             else int(os.environ.get("INGEST_POLY_LIMIT", DEFAULT_POLY_FETCH_LIMIT))
         )
+        self.category_config = category_config
 
     def fetch_all(self) -> IngestionResult:
         return IngestionResult(
@@ -352,20 +354,23 @@ class Ingestion:
         return out
 
     def fetch_poly(self) -> list[Market]:
-        """Fetch Polymarket markets sorted by liquidity desc, take top N.
-
-        Gamma's `order=liquidity` puts the most liquid markets first; combined
-        with `active=true&closed=false`, this gives us the arb-tradeable cohort
-        without scanning the entire long tail.
-        """
-        resp = self._http.get(
-            f"{GAMMA_API_BASE}/markets"
-            f"?limit={self.poly_fetch_limit}"
-            f"&active=true&closed=false"
-            f"&order=liquidity&ascending=false"
-        )
-        resp.raise_for_status()
-        body = resp.json() if isinstance(resp.json(), list) else []
-        return parse_poly_gamma_markets_response(
-            body, min_liquidity_usd=self.min_liquidity_usd
-        )
+        """Fetch Polymarket markets sorted by liquidity desc, paginate via offset."""
+        out: list[Market] = []
+        page_size = 500
+        for offset in range(0, self.poly_fetch_limit, page_size):
+            resp = self._http.get(
+                f"{GAMMA_API_BASE}/markets"
+                f"?limit={page_size}&offset={offset}"
+                f"&active=true&closed=false"
+                f"&order=liquidity&ascending=false"
+            )
+            resp.raise_for_status()
+            body = resp.json() if isinstance(resp.json(), list) else []
+            if not body:
+                break
+            out.extend(parse_poly_gamma_markets_response(
+                body,
+                min_liquidity_usd=self.min_liquidity_usd,
+                category_config=self.category_config,
+            ))
+        return out
