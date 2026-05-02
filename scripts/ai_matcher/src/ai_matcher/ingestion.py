@@ -44,8 +44,8 @@ def parse_close_time_utc(raw: dict, platform: str) -> datetime | None:
     """
     if platform == "kalshi":
         s = raw.get("close_time")
-    else:  # polymarket
-        s = raw.get("endDateIso") or raw.get("endDate")
+    else:  # polymarket — endDate is tz-aware; endDateIso is date-only on Gamma
+        s = raw.get("endDate") or raw.get("endDateIso")
     if not s:
         return None
     try:

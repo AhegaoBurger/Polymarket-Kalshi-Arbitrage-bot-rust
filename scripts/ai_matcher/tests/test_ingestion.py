@@ -206,8 +206,16 @@ def test_returns_none_for_garbage():
     assert parse_close_time_utc(raw, "kalshi") is None
 
 
-def test_polymarket_prefers_endDateIso_over_endDate():
-    raw = {"endDateIso": "2026-06-01T12:00:00Z", "endDate": "2099-01-01"}
+def test_polymarket_prefers_endDate_over_endDateIso():
+    """endDate is tz-aware on Gamma; endDateIso is date-only. Prefer endDate."""
+    raw = {"endDate": "2026-06-01T12:00:00Z", "endDateIso": "2026-06-01"}
+    dt = parse_close_time_utc(raw, "polymarket")
+    assert dt == datetime(2026, 6, 1, 12, 0, 0, tzinfo=timezone.utc)
+
+
+def test_polymarket_falls_back_to_endDateIso_when_endDate_missing():
+    """If endDate is absent but endDateIso happens to have a tz-aware string, use it."""
+    raw = {"endDateIso": "2026-06-01T12:00:00Z"}
     dt = parse_close_time_utc(raw, "polymarket")
     assert dt == datetime(2026, 6, 1, 12, 0, 0, tzinfo=timezone.utc)
 
