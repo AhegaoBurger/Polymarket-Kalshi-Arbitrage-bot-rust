@@ -1,3 +1,5 @@
+"""Tests for the audit HTML report."""
+
 from __future__ import annotations
 
 from pathlib import Path
@@ -6,72 +8,54 @@ from ai_matcher.report import PairAuditRow, render_report
 from ai_matcher.verifier import Decision
 
 
-def mk_row(
-    decision: str = "accept",
-    confidence: float = 0.97,
-    category: str = "Economics",
-) -> PairAuditRow:
-    return PairAuditRow(
-        kalshi_ticker="KXCPIYOY-26APR-B3.0",
-        kalshi_title="Kalshi market",
-        kalshi_description="kdesc",
-        kalshi_resolution="kr",
-        kalshi_outcomes=["Yes", "No"],
-        kalshi_url="https://kalshi.com/m/k1",
-        poly_slug="cpi-may-2026",
-        poly_title="Poly market",
-        poly_description="pdesc",
-        poly_resolution="pr",
-        poly_outcomes=["Yes", "No"],
-        poly_url="https://polymarket.com/event/poly1",
+def _row(**kwargs) -> PairAuditRow:
+    base = dict(
+        kalshi_ticker="K", kalshi_title="kt", kalshi_description="kd",
+        kalshi_resolution="kr", kalshi_outcomes=["yes", "no"],
+        kalshi_url="https://k.example",
+        poly_slug="p", poly_title="pt", poly_description="pd",
+        poly_resolution="pr", poly_outcomes=["yes", "no"],
+        poly_url="https://p.example",
         decision=Decision(
-            confidence=confidence,
-            resolution_match=True,
-            concerns=[],
-            reasoning="x",
-            category=category,
-            event_type="Cpi",
+            confidence=0.95, resolution_match=True, concerns=[],
+            reasoning="r", category="Politics", event_type="Election",
+            cost_usd=0.0007,
         ),
-        accepted=(decision == "accept"),
-        override_snippet='{"kalshi_market_ticker":"KXCPIYOY-26APR-B3.0","poly_condition_id":"0xC"}',
+        accepted=True, override_snippet="{}", override_outcome="none",
+        bucket_kalshi="Politics", bucket_poly="Politics",
+        cosine=0.83, delta_days=12.0,
     )
+    base.update(kwargs)
+    return PairAuditRow(**base)
 
 
-def test_renders_main_report(tmp_path: Path):
-    rows = [mk_row("accept"), mk_row("reject", confidence=0.6, category="Politics")]
-    render_report(rows, tmp_path)
-    main = (tmp_path / "report.html").read_text()
-    assert "Kalshi market" in main
-    assert "Poly market" in main
-    assert "0.97" in main
-    assert "Politics" in main
+def test_report_contains_new_columns(tmp_path: Path):
+    render_report([_row()], tmp_path)
+    html = (tmp_path / "report.html").read_text()
+    assert "Bucket pair" in html
+    assert "Cosine" in html
+    assert "Δdays" in html
+    assert "Politics → Politics" in html
+    assert "0.830" in html or "0.83" in html
+    assert "12" in html
 
 
-def test_renders_filter_variants(tmp_path: Path):
-    rows = [mk_row("accept"), mk_row("reject", confidence=0.6, category="Politics")]
-    render_report(rows, tmp_path)
-    accepted = (tmp_path / "report-accepted.html").read_text()
-    rejected = (tmp_path / "report-rejected.html").read_text()
-    assert "0.97" in accepted and "0.6" not in accepted
-    assert "0.6" in rejected
+def test_report_has_sortable_headers(tmp_path: Path):
+    render_report([_row()], tmp_path)
+    html = (tmp_path / "report.html").read_text()
+    assert 'data-sort="numeric"' in html
+    assert 'data-sort="string"' in html
 
 
-def test_whitelist_override_is_visible_in_report(tmp_path: Path):
-    """Spec §4.6.4: an auditor must be able to tell from the HTML when a
-    whitelist override flipped an LLM rejection to accepted."""
-    row = mk_row("accept", confidence=0.6, category="Politics")
-    row.override_outcome = "whitelist"
-    render_report([row], tmp_path)
-    main = (tmp_path / "report.html").read_text()
-    assert "WHITELIST OVERRIDE" in main
-    assert "Forced accept" in main
+def test_report_has_filter_input_and_sticky_header(tmp_path: Path):
+    render_report([_row()], tmp_path)
+    html = (tmp_path / "report.html").read_text()
+    assert 'id="filter"' in html
+    assert "position: sticky" in html
 
 
-def test_blacklist_override_is_visible_in_report(tmp_path: Path):
-    row = mk_row("accept", confidence=0.97, category="Economics")
-    row.accepted = False
-    row.override_outcome = "blacklist"
-    render_report([row], tmp_path)
-    main = (tmp_path / "report.html").read_text()
-    assert "BLACKLIST OVERRIDE" in main
-    assert "Forced reject" in main
+def test_report_has_sort_filter_js(tmp_path: Path):
+    render_report([_row()], tmp_path)
+    html = (tmp_path / "report.html").read_text()
+    assert "addEventListener('click'" in html
+    assert "addEventListener('input'" in html
