@@ -237,11 +237,9 @@ def run_pipeline_default(
             "no LLM verification)"
         )
     else:
-        import anthropic
-
-        client = anthropic.Anthropic()
+        model = os.environ.get("LLM_MODEL", "gpt-4.1-mini")
         verifier = Verifier(
-            client=client,
+            model=model,
             cache_path=project_root / ".ai_matcher_verifier_cache.json",
         )
         cfg.llm_model = verifier.model

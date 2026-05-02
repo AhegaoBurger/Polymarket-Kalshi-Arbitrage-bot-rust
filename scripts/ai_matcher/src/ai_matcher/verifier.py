@@ -1,7 +1,6 @@
-"""Claude verification of candidate pairs.
+"""LiteLLM-backed verifier for candidate market pairs.
 
-Uses the Anthropic SDK's tool-use mode to enforce structured JSON output.
-Spec: docs/superpowers/specs/2026-04-21-multi-category-matching-design.md §4.6.3 + Appendix A.
+Spec: docs/superpowers/specs/2026-05-02-matching-prefilter-and-llm-swap-design.md §4
 """
 
 from __future__ import annotations
@@ -11,27 +10,32 @@ from dataclasses import asdict, dataclass
 from pathlib import Path
 from typing import Any
 
+import litellm
+
 from ai_matcher.ingestion import Market
 
-DEFAULT_MODEL = "claude-opus-4-7"
+DEFAULT_MODEL = "gpt-4.1-mini"
 
 VERIFIER_TOOL = {
-    "name": "report_match_decision",
-    "description": "Report whether two prediction markets resolve to identical outcomes.",
-    "input_schema": {
-        "type": "object",
-        "properties": {
-            "confidence": {"type": "number", "minimum": 0, "maximum": 1},
-            "resolution_match": {"type": "boolean"},
-            "concerns": {"type": "array", "items": {"type": "string"}},
-            "reasoning": {"type": "string"},
-            "category": {"type": "string"},
-            "event_type": {"type": "string", "enum": [
-                "Sports", "Fomc", "Cpi", "NfpJobs", "Election", "Other"
-            ]},
+    "type": "function",
+    "function": {
+        "name": "report_match_decision",
+        "description": "Report whether two prediction markets resolve to identical outcomes.",
+        "parameters": {
+            "type": "object",
+            "properties": {
+                "confidence": {"type": "number", "minimum": 0, "maximum": 1},
+                "resolution_match": {"type": "boolean"},
+                "concerns": {"type": "array", "items": {"type": "string"}},
+                "reasoning": {"type": "string"},
+                "category": {"type": "string"},
+                "event_type": {"type": "string", "enum": [
+                    "Sports", "Fomc", "Cpi", "NfpJobs", "Election", "Other"
+                ]},
+            },
+            "required": ["confidence", "resolution_match", "concerns", "reasoning",
+                         "category", "event_type"],
         },
-        "required": ["confidence", "resolution_match", "concerns", "reasoning",
-                     "category", "event_type"],
     },
 }
 
@@ -61,13 +65,9 @@ class Decision:
     reasoning: str
     category: str
     event_type: str
+    cost_usd: float = 0.0
 
     def is_accepted(self, min_confidence: float = 0.9) -> bool:
-        """Return True if this decision passes acceptance with the given floor.
-
-        Default floor (0.9) matches the LLM-verifier threshold from spec §4.6.3.
-        Embeddings-only mode passes a different floor here.
-        """
         return (
             self.resolution_match
             and self.confidence >= min_confidence
@@ -76,14 +76,21 @@ class Decision:
 
     @property
     def accepted(self) -> bool:
-        """Default LLM-mode acceptance check. Use is_accepted() for custom thresholds."""
         return self.is_accepted(0.9)
 
 
+def user_prompt(kalshi: Market, poly: Market) -> str:
+    return (
+        f"Kalshi market:\n  Title: {kalshi.title}\n  Description: {kalshi.description}\n"
+        f"  Resolution: {kalshi.resolution_criteria}\n  Outcomes: {kalshi.outcomes}\n\n"
+        f"Polymarket market:\n  Title: {poly.title}\n  Description: {poly.description}\n"
+        f"  Resolution: {poly.resolution_criteria}\n  Outcomes: {poly.outcomes}\n\n"
+        "Do these resolve identically? Score accordingly."
+    )
+
+
 class Verifier:
-    def __init__(self, client: Any, model: str = DEFAULT_MODEL,
-                 cache_path: Path | None = None) -> None:
-        self.client = client
+    def __init__(self, model: str = DEFAULT_MODEL, cache_path: Path | None = None) -> None:
         self.model = model
         self.cache_path = cache_path
         self._cache: dict[str, dict] = self._load_cache()
@@ -113,24 +120,18 @@ class Verifier:
             return Decision(**self._cache[key])
 
         self.cache_misses += 1
-        user_prompt = (
-            f"Kalshi market:\n  Title: {kalshi.title}\n  Description: {kalshi.description}\n"
-            f"  Resolution: {kalshi.resolution_criteria}\n  Outcomes: {kalshi.outcomes}\n\n"
-            f"Polymarket market:\n  Title: {poly.title}\n  Description: {poly.description}\n"
-            f"  Resolution: {poly.resolution_criteria}\n  Outcomes: {poly.outcomes}\n\n"
-            "Do these resolve identically? Score accordingly."
-        )
-
-        resp = self.client.messages.create(
+        resp = litellm.completion(
             model=self.model,
-            max_tokens=1024,
-            system=SYSTEM_PROMPT,
+            messages=[
+                {"role": "system", "content": SYSTEM_PROMPT},
+                {"role": "user",   "content": user_prompt(kalshi, poly)},
+            ],
             tools=[VERIFIER_TOOL],
-            tool_choice={"type": "tool", "name": "report_match_decision"},
-            messages=[{"role": "user", "content": user_prompt}],
+            tool_choice={"type": "function", "function": {"name": "report_match_decision"}},
+            num_retries=3,
         )
-
         tool_input = self._extract_tool_input(resp)
+        cost = float(getattr(resp, "_hidden_params", {}).get("response_cost", 0.0) or 0.0)
         decision = Decision(
             confidence=float(tool_input["confidence"]),
             resolution_match=bool(tool_input["resolution_match"]),
@@ -138,6 +139,7 @@ class Verifier:
             reasoning=str(tool_input.get("reasoning", "")),
             category=str(tool_input.get("category", "")),
             event_type=str(tool_input.get("event_type", "Other")),
+            cost_usd=cost,
         )
         self._cache[key] = asdict(decision)
         self._save_cache()
@@ -145,29 +147,28 @@ class Verifier:
 
     @staticmethod
     def _extract_tool_input(resp: Any) -> dict:
-        for block in getattr(resp, "content", []) or []:
-            if getattr(block, "type", None) == "tool_use":
-                return getattr(block, "input", {}) or {}
-        raise ValueError("Anthropic response missing tool_use block")
+        choices = getattr(resp, "choices", None) or []
+        for ch in choices:
+            msg = getattr(ch, "message", None)
+            if msg is None:
+                continue
+            tool_calls = getattr(msg, "tool_calls", None) or []
+            for tc in tool_calls:
+                fn = getattr(tc, "function", None)
+                if fn is None:
+                    continue
+                args = getattr(fn, "arguments", None)
+                if args:
+                    return json.loads(args)
+        raise ValueError("LiteLLM response missing tool_calls")
 
 
 class EmbeddingsOnlyVerifier:
-    """Verifier replacement that skips the LLM and decides purely on cosine similarity.
-
-    Useful for cheap dry runs without an `ANTHROPIC_API_KEY`. Much weaker signal
-    than the LLM verifier — embeddings cluster by topical similarity, NOT by
-    resolution-criteria identity. Markets with the same topic but different
-    resolution dates will look identical to this verifier. Pair acceptance
-    requires `cosine >= accept_cosine` (default 0.85).
-
-    Same interface as `Verifier.verify` but takes the cosine score that
-    `HnswRetrieval.query` already produced — no extra compute.
-    """
+    """Verifier replacement that decides purely on cosine similarity (no LLM)."""
 
     def __init__(self, accept_cosine: float = 0.85) -> None:
         self.accept_cosine = accept_cosine
         self.model = "embeddings-only"
-        # Bookkeeping for compatibility with the LLM verifier surface.
         self.cache_hits = 0
         self.cache_misses = 0
 
@@ -190,4 +191,5 @@ class EmbeddingsOnlyVerifier:
             ),
             category="",
             event_type="Other",
+            cost_usd=0.0,
         )

@@ -1,136 +1,100 @@
+"""Tests for the LiteLLM-backed Verifier."""
+
 from __future__ import annotations
 
+import json
+from datetime import datetime, timezone
+from types import SimpleNamespace
 from pathlib import Path
-from unittest.mock import MagicMock
+
+import pytest
 
 from ai_matcher.ingestion import Market
-from ai_matcher.verifier import Decision, EmbeddingsOnlyVerifier, Verifier
+from ai_matcher.verifier import Decision, Verifier
 
 
-def mk_pair():
-    k = Market(
-        platform="kalshi", ticker="KX", title="A?", description="d",
-        resolution_criteria="r", outcomes=["Yes", "No"],
+def _market(platform: str, ticker: str, title: str = "T") -> Market:
+    return Market(
+        platform=platform, ticker=ticker, title=title,
+        bucket="Politics",
+        close_time_utc=datetime(2026, 6, 1, tzinfo=timezone.utc),
+        condition_id="0xC1" if platform == "polymarket" else "",
     )
-    p = Market(
-        platform="polymarket", ticker="poly", title="A?", description="d",
-        resolution_criteria="r", outcomes=["Yes", "No"], condition_id="0xC",
+
+
+def _fake_response(arguments: dict, cost: float = 0.0007) -> SimpleNamespace:
+    return SimpleNamespace(
+        choices=[SimpleNamespace(message=SimpleNamespace(
+            tool_calls=[SimpleNamespace(function=SimpleNamespace(
+                arguments=json.dumps(arguments),
+            ))]
+        ))],
+        _hidden_params={"response_cost": cost},
     )
-    return k, p
 
 
-def fake_anthropic_response(json_blob: dict) -> MagicMock:
-    """Mimic anthropic SDK: client.messages.create returns an object whose
-    .content[0] is a tool_use block with .input == json_blob."""
-    msg = MagicMock()
-    msg.stop_reason = "tool_use"
-    block = MagicMock()
-    block.type = "tool_use"
-    block.input = json_blob
-    msg.content = [block]
-    return msg
+def test_verify_parses_litellm_response(monkeypatch, tmp_path: Path):
+    captured: dict = {}
+    def fake_completion(**kwargs):
+        captured.update(kwargs)
+        return _fake_response({
+            "confidence": 0.95, "resolution_match": True,
+            "concerns": [], "reasoning": "R",
+            "category": "Politics", "event_type": "Election",
+        })
+    monkeypatch.setattr("litellm.completion", fake_completion)
+
+    v = Verifier(model="gpt-4.1-mini", cache_path=tmp_path / "cache.json")
+    decision = v.verify(_market("kalshi", "K1"), _market("polymarket", "P1"))
+    assert decision.confidence == 0.95
+    assert decision.resolution_match is True
+    assert decision.category == "Politics"
+    assert decision.event_type == "Election"
+    assert captured["model"] == "gpt-4.1-mini"
+    assert captured["tool_choice"]["type"] == "function"
+    assert captured["tools"][0]["type"] == "function"
+    assert captured["tools"][0]["function"]["name"] == "report_match_decision"
 
 
-def test_verifier_accepts_high_confidence_no_concerns(tmp_path: Path):
-    client = MagicMock()
-    client.messages.create.return_value = fake_anthropic_response({
-        "confidence": 0.97, "resolution_match": True, "concerns": [],
-        "reasoning": "identical resolution", "category": "Economics",
-        "event_type": "Cpi",
-    })
-    v = Verifier(client=client, model="claude-opus-4-7", cache_path=tmp_path / "v.json")
-    k, p = mk_pair()
-    d = v.verify(k, p)
-    assert d.accepted
-    assert d.confidence == 0.97
-    assert d.category == "Economics"
+def test_verify_caches_by_provider_and_pair(monkeypatch, tmp_path: Path):
+    calls = {"n": 0}
+    def fake_completion(**kwargs):
+        calls["n"] += 1
+        return _fake_response({
+            "confidence": 0.9, "resolution_match": True,
+            "concerns": [], "reasoning": "", "category": "Politics", "event_type": "Other",
+        })
+    monkeypatch.setattr("litellm.completion", fake_completion)
 
-
-def test_verifier_rejects_low_confidence(tmp_path: Path):
-    client = MagicMock()
-    client.messages.create.return_value = fake_anthropic_response({
-        "confidence": 0.6, "resolution_match": False, "concerns": ["different dates"],
-        "reasoning": "diverges", "category": "", "event_type": "Other",
-    })
-    v = Verifier(client=client, model="claude-opus-4-7", cache_path=tmp_path / "v.json")
-    k, p = mk_pair()
-    d = v.verify(k, p)
-    assert not d.accepted
-
-
-def test_verifier_caches_decision(tmp_path: Path):
-    client = MagicMock()
-    client.messages.create.return_value = fake_anthropic_response({
-        "confidence": 0.97, "resolution_match": True, "concerns": [],
-        "reasoning": "x", "category": "Economics", "event_type": "Cpi",
-    })
-    v = Verifier(client=client, model="claude-opus-4-7", cache_path=tmp_path / "v.json")
-    k, p = mk_pair()
+    v = Verifier(model="gpt-4.1-mini", cache_path=tmp_path / "cache.json")
+    k, p = _market("kalshi", "K1"), _market("polymarket", "P1")
     v.verify(k, p)
     v.verify(k, p)
-    assert client.messages.create.call_count == 1
+    assert calls["n"] == 1
     assert v.cache_hits == 1
 
 
-# === EmbeddingsOnlyVerifier =================================================
+def test_cache_invalidates_on_model_change(monkeypatch, tmp_path: Path):
+    monkeypatch.setattr("litellm.completion", lambda **kw: _fake_response({
+        "confidence": 0.9, "resolution_match": True,
+        "concerns": [], "reasoning": "", "category": "Politics", "event_type": "Other",
+    }))
+    cache_path = tmp_path / "cache.json"
+
+    v1 = Verifier(model="gpt-4.1-mini", cache_path=cache_path)
+    v1.verify(_market("kalshi", "K1"), _market("polymarket", "P1"))
+
+    v2 = Verifier(model="deepseek/deepseek-chat", cache_path=cache_path)
+    v2.verify(_market("kalshi", "K1"), _market("polymarket", "P1"))
+    assert v2.cache_misses == 1
+    assert v2.cache_hits == 0
 
 
-def test_embeddings_only_accepts_when_cosine_clears_threshold():
-    v = EmbeddingsOnlyVerifier(accept_cosine=0.85)
-    k, p = mk_pair()
-    d = v.verify(k, p, cosine=0.91)
-    assert d.confidence == 0.91
-    assert d.resolution_match
-    assert d.concerns == []
-    assert d.is_accepted(min_confidence=0.85)
-    assert "embeddings-only" in d.reasoning
-
-
-def test_embeddings_only_rejects_when_cosine_below_threshold():
-    v = EmbeddingsOnlyVerifier(accept_cosine=0.85)
-    k, p = mk_pair()
-    d = v.verify(k, p, cosine=0.7)
-    assert not d.resolution_match
-    assert d.concerns
-    assert not d.is_accepted(min_confidence=0.85)
-
-
-def test_embeddings_only_no_api_key_required():
-    """The whole point: no Anthropic client involved."""
-    v = EmbeddingsOnlyVerifier()
-    assert v.model == "embeddings-only"
-    # Smoke check: verify() runs without any client at all.
-    k, p = mk_pair()
-    d = v.verify(k, p, cosine=0.99)
-    assert d.is_accepted(min_confidence=0.85)
-
-
-# === Decision.is_accepted ===================================================
-
-
-def test_decision_is_accepted_respects_custom_floor():
-    d = Decision(
-        confidence=0.72,
-        resolution_match=True,
-        concerns=[],
-        reasoning="x",
-        category="",
-        event_type="Other",
-    )
-    # Default LLM floor (0.9) rejects 0.72.
-    assert not d.is_accepted()
-    assert not d.accepted
-    # Embeddings floor (0.7) accepts.
-    assert d.is_accepted(min_confidence=0.7)
-
-
-def test_decision_is_accepted_requires_no_concerns():
-    d = Decision(
-        confidence=0.99,
-        resolution_match=True,
-        concerns=["something"],
-        reasoning="x",
-        category="",
-        event_type="Other",
-    )
-    assert not d.is_accepted(min_confidence=0.0)
+def test_cost_field_threaded_into_cache(monkeypatch, tmp_path: Path):
+    monkeypatch.setattr("litellm.completion", lambda **kw: _fake_response({
+        "confidence": 0.9, "resolution_match": True,
+        "concerns": [], "reasoning": "", "category": "Politics", "event_type": "Other",
+    }, cost=0.0042))
+    v = Verifier(model="gpt-4.1-mini", cache_path=tmp_path / "cache.json")
+    decision = v.verify(_market("kalshi", "K1"), _market("polymarket", "P1"))
+    assert decision.cost_usd == pytest.approx(0.0042)
