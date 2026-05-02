@@ -401,19 +401,38 @@ def audit_sample_default(sample: int) -> int:
 
 
 def _render_audit_sample(pairs: list[dict], payload: dict) -> str:
-    lines = [
-        "<!DOCTYPE html><html><body "
-        "style='font-family:sans-serif;max-width:1000px;margin:1em auto;'>",
-        f"<h1>ai_matcher audit — {len(pairs)} samples (model {payload.get('model')})</h1>",
-    ]
+    """Render N spot-check pairs using the main report template — sort + filter for free."""
+    from importlib.resources import files
+    from jinja2 import Environment, FileSystemLoader, select_autoescape
+
+    from ai_matcher.report import PairAuditRow
+    from ai_matcher.verifier import Decision
+
+    template_dir = files("ai_matcher").joinpath("templates")
+    env = Environment(
+        loader=FileSystemLoader(str(template_dir)),
+        autoescape=select_autoescape(["html"]),
+    )
+    tpl = env.get_template("report.html.j2")
+    rows = []
     for p in pairs:
-        lines.append("<hr>")
-        lines.append(f"<h2>{p.get('description', '')}</h2>")
-        lines.append(f"<p>Kalshi: <code>{p.get('kalshi_market_ticker')}</code></p>")
-        lines.append(f"<p>Polymarket conditionId: <code>{p.get('poly_condition_id')}</code></p>")
-        lines.append(
-            f"<p>Category: {p.get('category')} — Event: {p.get('event_type')} — "
-            f"Confidence: {p.get('confidence')}</p>"
-        )
-    lines.append("</body></html>")
-    return "\n".join(lines)
+        rows.append(PairAuditRow(
+            kalshi_ticker=p.get("kalshi_market_ticker", ""),
+            kalshi_title="", kalshi_description="", kalshi_resolution="",
+            kalshi_outcomes=[], kalshi_url="",
+            poly_slug=p.get("poly_condition_id", ""),
+            poly_title="", poly_description="", poly_resolution="",
+            poly_outcomes=[], poly_url="",
+            decision=Decision(
+                confidence=float(p.get("confidence", 0.0)),
+                resolution_match=True, concerns=[],
+                reasoning="", category=p.get("category", ""),
+                event_type=p.get("event_type", "Other"),
+                cost_usd=0.0,
+            ),
+            accepted=True, override_snippet="{}", override_outcome="none",
+        ))
+    return tpl.render(
+        title=f"audit sample — model {payload.get('model')}",
+        rows=rows, categories=[],
+    )
