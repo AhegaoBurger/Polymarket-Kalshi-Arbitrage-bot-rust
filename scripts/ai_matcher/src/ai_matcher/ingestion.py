@@ -128,12 +128,14 @@ def parse_kalshi_event(raw: dict) -> dict | None:
         "event_ticker": ticker,
         "title": raw.get("title", "") or "",
         "sub_title": raw.get("sub_title", "") or "",
+        "category": raw.get("category", "") or "",
     }
 
 
 def parse_kalshi_markets_response(
     body: dict,
     event_title: str = "",
+    event_category: str = "",
     min_liquidity_usd: float = 0.0,
     min_volume_usd: float = 0.0,
     category_config: CategoryConfig | None = None,
@@ -169,7 +171,7 @@ def parse_kalshi_markets_response(
         title = m.get("title", "") or ""
         sub = m.get("subtitle") or m.get("yes_sub_title") or ""
         rules = m.get("rules_primary", "") or ""
-        category = m.get("category", "") or ""
+        category = m.get("category", "") or event_category
         bucket = (
             resolve_bucket(category_config, platform="kalshi", category=category, tags=[])
             if category_config is not None
@@ -371,6 +373,7 @@ class Ingestion:
                 parse_kalshi_markets_response(
                     m_resp.json(),
                     event_title=ev["title"],
+                    event_category=ev.get("category", "") or "",
                     min_liquidity_usd=self.min_liquidity_usd,
                     min_volume_usd=self.min_volume_usd,
                     category_config=self.category_config,

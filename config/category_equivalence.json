@@ -1,6 +1,6 @@
 {
   "buckets": {
-    "Politics":     { "kalshi": ["Politics"],            "poly": ["Politics"],             "tolerance_days": 60 },
+    "Politics":     { "kalshi": ["Politics", "Elections"], "poly": ["Politics"],             "tolerance_days": 60 },
     "Sports":       { "kalshi": ["Sports"],              "poly": ["Sports"],               "tolerance_days": 2  },
     "Weather":      { "kalshi": ["Climate and Weather"], "poly": ["Weather"],              "tolerance_days": 2  },
     "Crypto":       { "kalshi": ["Crypto", "Bitcoin"],   "poly": ["Crypto", "Bitcoin"],    "tolerance_days": 1  },

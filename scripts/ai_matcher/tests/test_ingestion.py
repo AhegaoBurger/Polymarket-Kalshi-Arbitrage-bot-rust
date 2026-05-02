@@ -513,3 +513,48 @@ def test_kalshi_volume_proxy_does_not_apply_when_liquidity_known():
         category_config=_kalshi_cfg(),
     )
     assert [m.ticker for m in markets] == ["K1"]
+
+
+def test_kalshi_parser_uses_event_category_when_market_has_none():
+    """Kalshi per-event /markets returns category=null on individual markets;
+    the parser must fall back to the event-level category."""
+    body = {"markets": [
+        {"ticker": "K1", "title": "t",
+         "close_time": "2026-06-01T12:00:00Z",
+         "category": None},  # market-level category is null in the real API
+    ]}
+    cfg = CategoryConfig(
+        buckets={"Politics": BucketDef(kalshi=["Elections"], poly=["Politics"], tolerance_days=60)},
+        default_tolerance_days=30,
+    )
+    markets = parse_kalshi_markets_response(
+        body, event_category="Elections", category_config=cfg,
+    )
+    assert markets[0].bucket == "Politics"
+    assert markets[0].category == "Elections"
+
+
+def test_kalshi_parser_market_category_wins_over_event_category():
+    """If the market explicitly carries a category, prefer it over the event one."""
+    body = {"markets": [
+        {"ticker": "K1", "title": "t",
+         "close_time": "2026-06-01T12:00:00Z",
+         "category": "Sports"},
+    ]}
+    cfg = CategoryConfig(
+        buckets={
+            "Sports":   BucketDef(kalshi=["Sports"],   poly=["Sports"],   tolerance_days=2),
+            "Politics": BucketDef(kalshi=["Elections"], poly=["Politics"], tolerance_days=60),
+        },
+        default_tolerance_days=30,
+    )
+    markets = parse_kalshi_markets_response(
+        body, event_category="Elections", category_config=cfg,
+    )
+    assert markets[0].bucket == "Sports"
+
+
+def test_parse_kalshi_event_extracts_category():
+    raw = {"event_ticker": "E1", "title": "Some event", "category": "Elections"}
+    parsed = parse_kalshi_event(raw)
+    assert parsed["category"] == "Elections"
