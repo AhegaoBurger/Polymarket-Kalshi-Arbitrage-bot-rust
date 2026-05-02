@@ -115,51 +115,147 @@ impl Default for BalanceCache {
     }
 }
 
-/// Fetch both exchange balances and store into the cache. Used for the startup
-/// priming call (must succeed) and each tick of the background refresh task
-/// (best-effort — failures are logged but don't abort the loop).
-pub async fn refresh_once(
-    cache: &BalanceCache,
-    kalshi: &KalshiApiClient,
-    poly: &SharedAsyncClient,
-) -> Result<()> {
-    let (kalshi_res, poly_res) = tokio::join!(
-        kalshi.fetch_balance_cents(),
-        poly.fetch_poly_balance_usdc_micros(),
-    );
-
-    match kalshi_res {
+fn handle_kalshi_result(cache: &BalanceCache, res: Result<i64>) {
+    match res {
         Ok(cents) => {
             cache.set_kalshi_cents(cents);
             debug!("[BALANCE] Kalshi: {} cents (${:.2})", cents, cents as f64 / 100.0);
         }
         Err(e) => warn!("[BALANCE] Kalshi fetch failed: {}", e),
     }
-    match poly_res {
-        Ok(micros) => {
-            cache.set_poly_usdc_micros(micros);
-            debug!("[BALANCE] Poly: {} micros (${:.2})", micros, micros as f64 / 1_000_000.0);
+}
+
+/// Fetch both exchange balances and store into the cache. Used for the startup
+/// priming call (must succeed) and each tick of the background refresh task
+/// (best-effort — failures are logged but don't abort the loop).
+///
+/// `refresh_poly` controls whether the Polymarket leg is fetched. Pass `false`
+/// when the Polymarket value is being managed manually (via
+/// `POLY_BALANCE_USDC`) — the cache value is then owned exclusively by
+/// `commit_poly` and survives across refresh ticks.
+pub async fn refresh_once(
+    cache: &BalanceCache,
+    kalshi: &KalshiApiClient,
+    poly: &SharedAsyncClient,
+    refresh_poly: bool,
+) -> Result<()> {
+    if refresh_poly {
+        let (kalshi_res, poly_res) = tokio::join!(
+            kalshi.fetch_balance_cents(),
+            poly.fetch_poly_balance_usdc_micros(),
+        );
+        handle_kalshi_result(cache, kalshi_res);
+        match poly_res {
+            Ok(micros) => {
+                cache.set_poly_usdc_micros(micros);
+                debug!("[BALANCE] Poly: {} micros (${:.2})", micros, micros as f64 / 1_000_000.0);
+            }
+            Err(e) => warn!("[BALANCE] Poly fetch failed: {}", e),
         }
-        Err(e) => warn!("[BALANCE] Poly fetch failed: {}", e),
+    } else {
+        handle_kalshi_result(cache, kalshi.fetch_balance_cents().await);
     }
     Ok(())
 }
 
 /// Spawn a background task that refreshes the balance cache every
 /// `REFRESH_INTERVAL`. Non-fatal: failures are warned and the loop continues.
+///
+/// `refresh_poly` is forwarded to `refresh_once` on every tick — see its docs
+/// for manual-mode semantics.
 pub fn spawn_refresh_task(
     cache: Arc<BalanceCache>,
     kalshi: Arc<KalshiApiClient>,
     poly: Arc<SharedAsyncClient>,
+    refresh_poly: bool,
 ) {
     tokio::spawn(async move {
-        info!("[BALANCE] Refresh task started ({:?} interval)", REFRESH_INTERVAL);
+        info!(
+            "[BALANCE] Refresh task started ({:?} interval, refresh_poly={})",
+            REFRESH_INTERVAL, refresh_poly,
+        );
         let mut ticker = tokio::time::interval(REFRESH_INTERVAL);
         ticker.set_missed_tick_behavior(tokio::time::MissedTickBehavior::Skip);
         ticker.tick().await;
         loop {
             ticker.tick().await;
-            let _ = refresh_once(&cache, &kalshi, &poly).await;
+            let _ = refresh_once(&cache, &kalshi, &poly, refresh_poly).await;
         }
     });
+}
+
+/// Parse the `POLY_BALANCE_USDC` env-var value into USDC micros.
+///
+/// Returns `None` for missing or unparseable values. Whitespace around the
+/// number is tolerated. Negative values are clamped to 0 so the cache never
+/// holds a value that would underflow `commit_poly`.
+pub fn parse_poly_balance_env(raw: Option<&str>) -> Option<u64> {
+    let s = raw?.trim();
+    if s.is_empty() {
+        return None;
+    }
+    let usdc = s.parse::<f64>().ok()?;
+    if !usdc.is_finite() {
+        return None;
+    }
+    let micros = (usdc.max(0.0) * 1_000_000.0).round();
+    // `as u64` saturates on overflow — reject values that would saturate so
+    // the cache never holds a fictitious near-u64::MAX balance.
+    if micros > u64::MAX as f64 {
+        return None;
+    }
+    Some(micros as u64)
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    #[test]
+    fn parse_none_when_unset() {
+        assert_eq!(parse_poly_balance_env(None), None);
+    }
+
+    #[test]
+    fn parse_none_when_empty_or_whitespace() {
+        assert_eq!(parse_poly_balance_env(Some("")), None);
+        assert_eq!(parse_poly_balance_env(Some("   ")), None);
+    }
+
+    #[test]
+    fn parse_decimal_dollars_to_micros() {
+        assert_eq!(parse_poly_balance_env(Some("23.87")), Some(23_870_000));
+        assert_eq!(parse_poly_balance_env(Some("10")), Some(10_000_000));
+        assert_eq!(parse_poly_balance_env(Some("0.000001")), Some(1));
+    }
+
+    #[test]
+    fn parse_tolerates_surrounding_whitespace() {
+        assert_eq!(parse_poly_balance_env(Some("  10.00  ")), Some(10_000_000));
+    }
+
+    #[test]
+    fn parse_returns_none_for_garbage() {
+        assert_eq!(parse_poly_balance_env(Some("nope")), None);
+        assert_eq!(parse_poly_balance_env(Some("1.2.3")), None);
+    }
+
+    #[test]
+    fn parse_clamps_negative_to_zero() {
+        assert_eq!(parse_poly_balance_env(Some("-5.00")), Some(0));
+    }
+
+    #[test]
+    fn parse_rejects_nan_and_inf() {
+        assert_eq!(parse_poly_balance_env(Some("NaN")), None);
+        assert_eq!(parse_poly_balance_env(Some("inf")), None);
+    }
+
+    #[test]
+    fn parse_rejects_overflowing_values() {
+        // Values that would saturate the f64 → u64 cast (≈ $18.4T+) must be rejected
+        // so the atomic cache never holds a fictitious balance.
+        assert_eq!(parse_poly_balance_env(Some("1e30")), None);
+        assert_eq!(parse_poly_balance_env(Some("18446744073710")), None); // > u64::MAX micros / 1e6
+    }
 }
