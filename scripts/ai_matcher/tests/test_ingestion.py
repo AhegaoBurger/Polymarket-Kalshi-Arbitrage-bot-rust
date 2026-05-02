@@ -417,3 +417,48 @@ def test_poly_pagination_stops_when_cap_reached():
     markets = ing.fetch_poly()
     assert len(stub.call_log) == 1
     assert len(markets) == 500
+
+
+def test_kalshi_pagination_walks_cursor():
+    events_page1 = {
+        "events": [{"event_ticker": f"E{i}", "title": "t"} for i in range(200)],
+        "cursor": "CUR-A",
+    }
+    events_page2 = {
+        "events": [{"event_ticker": f"F{i}", "title": "t"} for i in range(150)],
+        "cursor": "",
+    }
+    market_page = {"markets": [
+        {"ticker": "M1", "title": "t", "category": "Politics",
+         "close_time": "2026-06-01T12:00:00Z"}
+    ]}
+    stub = _StubHttp({
+        "https://api.elections.kalshi.com/trade-api/v2/events": [events_page1, events_page2],
+        "https://api.elections.kalshi.com/trade-api/v2/markets": [market_page] * 350,
+    })
+    ing = Ingestion(http=stub, max_kalshi_events=500, min_liquidity_usd=0.0)
+    markets = ing.fetch_kalshi()
+    assert len(markets) == 350
+    events_calls = [c for c in stub.call_log if "/events" in c]
+    assert len(events_calls) == 2
+    assert "cursor=" not in events_calls[0]
+    assert "cursor=CUR-A" in events_calls[1]
+
+
+def test_kalshi_pagination_stops_at_cap():
+    events_page = {
+        "events": [{"event_ticker": f"E{i}", "title": "t"} for i in range(200)],
+        "cursor": "CUR-A",
+    }
+    market_page = {"markets": [
+        {"ticker": "M1", "title": "t", "category": "Politics",
+         "close_time": "2026-06-01T12:00:00Z"}
+    ]}
+    stub = _StubHttp({
+        "https://api.elections.kalshi.com/trade-api/v2/events": [events_page] * 5,
+        "https://api.elections.kalshi.com/trade-api/v2/markets": [market_page] * 200,
+    })
+    ing = Ingestion(http=stub, max_kalshi_events=200, min_liquidity_usd=0.0)
+    ing.fetch_kalshi()
+    events_calls = [c for c in stub.call_log if "/events" in c]
+    assert len(events_calls) == 1

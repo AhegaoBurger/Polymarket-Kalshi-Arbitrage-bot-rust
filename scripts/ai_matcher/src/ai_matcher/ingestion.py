@@ -31,7 +31,7 @@ DEFAULT_TIMEOUT = 15.0
 
 # Defaults (override via env vars in production):
 DEFAULT_MIN_LIQUIDITY_USD = 100.0       # MIN_LIQUIDITY_USD
-DEFAULT_MAX_KALSHI_EVENTS = 200         # INGEST_KALSHI_MAX_EVENTS
+DEFAULT_MAX_KALSHI_EVENTS = 2000        # was 200 — INGEST_KALSHI_MAX_EVENTS
 DEFAULT_POLY_FETCH_LIMIT = 10000        # was 500 — INGEST_POLY_LIMIT
 
 
@@ -317,17 +317,26 @@ class Ingestion:
         )
 
     def fetch_kalshi(self) -> list[Market]:
-        """Walk Kalshi events, then per-event markets — same path Rust takes.
-
-        Skips multivariate parlay events (`KXMV*`) and applies the liquidity floor.
-        """
-        events_resp = self._http.get(
-            f"{KALSHI_API_BASE}/events"
-            f"?limit={min(self.max_kalshi_events, 200)}&status=open"
-        )
-        events_resp.raise_for_status()
-        events_body = events_resp.json()
-        raw_events = events_body.get("events", []) or []
+        """Walk Kalshi events with cursor pagination, then per-event /markets walk."""
+        cursor = ""
+        raw_events: list[dict] = []
+        while len(raw_events) < self.max_kalshi_events:
+            url = f"{KALSHI_API_BASE}/events?limit=200&status=open"
+            if cursor:
+                url += f"&cursor={cursor}"
+            try:
+                resp = self._http.get(url)
+                resp.raise_for_status()
+            except httpx.HTTPError:
+                break
+            body = resp.json()
+            page = body.get("events", []) or []
+            if not page:
+                break
+            raw_events.extend(page)
+            cursor = body.get("cursor", "") or ""
+            if not cursor:
+                break
 
         kept_events = [parse_kalshi_event(e) for e in raw_events]
         kept_events = [e for e in kept_events if e is not None]
@@ -342,13 +351,13 @@ class Ingestion:
                 )
                 m_resp.raise_for_status()
             except httpx.HTTPError:
-                # One bad event shouldn't tank the whole ingestion.
                 continue
             out.extend(
                 parse_kalshi_markets_response(
                     m_resp.json(),
                     event_title=ev["title"],
                     min_liquidity_usd=self.min_liquidity_usd,
+                    category_config=self.category_config,
                 )
             )
         return out
