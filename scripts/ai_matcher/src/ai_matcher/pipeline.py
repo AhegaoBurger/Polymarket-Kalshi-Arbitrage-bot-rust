@@ -15,7 +15,7 @@ import numpy as np
 from ai_matcher.ingestion import Ingestion, IngestionResult, Market
 from ai_matcher.overrides import OverrideOutcome, OverrideSet
 from ai_matcher.report import PairAuditRow, render_report
-from ai_matcher.retrieval import HnswRetrieval
+from ai_matcher.retrieval import BucketedHnswRetrieval as HnswRetrieval
 from ai_matcher.verifier import EmbeddingsOnlyVerifier, Verifier
 
 
