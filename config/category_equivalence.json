@@ -1,0 +1,14 @@
+{
+  "buckets": {
+    "Politics":     { "kalshi": ["Politics"],            "poly": ["Politics"],             "tolerance_days": 60 },
+    "Sports":       { "kalshi": ["Sports"],              "poly": ["Sports"],               "tolerance_days": 2  },
+    "Weather":      { "kalshi": ["Climate and Weather"], "poly": ["Weather"],              "tolerance_days": 2  },
+    "Crypto":       { "kalshi": ["Crypto", "Bitcoin"],   "poly": ["Crypto", "Bitcoin"],    "tolerance_days": 1  },
+    "Economics":    { "kalshi": ["Economics"],           "poly": ["Finance", "Economics"], "tolerance_days": 14 },
+    "Tech":         { "kalshi": ["Tech"],                "poly": ["Tech"],                 "tolerance_days": 30 },
+    "Mentions":     { "kalshi": ["Mentions"],            "poly": ["Mentions"],             "tolerance_days": 7  },
+    "Culture":      { "kalshi": ["Culture"],             "poly": ["Culture"],              "tolerance_days": 30 },
+    "Geopolitical": { "kalshi": ["World"],               "poly": ["Geopolitical"],         "tolerance_days": 30 }
+  },
+  "default_tolerance_days": 30
+}
