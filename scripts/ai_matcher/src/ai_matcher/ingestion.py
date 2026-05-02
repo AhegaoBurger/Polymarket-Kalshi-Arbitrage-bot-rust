@@ -18,6 +18,7 @@ import hashlib
 import json
 import os
 from dataclasses import dataclass, field
+from datetime import datetime
 
 import httpx
 
@@ -42,6 +43,9 @@ class Market:
     resolution_criteria: str = ""
     outcomes: list[str] = field(default_factory=list)
     category: str = ""
+    tags: list[str] = field(default_factory=list)               # NEW: platform-side tag list (Polymarket-only meaningfully)
+    bucket: str = "Unknown"                                      # NEW: cross-platform bucket name from resolve_bucket
+    close_time_utc: datetime | None = None                       # NEW: tz-aware UTC expiry; None means "not parsed yet"
     # Liquidity in USD (normalized — Kalshi's native cents are divided by 100):
     liquidity_usd: float = 0.0
     volume_usd: float = 0.0

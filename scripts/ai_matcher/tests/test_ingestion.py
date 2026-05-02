@@ -147,3 +147,22 @@ def test_content_hash_is_stable():
     assert a == b
     c = content_hash("alpha", "beta", "delta")
     assert a != c
+
+
+from datetime import datetime, timezone
+
+from ai_matcher.ingestion import Market
+
+
+def test_market_dataclass_has_bucket_close_time_tags_fields():
+    m = Market(
+        platform="kalshi",
+        ticker="K1",
+        title="t",
+        bucket="Politics",
+        close_time_utc=datetime(2026, 6, 1, tzinfo=timezone.utc),
+        tags=["Politics", "Election"],
+    )
+    assert m.bucket == "Politics"
+    assert m.close_time_utc == datetime(2026, 6, 1, tzinfo=timezone.utc)
+    assert m.tags == ["Politics", "Election"]
