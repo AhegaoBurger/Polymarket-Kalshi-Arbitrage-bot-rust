@@ -31,6 +31,10 @@ class PairAuditRow:
     # "none" | "whitelist" | "blacklist" — surfaced visually so the auditor
     # can tell at a glance when manual_overrides.json flipped the LLM verdict.
     override_outcome: str = "none"
+    bucket_kalshi: str = "Unknown"
+    bucket_poly: str = "Unknown"
+    cosine: float = 0.0
+    delta_days: float | None = None
 
 
 def _env() -> Environment:

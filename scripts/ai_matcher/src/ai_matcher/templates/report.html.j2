@@ -4,10 +4,12 @@
 <meta charset="utf-8">
 <title>ai_matcher — {{ title }}</title>
 <style>
-  body { font-family: -apple-system, sans-serif; max-width: 1400px; margin: 1em auto; padding: 0 1em; }
+  body { font-family: -apple-system, sans-serif; max-width: 1500px; margin: 1em auto; padding: 0 1em; }
   table { border-collapse: collapse; width: 100%; }
   th, td { border: 1px solid #ccc; padding: 0.5em; vertical-align: top; font-size: 0.9em; }
-  th { background: #f4f4f4; text-align: left; }
+  th { background: #f4f4f4; text-align: left; cursor: pointer;
+       position: sticky; top: 0; z-index: 1; }
+  tbody tr:nth-child(even) { background: #fafafa; }
   .accept { background: #e8f5e9; }
   .reject { background: #ffebee; }
   .override-whitelist { background: #fff3cd; border-left: 4px solid #ffa000; }
@@ -15,9 +17,13 @@
   .override-label { display: inline-block; padding: 0.1em 0.4em; border-radius: 3px;
                     background: #444; color: white; font-size: 0.75em;
                     font-weight: bold; margin-top: 0.3em; }
-  .conf { font-weight: bold; font-variant-numeric: tabular-nums; }
+  .conf, .num { font-weight: bold; font-variant-numeric: tabular-nums; }
   pre.snippet { background: #fafafa; padding: 0.4em; font-size: 0.8em; white-space: pre-wrap; }
   .filters a { margin-right: 1em; }
+  .toolbar { margin: 0.6em 0; display: flex; gap: 1em; align-items: center; }
+  .toolbar input { padding: 0.4em 0.6em; font-size: 0.9em; min-width: 25em; }
+  th.asc::after  { content: ' ▲'; }
+  th.desc::after { content: ' ▼'; }
 </style>
 </head>
 <body>
@@ -30,15 +36,21 @@
   <a href="report-by-category-{{ cat | lower }}.html">{{ cat }}</a>
   {% endfor %}
 </p>
-<p>{{ rows | length }} pair(s).</p>
+<div class="toolbar">
+  <input id="filter" placeholder="Filter (substring match across all columns)…" />
+  <span>{{ rows | length }} pair(s).</span>
+</div>
 <table>
 <thead>
 <tr>
-  <th>Decision</th>
-  <th>Kalshi</th>
-  <th>Polymarket</th>
-  <th>LLM analysis</th>
-  <th>Override snippet</th>
+  <th data-sort="string">Decision</th>
+  <th data-sort="string">Kalshi</th>
+  <th data-sort="string">Polymarket</th>
+  <th data-sort="string">Bucket pair</th>
+  <th data-sort="numeric">Cosine</th>
+  <th data-sort="numeric">Δdays</th>
+  <th data-sort="string">LLM analysis</th>
+  <th data-sort="string">Override snippet</th>
 </tr>
 </thead>
 <tbody>
@@ -73,6 +85,9 @@
     <em>{{ row.poly_resolution }}</em><br>
     Outcomes: {{ row.poly_outcomes | join(', ') }}
   </td>
+  <td class="num">{{ row.bucket_kalshi }} → {{ row.bucket_poly }}</td>
+  <td class="num">{{ '%.3f' | format(row.cosine) }}</td>
+  <td class="num">{{ '%.1f' | format(row.delta_days) if row.delta_days is not none else '—' }}</td>
   <td>
     Category: {{ row.decision.category }}<br>
     Concerns:
@@ -86,5 +101,48 @@
 {% endfor %}
 </tbody>
 </table>
+<script>
+(function() {
+  const tbody = document.querySelector('tbody');
+  if (!tbody) return;
+  const rows = Array.from(tbody.querySelectorAll('tr'));
+  document.querySelectorAll('th[data-sort]').forEach((th, i) => {
+    th.addEventListener('click', () => {
+      const numeric = th.dataset.sort === 'numeric';
+      const dir = th.classList.contains('asc') ? -1 : 1;
+      document.querySelectorAll('th').forEach(h => h.classList.remove('asc', 'desc'));
+      th.classList.add(dir === 1 ? 'asc' : 'desc');
+      rows.sort((a, b) => {
+        const av = a.children[i].textContent.trim();
+        const bv = b.children[i].textContent.trim();
+        if (numeric) {
+          const an = parseFloat(av);
+          const bn = parseFloat(bv);
+          if (isNaN(an) && isNaN(bn)) return 0;
+          if (isNaN(an)) return 1;
+          if (isNaN(bn)) return -1;
+          return (an - bn) * dir;
+        }
+        return av.localeCompare(bv) * dir;
+      });
+      rows.forEach(r => tbody.appendChild(r));
+    });
+  });
+
+  const filter = document.getElementById('filter');
+  if (filter) {
+    let timer;
+    filter.addEventListener('input', () => {
+      clearTimeout(timer);
+      timer = setTimeout(() => {
+        const q = filter.value.trim().toLowerCase();
+        rows.forEach(r => {
+          r.style.display = !q || r.textContent.toLowerCase().includes(q) ? '' : 'none';
+        });
+      }, 150);
+    });
+  }
+})();
+</script>
 </body>
 </html>

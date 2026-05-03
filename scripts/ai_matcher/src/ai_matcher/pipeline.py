@@ -12,11 +12,37 @@ from typing import Any
 
 import numpy as np
 
+from collections import defaultdict
+
+from ai_matcher.categories import CategoryConfig
 from ai_matcher.ingestion import Ingestion, IngestionResult, Market
 from ai_matcher.overrides import OverrideOutcome, OverrideSet
 from ai_matcher.report import PairAuditRow, render_report
-from ai_matcher.retrieval import HnswRetrieval
+from ai_matcher.retrieval import BucketedHnswRetrieval
 from ai_matcher.verifier import EmbeddingsOnlyVerifier, Verifier
+
+
+def date_overlap_ok(
+    k: Market,
+    p: Market,
+    cfg: CategoryConfig,
+    scale: float,
+) -> bool:
+    """Return True iff the two markets' UTC expiries are within the bucket's tolerance.
+
+    Bucket selection: the Kalshi-side bucket if known; otherwise the Polymarket
+    bucket; otherwise default_tolerance_days. Both Unknown → default_tolerance_days.
+    """
+    bucket = k.bucket if k.bucket != "Unknown" else p.bucket
+    tol_days = (
+        cfg.buckets[bucket].tolerance_days
+        if bucket in cfg.buckets
+        else cfg.default_tolerance_days
+    )
+    if k.close_time_utc is None or p.close_time_utc is None:
+        return False
+    delta_seconds = abs((k.close_time_utc - p.close_time_utc).total_seconds())
+    return delta_seconds <= tol_days * scale * 86_400
 
 
 @dataclass
@@ -33,6 +59,8 @@ class PipelineConfig:
     # Min confidence to accept a pair. LLM verifier defaults to 0.9; embeddings-only
     # mode lowers this so cosine-based confidence isn't filtered by the LLM-tuned floor.
     acceptance_min_confidence: float = 0.9
+    category_config: CategoryConfig | None = None
+    expiry_tolerance_scale: float = 1.0
 
 
 def _atomic_write_json(path: Path, payload: dict) -> None:
@@ -84,15 +112,32 @@ def run_pipeline(
 ) -> dict:
     result: IngestionResult = ingestion.fetch_all()
 
-    poly_vecs = np.zeros((len(result.poly), embedder.dim), dtype=np.float32)
-    for i, m in enumerate(result.poly):
-        poly_vecs[i] = embedder.embed(m)
+    counters_drops_ingest = getattr(ingestion, "last_drops", {
+        "kalshi_missing_date": 0, "poly_missing_date": 0,
+        "kalshi_low_volume": 0, "poly_low_liquidity": 0,
+    })
+    bucketed_counts: dict[str, int] = defaultdict(int)
+
+    polys_by_bucket: dict[str, list[tuple[np.ndarray, str]]] = defaultdict(list)
+    all_polys: list[tuple[np.ndarray, str]] = []
+    # Key by condition_id for poly markets (unique per market even if ticker collides).
+    # Fall back to ticker when condition_id is absent (tests / Kalshi-side entries).
+    poly_by_id: dict[str, Market] = {}
+    for m in result.poly:
+        bucketed_counts[m.bucket] += 1
+        vec = embedder.embed(m)
+        uid = m.condition_id if m.condition_id else m.ticker
+        polys_by_bucket[m.bucket].append((vec, uid))
+        all_polys.append((vec, uid))
+        poly_by_id[uid] = m
+
     embedder.flush()
 
-    retrieval = HnswRetrieval(dim=embedder.dim, top_k=cfg.top_k, min_cosine=cfg.min_cosine)
-    if len(result.poly) > 0:
-        retrieval.build(poly_vecs, [m.ticker for m in result.poly])
-    poly_by_ticker: dict[str, Market] = {m.ticker: m for m in result.poly}
+    retrieval = BucketedHnswRetrieval(
+        dim=embedder.dim, top_k=cfg.top_k, min_cosine=cfg.min_cosine
+    )
+    if all_polys:
+        retrieval.build(polys_by_bucket, all_polys)
 
     overrides = OverrideSet.load(cfg.overrides_path)
     rows: list[PairAuditRow] = []
@@ -101,15 +146,51 @@ def run_pipeline(
 
     accepted = 0
     rejected = 0
+    candidates_after_retrieval = 0
+    drops_at_date_overlap = 0
+    verifier_calls = 0
+    verifier_cost_usd = 0.0
 
     for k in result.kalshi:
+        bucketed_counts[k.bucket] += 1
         k_vec = embedder.embed(k)
-        candidates = retrieval.query(k_vec) if len(result.poly) > 0 else []
-        for poly_ticker, cosine in candidates:
-            p = poly_by_ticker.get(poly_ticker)
+        candidates = retrieval.query(k_vec, k.bucket) if all_polys else []
+        for poly_uid, cosine in candidates:
+            p = poly_by_id.get(poly_uid)
             if p is None:
                 continue
+            candidates_after_retrieval += 1
+
+            if cfg.category_config is not None and not date_overlap_ok(
+                k, p, cfg.category_config, cfg.expiry_tolerance_scale
+            ):
+                drops_at_date_overlap += 1
+                tol = (
+                    cfg.category_config.buckets[k.bucket].tolerance_days
+                    if k.bucket in cfg.category_config.buckets
+                    else cfg.category_config.default_tolerance_days
+                )
+                delta_days = (
+                    int(abs((k.close_time_utc - p.close_time_utc).total_seconds()) // 86_400)
+                    if (k.close_time_utc and p.close_time_utc) else None
+                )
+                audit_log_lines.append(json.dumps({
+                    "ts": dt.datetime.now(tz=dt.timezone.utc).isoformat(),
+                    "kalshi": k.ticker, "poly": p.condition_id,
+                    "decision": "reject", "reject_reason": "expiry-gap",
+                    "bucket_kalshi": k.bucket, "bucket_poly": p.bucket,
+                    "cosine": round(float(cosine), 4),
+                    "delta_days": delta_days, "tolerance_days": tol,
+                }))
+                rejected += 1
+                continue
+
+            verifier_calls += 1
+            hits_before = getattr(verifier, "cache_hits", 0)
             decision = _call_verifier(verifier, k, p, cosine)
+            was_cache_hit = getattr(verifier, "cache_hits", 0) > hits_before
+            if not was_cache_hit:
+                verifier_cost_usd += getattr(decision, "cost_usd", 0.0) or 0.0
             override = overrides.lookup(k.ticker, p.condition_id)
             ai_accept = decision.is_accepted(min_confidence=cfg.acceptance_min_confidence)
             if override == OverrideOutcome.BLACKLIST:
@@ -118,6 +199,16 @@ def run_pipeline(
                 final_accepted = True
             else:
                 final_accepted = ai_accept
+
+            tol_resolved = (
+                cfg.category_config.buckets[k.bucket].tolerance_days
+                if cfg.category_config and k.bucket in cfg.category_config.buckets
+                else (cfg.category_config.default_tolerance_days if cfg.category_config else None)
+            )
+            delta_days_resolved = (
+                int(abs((k.close_time_utc - p.close_time_utc).total_seconds()) // 86_400)
+                if (k.close_time_utc and p.close_time_utc) else None
+            )
 
             if final_accepted:
                 accepted += 1
@@ -130,38 +221,42 @@ def run_pipeline(
                     "event_type": decision.event_type,
                     "confidence": decision.confidence,
                     "description": f"{k.title} ↔ {p.title}",
+                    "bucket_kalshi": k.bucket,
+                    "bucket_poly": p.bucket,
+                    "cosine": round(float(cosine), 4),
+                    "delta_days": delta_days_resolved,
                 })
             else:
                 rejected += 1
-
             rows.append(PairAuditRow(
-                kalshi_ticker=k.ticker,
-                kalshi_title=k.title,
-                kalshi_description=k.description,
-                kalshi_resolution=k.resolution_criteria,
-                kalshi_outcomes=k.outcomes,
-                kalshi_url=_kalshi_url(k.ticker),
-                poly_slug=p.ticker,
-                poly_title=p.title,
-                poly_description=p.description,
-                poly_resolution=p.resolution_criteria,
-                poly_outcomes=p.outcomes,
-                poly_url=_poly_url(p.ticker),
-                decision=decision,
-                accepted=final_accepted,
+                kalshi_ticker=k.ticker, kalshi_title=k.title,
+                kalshi_description=k.description, kalshi_resolution=k.resolution_criteria,
+                kalshi_outcomes=k.outcomes, kalshi_url=_kalshi_url(k.ticker),
+                poly_slug=p.ticker, poly_title=p.title,
+                poly_description=p.description, poly_resolution=p.resolution_criteria,
+                poly_outcomes=p.outcomes, poly_url=_poly_url(p.ticker),
+                decision=decision, accepted=final_accepted,
                 override_snippet=_override_snippet(k.ticker, p.condition_id),
                 override_outcome=override.value,
+                bucket_kalshi=k.bucket, bucket_poly=p.bucket,
+                cosine=float(cosine),
+                delta_days=delta_days_resolved,
             ))
 
             audit_log_lines.append(json.dumps({
                 "ts": dt.datetime.now(tz=dt.timezone.utc).isoformat(),
-                "kalshi": k.ticker,
-                "poly": p.condition_id,
+                "kalshi": k.ticker, "poly": p.condition_id,
                 "decision": "accept" if final_accepted else "reject",
+                "reject_reason": None if final_accepted else "verifier",
+                "bucket_kalshi": k.bucket, "bucket_poly": p.bucket,
+                "cosine": round(float(cosine), 4),
+                "delta_days": delta_days_resolved, "tolerance_days": tol_resolved,
                 "confidence": decision.confidence,
                 "concerns": decision.concerns,
-                "override": override.value,
                 "reasoning": decision.reasoning,
+                "override": override.value,
+                "model": getattr(verifier, "model", ""),
+                "cost_usd": getattr(decision, "cost_usd", 0.0),
             }))
 
     payload = {
@@ -172,7 +267,6 @@ def run_pipeline(
         "pairs": accepted_pairs,
     }
     _atomic_write_json(cfg.matches_path, payload)
-
     render_report(rows, cfg.audit_dir)
 
     if audit_log_lines:
@@ -181,7 +275,17 @@ def run_pipeline(
             for line in audit_log_lines:
                 f.write(line + "\n")
 
-    return {"accepted": accepted, "rejected": rejected, "rows": len(rows)}
+    return {
+        "ingested": {"kalshi": len(result.kalshi), "poly": len(result.poly)},
+        "drops_at_ingest": counters_drops_ingest,
+        "bucketed": dict(bucketed_counts),
+        "candidates_after_retrieval": candidates_after_retrieval,
+        "drops_at_date_overlap": drops_at_date_overlap,
+        "verifier_calls": verifier_calls,
+        "verifier_cache_hits": getattr(verifier, "cache_hits", 0),
+        "verifier_cost_usd": round(verifier_cost_usd, 4),
+        "accepted": accepted, "rejected": rejected, "rows": len(rows),
+    }
 
 
 def _project_root() -> Path:
@@ -220,6 +324,13 @@ def run_pipeline_default(
         llm_model="",
     )
 
+    from ai_matcher.categories import load_category_config
+    cfg.category_config = load_category_config(project_root / "config" / "category_equivalence.json")
+    cfg.expiry_tolerance_scale = float(os.environ.get("EXPIRY_TOLERANCE_SCALE", "1.0"))
+    if cfg.expiry_tolerance_scale <= 0:
+        print("[ai_matcher] EXPIRY_TOLERANCE_SCALE must be > 0; using 1.0")
+        cfg.expiry_tolerance_scale = 1.0
+
     from ai_matcher.embedder import Embedder
 
     embedder = Embedder(cache_path=project_root / ".ai_matcher_cache.json")
@@ -237,16 +348,14 @@ def run_pipeline_default(
             "no LLM verification)"
         )
     else:
-        import anthropic
-
-        client = anthropic.Anthropic()
+        model = os.environ.get("LLM_MODEL", "gpt-4.1-mini")
         verifier = Verifier(
-            client=client,
+            model=model,
             cache_path=project_root / ".ai_matcher_verifier_cache.json",
         )
         cfg.llm_model = verifier.model
 
-    ingestion = Ingestion()
+    ingestion = Ingestion(category_config=cfg.category_config)
 
     summary = run_pipeline(cfg, ingestion=ingestion, embedder=embedder, verifier=verifier)
     print(f"[ai_matcher] run complete: {summary}")
@@ -299,19 +408,42 @@ def audit_sample_default(sample: int) -> int:
 
 
 def _render_audit_sample(pairs: list[dict], payload: dict) -> str:
-    lines = [
-        "<!DOCTYPE html><html><body "
-        "style='font-family:sans-serif;max-width:1000px;margin:1em auto;'>",
-        f"<h1>ai_matcher audit — {len(pairs)} samples (model {payload.get('model')})</h1>",
-    ]
+    """Render N spot-check pairs using the main report template — sort + filter for free."""
+    from importlib.resources import files
+    from jinja2 import Environment, FileSystemLoader, select_autoescape
+
+    from ai_matcher.report import PairAuditRow
+    from ai_matcher.verifier import Decision
+
+    template_dir = files("ai_matcher").joinpath("templates")
+    env = Environment(
+        loader=FileSystemLoader(str(template_dir)),
+        autoescape=select_autoescape(["html"]),
+    )
+    tpl = env.get_template("report.html.j2")
+    rows = []
     for p in pairs:
-        lines.append("<hr>")
-        lines.append(f"<h2>{p.get('description', '')}</h2>")
-        lines.append(f"<p>Kalshi: <code>{p.get('kalshi_market_ticker')}</code></p>")
-        lines.append(f"<p>Polymarket conditionId: <code>{p.get('poly_condition_id')}</code></p>")
-        lines.append(
-            f"<p>Category: {p.get('category')} — Event: {p.get('event_type')} — "
-            f"Confidence: {p.get('confidence')}</p>"
-        )
-    lines.append("</body></html>")
-    return "\n".join(lines)
+        rows.append(PairAuditRow(
+            kalshi_ticker=p.get("kalshi_market_ticker", ""),
+            kalshi_title="", kalshi_description="", kalshi_resolution="",
+            kalshi_outcomes=[], kalshi_url="",
+            poly_slug=p.get("poly_condition_id", ""),
+            poly_title="", poly_description="", poly_resolution="",
+            poly_outcomes=[], poly_url="",
+            decision=Decision(
+                confidence=float(p.get("confidence", 0.0)),
+                resolution_match=True, concerns=[],
+                reasoning="", category=p.get("category", ""),
+                event_type=p.get("event_type", "Other"),
+                cost_usd=0.0,
+            ),
+            accepted=True, override_snippet="{}", override_outcome="none",
+            bucket_kalshi=p.get("bucket_kalshi", "Unknown"),
+            bucket_poly=p.get("bucket_poly", "Unknown"),
+            cosine=float(p.get("cosine", 0.0)),
+            delta_days=p.get("delta_days"),
+        ))
+    return tpl.render(
+        title=f"audit sample — model {payload.get('model')}",
+        rows=rows, categories=[],
+    )
