@@ -6,6 +6,7 @@ from ai_matcher.ingestion import (
     content_hash,
     parse_kalshi_event,
     parse_kalshi_markets_response,
+    parse_poly_events_response,
     parse_poly_gamma_markets_response,
 )
 
@@ -166,11 +167,11 @@ def test_market_dataclass_has_bucket_close_time_tags_fields():
         title="t",
         bucket="Politics",
         close_time_utc=datetime(2026, 6, 1, tzinfo=timezone.utc),
-        tags=["Politics", "Election"],
+        tags=["politics", "election"],
     )
     assert m.bucket == "Politics"
     assert m.close_time_utc == datetime(2026, 6, 1, tzinfo=timezone.utc)
-    assert m.tags == ["Politics", "Election"]
+    assert m.tags == ["politics", "election"]
 
 
 from ai_matcher.ingestion import parse_close_time_utc
@@ -302,39 +303,41 @@ def test_kalshi_parser_works_without_category_config():
 
 
 def _poly_cfg() -> CategoryConfig:
+    """Test config uses lowercase tag slugs to match production /events shape."""
     return CategoryConfig(
         buckets={
-            "Politics":  BucketDef(kalshi=["Politics"], poly=["Politics"], tolerance_days=60),
-            "Economics": BucketDef(kalshi=["Economics"], poly=["Finance", "Economics"], tolerance_days=14),
+            "Politics":  BucketDef(kalshi=["Politics"], poly=["politics"], tolerance_days=60),
+            "Economics": BucketDef(kalshi=["Economics"], poly=["finance", "economy"], tolerance_days=14),
         },
         default_tolerance_days=30,
     )
 
 
 def test_poly_parser_assigns_bucket_from_category():
+    """Legacy /markets parser still works when fed the historical category field."""
     body = [{
         "conditionId": "0xC1", "slug": "p1", "question": "q",
-        "category": "Politics",
+        "category": "politics",
         "endDateIso": "2026-06-01T12:00:00Z",
     }]
     markets, _ = parse_poly_gamma_markets_response(body, category_config=_poly_cfg())
     assert markets[0].bucket == "Politics"
 
 
-def test_poly_parser_falls_back_to_tags_when_category_empty():
+def test_poly_parser_falls_back_to_tag_slugs_when_category_empty():
     body = [{
         "conditionId": "0xC1", "slug": "p1", "question": "q",
         "category": "",
-        "tags": ["Politics", "Election"],
+        "tags": [{"slug": "politics", "label": "Politics"}, {"slug": "trump", "label": "Trump"}],
         "endDateIso": "2026-06-01T12:00:00Z",
     }]
     markets, _ = parse_poly_gamma_markets_response(body, category_config=_poly_cfg())
     assert markets[0].bucket == "Politics"
-    assert markets[0].tags == ["Politics", "Election"]
+    assert markets[0].tags == ["politics", "trump"]
 
 
-def test_poly_parser_handles_object_shaped_tags():
-    """Gamma sometimes returns tags as [{"label": "X"}, ...] instead of ["X", ...]."""
+def test_poly_parser_handles_label_only_tags():
+    """Legacy / fixture shape: tags as [{"label": "X"}] without slug. Lowercased."""
     body = [{
         "conditionId": "0xC1", "slug": "p1", "question": "q",
         "category": "",
@@ -343,7 +346,24 @@ def test_poly_parser_handles_object_shaped_tags():
     }]
     markets, _ = parse_poly_gamma_markets_response(body, category_config=_poly_cfg())
     assert markets[0].bucket == "Politics"
-    assert markets[0].tags == ["Politics", "Trump"]
+    assert markets[0].tags == ["politics", "trump"]
+
+
+def test_poly_parser_filters_noise_tags():
+    """Editorial/curation tags must not pollute Market.tags or bucketing."""
+    body = [{
+        "conditionId": "0xC1", "slug": "p1", "question": "q",
+        "category": "",
+        "tags": [
+            {"slug": "featured"}, {"slug": "all"}, {"slug": "2026-predictions"},
+            {"slug": "up-or-down"}, {"slug": "5m"}, {"slug": "rewards-50-4pt5-20"},
+            {"slug": "politics"},
+        ],
+        "endDateIso": "2026-06-01T12:00:00Z",
+    }]
+    markets, _ = parse_poly_gamma_markets_response(body, category_config=_poly_cfg())
+    assert markets[0].tags == ["politics"]
+    assert markets[0].bucket == "Politics"
 
 
 def test_poly_parser_drops_market_with_missing_endDate():
@@ -357,14 +377,189 @@ def test_poly_parser_drops_market_with_missing_endDate():
 
 
 def test_poly_parser_assigns_economics_bucket_from_finance_category():
-    """Cross-platform alias: Polymarket 'Finance' maps to the Economics bucket."""
+    """Cross-platform alias: Polymarket 'finance' tag maps to the Economics bucket."""
     body = [{
         "conditionId": "0xC1", "slug": "p1", "question": "q",
-        "category": "Finance",
+        "category": "finance",
         "endDateIso": "2026-06-01T12:00:00Z",
     }]
     markets, _ = parse_poly_gamma_markets_response(body, category_config=_poly_cfg())
     assert markets[0].bucket == "Economics"
+
+
+# === parse_poly_events_response (the active production path) ============
+
+def test_poly_events_parser_propagates_event_tags_to_children():
+    """Active Polymarket markets carry no tags of their own; the parser must
+    take tag slugs from the parent event and attach them to each child Market."""
+    body = [{
+        "id": "1", "ticker": "ev1", "title": "Macron out by ___?",
+        "active": True, "closed": False,
+        "tags": [
+            {"id": "1378", "slug": "france", "label": "France"},
+            {"id": "2", "slug": "politics", "label": "Politics"},
+            {"id": "101970", "slug": "world", "label": "World"},
+        ],
+        "markets": [
+            {
+                "conditionId": "0xC1", "slug": "macron-out-by-jun-30",
+                "question": "Macron out by June 30, 2026?",
+                "active": True, "closed": False,
+                "endDate": "2026-06-30T12:00:00Z",
+                "outcomes": "[\"Yes\",\"No\"]",
+                "clobTokenIds": "[\"tokA\",\"tokB\"]",
+                "liquidity": "48880.9",
+            },
+            {
+                "conditionId": "0xC2", "slug": "macron-out-by-dec-31",
+                "question": "Macron out by Dec 31, 2026?",
+                "active": True, "closed": False,
+                "endDate": "2026-12-31T12:00:00Z",
+                "outcomes": "[\"Yes\",\"No\"]",
+                "clobTokenIds": "[\"tokC\",\"tokD\"]",
+                "liquidity": "10000",
+            },
+        ],
+    }]
+    markets, drops = parse_poly_events_response(body, category_config=_poly_cfg())
+    assert len(markets) == 2
+    assert all(m.tags == ["france", "politics", "world"] for m in markets)
+    assert all(m.bucket == "Politics" for m in markets)
+    assert markets[0].condition_id == "0xC1"
+    assert markets[1].condition_id == "0xC2"
+    assert drops == {"missing_date": 0, "low_liquidity": 0}
+
+
+def test_poly_events_parser_drops_closed_children_keeps_open_siblings():
+    """Polymarket scalarizes a question into N date-bucketed children;
+    expired buckets are `closed:true` while the parent event is still open."""
+    body = [{
+        "id": "1", "ticker": "ev1", "title": "ev",
+        "active": True, "closed": False,
+        "tags": [{"slug": "politics"}],
+        "markets": [
+            {
+                "conditionId": "0xCLOSED", "slug": "expired-bucket",
+                "active": True, "closed": True,  # past date — drop
+                "endDate": "2025-03-31T12:00:00Z",
+                "outcomes": "[]", "clobTokenIds": "[]",
+            },
+            {
+                "conditionId": "0xOPEN", "slug": "open-bucket",
+                "active": True, "closed": False,
+                "endDate": "2026-12-31T12:00:00Z",
+                "outcomes": "[]", "clobTokenIds": "[]",
+            },
+        ],
+    }]
+    markets, _ = parse_poly_events_response(body, category_config=_poly_cfg())
+    assert [m.condition_id for m in markets] == ["0xOPEN"]
+
+
+def test_poly_events_parser_skips_closed_event_entirely():
+    body = [{
+        "id": "1", "ticker": "ev1", "title": "ev",
+        "active": True, "closed": True,  # entire event closed
+        "tags": [{"slug": "politics"}],
+        "markets": [
+            {
+                "conditionId": "0xC1", "slug": "x", "active": True, "closed": False,
+                "endDate": "2026-12-31T12:00:00Z",
+                "outcomes": "[]", "clobTokenIds": "[]",
+            },
+        ],
+    }]
+    markets, _ = parse_poly_events_response(body, category_config=_poly_cfg())
+    assert markets == []
+
+
+def test_poly_events_parser_assigns_unknown_when_no_useful_tags():
+    """Event with only noise tags → bucket Unknown but market still emitted."""
+    body = [{
+        "id": "1", "ticker": "ev1", "title": "ev",
+        "active": True, "closed": False,
+        "tags": [{"slug": "featured"}, {"slug": "2026-predictions"}],
+        "markets": [
+            {
+                "conditionId": "0xC1", "slug": "x", "active": True, "closed": False,
+                "endDate": "2026-12-31T12:00:00Z",
+                "outcomes": "[]", "clobTokenIds": "[]",
+            },
+        ],
+    }]
+    markets, _ = parse_poly_events_response(body, category_config=_poly_cfg())
+    assert len(markets) == 1
+    assert markets[0].tags == []
+    assert markets[0].bucket == "Unknown"
+
+
+def test_poly_events_parser_drops_below_liquidity_floor():
+    body = [{
+        "id": "1", "ticker": "ev1", "title": "ev",
+        "active": True, "closed": False,
+        "tags": [{"slug": "politics"}],
+        "markets": [
+            {
+                "conditionId": "0xRICH", "slug": "rich", "active": True, "closed": False,
+                "endDate": "2026-12-31T12:00:00Z", "outcomes": "[]", "clobTokenIds": "[]",
+                "liquidity": "5000",
+            },
+            {
+                "conditionId": "0xPOOR", "slug": "poor", "active": True, "closed": False,
+                "endDate": "2026-12-31T12:00:00Z", "outcomes": "[]", "clobTokenIds": "[]",
+                "liquidity": "5",
+            },
+        ],
+    }]
+    markets, drops = parse_poly_events_response(
+        body, min_liquidity_usd=100.0, category_config=_poly_cfg(),
+    )
+    assert [m.condition_id for m in markets] == ["0xRICH"]
+    assert drops["low_liquidity"] == 1
+
+
+def test_poly_events_parser_drops_missing_date():
+    body = [{
+        "id": "1", "ticker": "ev1", "title": "ev",
+        "active": True, "closed": False,
+        "tags": [{"slug": "politics"}],
+        "markets": [
+            {
+                "conditionId": "0xC1", "slug": "no-date", "active": True, "closed": False,
+                "outcomes": "[]", "clobTokenIds": "[]",
+            },
+            {
+                "conditionId": "0xC2", "slug": "good", "active": True, "closed": False,
+                "endDate": "2026-12-31T12:00:00Z", "outcomes": "[]", "clobTokenIds": "[]",
+            },
+        ],
+    }]
+    markets, drops = parse_poly_events_response(body, category_config=_poly_cfg())
+    assert [m.condition_id for m in markets] == ["0xC2"]
+    assert drops["missing_date"] == 1
+
+
+def test_poly_events_parser_geopolitics_bucket_from_world_slug():
+    """`world` and `geopolitics` slugs both map to the Geopolitical bucket."""
+    cfg = CategoryConfig(
+        buckets={
+            "Geopolitical": BucketDef(kalshi=["World"], poly=["world", "geopolitics", "ukraine"], tolerance_days=30),
+        },
+        default_tolerance_days=30,
+    )
+    body = [{
+        "id": "1", "ticker": "ev", "title": "Ukraine recognizes...",
+        "active": True, "closed": False,
+        "tags": [{"slug": "ukraine"}, {"slug": "world"}, {"slug": "geopolitics"}],
+        "markets": [
+            {
+                "conditionId": "0xC1", "slug": "x", "active": True, "closed": False,
+                "endDate": "2026-12-31T12:00:00Z", "outcomes": "[]", "clobTokenIds": "[]",
+            },
+        ],
+    }]
+    markets, _ = parse_poly_events_response(body, category_config=cfg)
+    assert markets[0].bucket == "Geopolitical"
 
 
 import httpx
@@ -398,14 +593,28 @@ class _StubResponse:
         return self._body
 
 
+def _ev(slug_prefix: str, i: int) -> dict:
+    """Build a minimal /events-shaped event with one tradable child market."""
+    return {
+        "id": f"e{slug_prefix}{i}", "ticker": f"t-{slug_prefix}{i}", "title": "ev",
+        "active": True, "closed": False,
+        "tags": [{"slug": "politics"}],
+        "markets": [{
+            "conditionId": f"0x{slug_prefix.upper()}{i}",
+            "slug": f"{slug_prefix}{i}", "question": "q",
+            "active": True, "closed": False,
+            "endDate": "2026-06-01T12:00:00Z",
+            "outcomes": "[]", "clobTokenIds": "[]",
+        }],
+    }
+
+
 def test_poly_pagination_walks_offset():
-    page1 = [{"conditionId": f"0xA{i}", "slug": f"a{i}", "question": "q",
-              "endDateIso": "2026-06-01T12:00:00Z"} for i in range(500)]
-    page2 = [{"conditionId": f"0xB{i}", "slug": f"b{i}", "question": "q",
-              "endDateIso": "2026-06-01T12:00:00Z"} for i in range(500)]
+    page1 = [_ev("a", i) for i in range(500)]
+    page2 = [_ev("b", i) for i in range(500)]
     page3 = []
     stub = _StubHttp({
-        "https://gamma-api.polymarket.com/markets": [page1, page2, page3],
+        "https://gamma-api.polymarket.com/events": [page1, page2, page3],
     })
     ing = Ingestion(http=stub, poly_fetch_limit=2000, min_liquidity_usd=0.0)
     markets = ing.fetch_poly()
@@ -417,10 +626,9 @@ def test_poly_pagination_walks_offset():
 
 
 def test_poly_pagination_stops_when_cap_reached():
-    page1 = [{"conditionId": f"0xA{i}", "slug": f"a{i}", "question": "q",
-              "endDateIso": "2026-06-01T12:00:00Z"} for i in range(500)]
+    page1 = [_ev("a", i) for i in range(500)]
     stub = _StubHttp({
-        "https://gamma-api.polymarket.com/markets": [page1, page1, page1],
+        "https://gamma-api.polymarket.com/events": [page1, page1, page1],
     })
     ing = Ingestion(http=stub, poly_fetch_limit=500, min_liquidity_usd=0.0)
     markets = ing.fetch_poly()

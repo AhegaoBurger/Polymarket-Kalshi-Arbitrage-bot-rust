@@ -23,6 +23,9 @@ Examples:
     # Bucket assignment dry-run — runs our parser + resolve_bucket
     uv run python inspect_apis.py poly-buckets --limit 100
     uv run python inspect_apis.py kalshi-buckets --limit 50
+
+    # Event-driven Polymarket bucketing (the active ingestion path)
+    uv run python inspect_apis.py poly-events --limit 500
 """
 
 from __future__ import annotations
@@ -301,6 +304,78 @@ def cmd_poly_buckets(args: argparse.Namespace) -> None:
             print(f"  {slug:<50}  cat={cat!r}, tags={tags}")
 
 
+def cmd_poly_events(args: argparse.Namespace) -> None:
+    """Walk /events, run event-driven parser, show bucket + tag-slug distribution.
+
+    This is the diagnostic for `parse_poly_events_response`. Active Polymarket
+    markets carry no category and no tags — taxonomy lives at the event level.
+    Use this when buckets look wrong to rule out an API-shape change before
+    blaming `resolve_bucket` or the equivalence config.
+    """
+    from ai_matcher.categories import load_category_config
+    from ai_matcher.ingestion import _parse_poly_tags, parse_poly_events_response
+
+    cfg = load_category_config(_repo_root() / "config" / "category_equivalence.json")
+    if not cfg.buckets:
+        print("WARN: empty category config; everything will bucket as Unknown",
+              file=sys.stderr)
+
+    # Walk pages until we have args.limit events (or exhaust the API).
+    page_size = 500
+    raw_events: list[dict] = []
+    with httpx.Client(timeout=DEFAULT_TIMEOUT) as c:
+        for offset in range(0, args.limit, page_size):
+            url = (
+                f"{GAMMA_API_BASE}/events"
+                f"?limit={min(page_size, args.limit - offset)}&offset={offset}"
+                f"&active=true&closed=false"
+                f"&order=liquidity&ascending=false"
+            )
+            print(f"GET {url}", file=sys.stderr)
+            page = c.get(url).json()
+            if not isinstance(page, list) or not page:
+                break
+            raw_events.extend(page)
+
+    markets, drops = parse_poly_events_response(raw_events, category_config=cfg)
+
+    bucket_counts: Counter = Counter()
+    tag_slug_counts: Counter = Counter()
+    has_category = 0
+    has_tags = 0
+    unknown_examples: list[tuple[str, list[str]]] = []
+    for ev in raw_events:
+        if ev.get("category"):
+            has_category += 1
+        slugs = _parse_poly_tags(ev.get("tags"))
+        if slugs:
+            has_tags += 1
+        for s in slugs:
+            tag_slug_counts[s] += 1
+    for m in markets:
+        bucket_counts[m.bucket] += 1
+        if m.bucket == "Unknown" and len(unknown_examples) < 10:
+            unknown_examples.append((m.ticker, m.tags))
+
+    print(f"# {len(raw_events)} events fetched, {len(markets)} markets after parsing (drops: {drops})")
+    print(f"# events with .category populated: {has_category} (expect 0 — schema migrated)")
+    print(f"# events with non-empty .tags after noise filter: {has_tags} / {len(raw_events)}")
+    print()
+    print("Bucket distribution (per market):")
+    for b, n in bucket_counts.most_common():
+        pct = (n / len(markets) * 100) if markets else 0
+        print(f"  {b:<20} {n:<6} ({pct:>5.1f}%)")
+    print()
+    print("Top tag slugs (per event, post-noise-filter):")
+    for slug, n in tag_slug_counts.most_common(30):
+        print(f"  {slug:<32} {n}")
+    if unknown_examples:
+        print()
+        print("Sample Unknown-bucket markets (slug, tags):")
+        for slug, tags in unknown_examples:
+            print(f"  {slug:<60}  tags={tags}")
+
+
 # --- Helpers --------------------------------------------------------------
 
 def _repo_root() -> Path:
@@ -358,6 +433,12 @@ def main() -> int:
     ppb = sub.add_parser("poly-buckets", help="Run parser on N Polymarket markets, show bucket distribution")
     ppb.add_argument("--limit", type=int, default=100)
     ppb.set_defaults(func=cmd_poly_buckets)
+
+    # Polymarket /events bucket distribution (the active code path)
+    ppe = sub.add_parser("poly-events", help="Run event-driven parser on N Polymarket events, show bucket + tag-slug distribution")
+    ppe.add_argument("--limit", type=int, default=500,
+                     help="Number of events to fetch (default: 500)")
+    ppe.set_defaults(func=cmd_poly_events)
 
     args = p.parse_args()
     args.func(args)

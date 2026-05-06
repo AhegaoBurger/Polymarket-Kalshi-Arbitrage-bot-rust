@@ -1,14 +1,14 @@
 {
   "buckets": {
-    "Politics":     { "kalshi": ["Politics", "Elections"], "poly": ["Politics"],             "tolerance_days": 60 },
-    "Sports":       { "kalshi": ["Sports"],              "poly": ["Sports"],               "tolerance_days": 2  },
-    "Weather":      { "kalshi": ["Climate and Weather"], "poly": ["Weather"],              "tolerance_days": 2  },
-    "Crypto":       { "kalshi": ["Crypto", "Bitcoin"],   "poly": ["Crypto", "Bitcoin"],    "tolerance_days": 1  },
-    "Economics":    { "kalshi": ["Economics"],           "poly": ["Finance", "Economics"], "tolerance_days": 14 },
-    "Tech":         { "kalshi": ["Tech"],                "poly": ["Tech"],                 "tolerance_days": 30 },
-    "Mentions":     { "kalshi": ["Mentions"],            "poly": ["Mentions"],             "tolerance_days": 7  },
-    "Culture":      { "kalshi": ["Culture"],             "poly": ["Culture"],              "tolerance_days": 30 },
-    "Geopolitical": { "kalshi": ["World"],               "poly": ["Geopolitical"],         "tolerance_days": 30 }
+    "Politics":     { "kalshi": ["Politics", "Elections"], "poly": ["politics", "elections", "midterms", "primaries", "primary-elections", "house-elections", "senate-midterms", "governor-midterms", "house-primary", "senate-primary", "governor-primary", "us-presidential-election", "democratic-primary", "republican-primary", "trump", "trump-presidency"], "tolerance_days": 60 },
+    "Sports":       { "kalshi": ["Sports"],              "poly": ["sports", "soccer", "nba", "nfl", "mlb", "nhl", "epl", "games", "international-cricket", "counter-strike", "legends-league-cricket"], "tolerance_days": 2  },
+    "Weather":      { "kalshi": ["Climate and Weather"], "poly": ["weather", "climate"],   "tolerance_days": 2  },
+    "Crypto":       { "kalshi": ["Crypto", "Bitcoin"],   "poly": ["crypto", "crypto-prices", "bitcoin", "ethereum", "btc", "eth", "sol", "xrp"], "tolerance_days": 1  },
+    "Economics":    { "kalshi": ["Economics"],           "poly": ["economy", "finance", "business", "stocks", "ipos", "commodities", "oil", "gas", "gold", "nymex-crude-oil-futures"], "tolerance_days": 14 },
+    "Tech":         { "kalshi": ["Tech"],                "poly": ["tech", "big-tech", "ai", "science", "elon-musk"], "tolerance_days": 30 },
+    "Mentions":     { "kalshi": ["Mentions"],            "poly": ["mentions"],             "tolerance_days": 7  },
+    "Culture":      { "kalshi": ["Culture"],             "poly": ["pop-culture", "culture", "celebrities", "box-office-openings"], "tolerance_days": 30 },
+    "Geopolitical": { "kalshi": ["World"],               "poly": ["geopolitics", "world", "global-elections", "ukraine", "russia", "israel", "middle-east", "china", "india", "france", "uk", "eu", "nato", "foreign-policy"], "tolerance_days": 30 }
   },
   "default_tolerance_days": 30
 }

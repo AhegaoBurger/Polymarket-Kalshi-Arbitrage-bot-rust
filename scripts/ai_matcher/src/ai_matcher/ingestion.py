@@ -17,6 +17,7 @@ from __future__ import annotations
 import hashlib
 import json
 import os
+import re
 from dataclasses import dataclass, field
 from datetime import datetime, timezone
 
@@ -203,16 +204,42 @@ def parse_kalshi_markets_response(
     return out, drops
 
 
+# Tag slugs that aren't real categories — Polymarket uses them for editorial
+# curation, time windows, and recurring-tick noise. Sampled across 2000 active
+# events 2026-05-06 — see memory project_polymarket_category_lives_on_events.md.
+POLY_NOISE_TAG_SLUGS: frozenset[str] = frozenset({
+    "featured", "all", "hide-from-new", "pre-market", "recurring", "new", "trending",
+    "yearly", "up-or-down", "fdv", "hit-price", "token-launch", "mention", "mentions",
+})
+_POLY_NOISE_RE = re.compile(r"^(\d{4}(-predictions)?|\d+m|rewards-.*|earn-\d+)$")
+
+
+def _is_noise_tag(slug: str) -> bool:
+    if not slug:
+        return True
+    return slug in POLY_NOISE_TAG_SLUGS or bool(_POLY_NOISE_RE.match(slug))
+
+
 def _parse_poly_tags(raw: list | None) -> list[str]:
-    """Tolerate either ['Politics', ...] or [{'label': 'Politics'}, ...]."""
+    """Extract tag slugs from a Polymarket tags array, filtering noise.
+
+    Tolerates three shapes seen in the wild:
+      [{'id', 'label', 'slug', ...}, ...]   — modern /events response (preferred)
+      [{'label': 'Politics'}, ...]          — legacy / partial fixtures
+      ['Politics', ...]                     — plain-string fixtures
+    Always returns lowercase kebab-case slugs (or kebab-cased labels as fallback).
+    Noise tags (`featured`, `up-or-down`, `2026-predictions`, etc.) are dropped.
+    """
     out: list[str] = []
     for t in raw or []:
+        slug = ""
         if isinstance(t, dict):
-            label = t.get("label") or t.get("name")
-            if label:
-                out.append(str(label))
-        elif isinstance(t, str) and t:
-            out.append(t)
+            slug = (t.get("slug") or t.get("label") or t.get("name") or "").strip().lower()
+        elif isinstance(t, str):
+            slug = t.strip().lower()
+        if not slug or _is_noise_tag(slug):
+            continue
+        out.append(slug)
     return out
 
 
@@ -284,6 +311,82 @@ def parse_poly_gamma_markets_response(
             poly_yes_token=toks[0] if len(toks) > 0 else "",
             poly_no_token=toks[1] if len(toks) > 1 else "",
         ))
+    return out, drops
+
+
+def parse_poly_events_response(
+    body: list[dict],
+    min_liquidity_usd: float = 0.0,
+    category_config: CategoryConfig | None = None,
+) -> tuple[list[Market], dict[str, int]]:
+    """Parse a Polymarket Gamma `/events` response into Market objects.
+
+    Active Polymarket markets carry no `category` field and no `tags[]` of their
+    own — taxonomy lives on the parent event's `tags[]` and must be propagated
+    down to each child. See memory project_polymarket_category_lives_on_events.md
+    for the empirical schema.
+
+    For each event we walk `event.markets[]`, drop closed/inactive children,
+    apply the liquidity floor, and assign the bucket from the event's tag slugs.
+    Returns (markets, drops) where drops counts per-reason filtering.
+    """
+    out: list[Market] = []
+    drops: dict[str, int] = {"missing_date": 0, "low_liquidity": 0}
+    for ev in body or []:
+        if ev.get("closed") is True or ev.get("active") is False:
+            continue
+        ev_tag_slugs = _parse_poly_tags(ev.get("tags"))
+        for m in ev.get("markets") or []:
+            if m.get("closed") is True or m.get("active") is False:
+                continue
+            cid = m.get("conditionId", "") or ""
+            if not cid:
+                continue
+            liq = _to_float(m.get("liquidity") or m.get("liquidityNum") or 0)
+            if liq < min_liquidity_usd:
+                drops["low_liquidity"] += 1
+                continue
+            vol = _to_float(m.get("volume") or m.get("volumeNum") or 0)
+
+            close_utc = parse_close_time_utc(m, platform="polymarket")
+            if close_utc is None:
+                drops["missing_date"] += 1
+                continue
+
+            outcomes_str = m.get("outcomes") or "[]"
+            try:
+                outcomes = json.loads(outcomes_str) if isinstance(outcomes_str, str) else outcomes_str
+            except json.JSONDecodeError:
+                outcomes = []
+            toks_str = m.get("clobTokenIds") or "[]"
+            try:
+                toks = json.loads(toks_str) if isinstance(toks_str, str) else toks_str
+            except json.JSONDecodeError:
+                toks = []
+
+            bucket = (
+                resolve_bucket(category_config, platform="polymarket", category="", tags=ev_tag_slugs)
+                if category_config is not None
+                else "Unknown"
+            )
+
+            out.append(Market(
+                platform="polymarket",
+                ticker=m.get("slug", "") or "",
+                title=m.get("question", "") or "",
+                description=m.get("description", "") or "",
+                resolution_criteria=m.get("description", "") or "",
+                outcomes=outcomes if isinstance(outcomes, list) else [],
+                category="",
+                tags=ev_tag_slugs,
+                bucket=bucket,
+                close_time_utc=close_utc,
+                liquidity_usd=liq,
+                volume_usd=vol,
+                condition_id=cid,
+                poly_yes_token=toks[0] if len(toks) > 0 else "",
+                poly_no_token=toks[1] if len(toks) > 1 else "",
+            ))
     return out, drops
 
 
@@ -403,14 +506,20 @@ class Ingestion:
         return out
 
     def fetch_poly(self) -> list[Market]:
-        """Fetch Polymarket markets sorted by liquidity desc, paginate via offset."""
+        """Fetch Polymarket markets via the /events endpoint with offset pagination.
+
+        Uses /events (not /markets) because the latter strips taxonomy entirely:
+        no category, no tags. Tags only appear at event level. The parser walks
+        each event's nested markets[] and propagates parent tag slugs down.
+        See memory project_polymarket_category_lives_on_events.md.
+        """
         out: list[Market] = []
         self.last_drops["poly_missing_date"] = 0
         self.last_drops["poly_low_liquidity"] = 0
         page_size = 500
         for offset in range(0, self.poly_fetch_limit, page_size):
             resp = self._http.get(
-                f"{GAMMA_API_BASE}/markets"
+                f"{GAMMA_API_BASE}/events"
                 f"?limit={page_size}&offset={offset}"
                 f"&active=true&closed=false"
                 f"&order=liquidity&ascending=false"
@@ -419,7 +528,7 @@ class Ingestion:
             body = resp.json() if isinstance(resp.json(), list) else []
             if not body:
                 break
-            markets, drops = parse_poly_gamma_markets_response(
+            markets, drops = parse_poly_events_response(
                 body,
                 min_liquidity_usd=self.min_liquidity_usd,
                 category_config=self.category_config,
