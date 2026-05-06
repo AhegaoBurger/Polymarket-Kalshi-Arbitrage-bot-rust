@@ -63,6 +63,17 @@ class PipelineConfig:
     expiry_tolerance_scale: float = 1.0
 
 
+def _batch_embed(embedder: Any, markets: list[Market]) -> list[np.ndarray]:
+    """Embed a list of markets, preferring the batched embed_many() if present.
+    Falls back to per-market embed() for test mocks that don't implement it."""
+    if not markets:
+        return []
+    embed_many = getattr(embedder, "embed_many", None)
+    if callable(embed_many):
+        return embed_many(markets)
+    return [embedder.embed(m) for m in markets]
+
+
 def _atomic_write_json(path: Path, payload: dict) -> None:
     path.parent.mkdir(parents=True, exist_ok=True)
     fd, tmp_name = tempfile.mkstemp(prefix=path.name + ".", dir=str(path.parent))
@@ -118,20 +129,27 @@ def run_pipeline(
     })
     bucketed_counts: dict[str, int] = defaultdict(int)
 
+    # Pre-batch all embeddings up front. embed_many batches model.encode() into
+    # one call per side (instead of one per market) — orders of magnitude faster
+    # on CPU and gives the user a tqdm progress bar so they can see liveness.
+    # Falls back to per-market embed() for test mocks that don't implement it.
+    print(f"[ai_matcher] embedding {len(result.poly)} Polymarket markets...", flush=True)
+    poly_vecs = _batch_embed(embedder, result.poly)
+    print(f"[ai_matcher] embedding {len(result.kalshi)} Kalshi markets...", flush=True)
+    kalshi_vecs = _batch_embed(embedder, result.kalshi)
+    embedder.flush()
+
     polys_by_bucket: dict[str, list[tuple[np.ndarray, str]]] = defaultdict(list)
     all_polys: list[tuple[np.ndarray, str]] = []
     # Key by condition_id for poly markets (unique per market even if ticker collides).
     # Fall back to ticker when condition_id is absent (tests / Kalshi-side entries).
     poly_by_id: dict[str, Market] = {}
-    for m in result.poly:
+    for m, vec in zip(result.poly, poly_vecs):
         bucketed_counts[m.bucket] += 1
-        vec = embedder.embed(m)
         uid = m.condition_id if m.condition_id else m.ticker
         polys_by_bucket[m.bucket].append((vec, uid))
         all_polys.append((vec, uid))
         poly_by_id[uid] = m
-
-    embedder.flush()
 
     retrieval = BucketedHnswRetrieval(
         dim=embedder.dim, top_k=cfg.top_k, min_cosine=cfg.min_cosine
@@ -151,9 +169,8 @@ def run_pipeline(
     verifier_calls = 0
     verifier_cost_usd = 0.0
 
-    for k in result.kalshi:
+    for k, k_vec in zip(result.kalshi, kalshi_vecs):
         bucketed_counts[k.bucket] += 1
-        k_vec = embedder.embed(k)
         candidates = retrieval.query(k_vec, k.bucket) if all_polys else []
         for poly_uid, cosine in candidates:
             p = poly_by_id.get(poly_uid)

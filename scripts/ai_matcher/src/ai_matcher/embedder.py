@@ -72,16 +72,46 @@ class Embedder:
         self.cache_misses = 0
 
     def embed(self, market: Market) -> np.ndarray:
-        h = market.content_hash()
-        cached = self.cache.get(h)
-        if cached is not None:
-            self.cache_hits += 1
-            return cached
-        vec = self._model.encode(market.text_for_embedding(), normalize_embeddings=True)
-        vec = np.asarray(vec, dtype=np.float32)
-        self.cache.put(h, vec)
-        self.cache_misses += 1
-        return vec
+        """Single-market embed. Thin wrapper over embed_many — prefer embed_many
+        when handling >1 market so encoding is batched."""
+        return self.embed_many([market])[0]
+
+    def embed_many(self, markets: list[Market]) -> list[np.ndarray]:
+        """Batch-embed a list of markets, returning vectors in the same order.
+
+        Cache hits are resolved without touching the model. Cache misses are
+        encoded in one batched call (with a tqdm progress bar) — orders of
+        magnitude faster than a Python loop of single-item encodes on CPU.
+        """
+        n = len(markets)
+        out: list[np.ndarray | None] = [None] * n
+        miss_indices: list[int] = []
+        miss_texts: list[str] = []
+        miss_hashes: list[str] = []
+        for i, m in enumerate(markets):
+            h = m.content_hash()
+            cached = self.cache.get(h)
+            if cached is not None:
+                out[i] = cached
+                self.cache_hits += 1
+            else:
+                miss_indices.append(i)
+                miss_texts.append(m.text_for_embedding())
+                miss_hashes.append(h)
+        if miss_texts:
+            vecs = self._model.encode(
+                miss_texts,
+                batch_size=64,
+                normalize_embeddings=True,
+                show_progress_bar=True,
+                convert_to_numpy=True,
+            )
+            for idx, h, vec in zip(miss_indices, miss_hashes, vecs):
+                v = np.asarray(vec, dtype=np.float32)
+                self.cache.put(h, v)
+                out[idx] = v
+            self.cache_misses += len(miss_texts)
+        return [v for v in out if v is not None]  # type: ignore[misc]
 
     def flush(self) -> None:
         self.cache.save()

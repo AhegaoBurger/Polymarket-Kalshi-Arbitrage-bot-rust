@@ -457,6 +457,7 @@ class Ingestion:
         """Walk Kalshi events with cursor pagination, then per-event /markets walk."""
         cursor = ""
         raw_events: list[dict] = []
+        page_n = 0
         while len(raw_events) < self.max_kalshi_events:
             url = f"{KALSHI_API_BASE}/events?limit=200&status=open"
             if cursor:
@@ -471,6 +472,12 @@ class Ingestion:
             if not page:
                 break
             raw_events.extend(page)
+            page_n += 1
+            print(
+                f"[ingest] kalshi /events page {page_n}: "
+                f"{len(raw_events)} / {self.max_kalshi_events} events",
+                flush=True,
+            )
             cursor = body.get("cursor", "") or ""
             if not cursor:
                 break
@@ -479,11 +486,19 @@ class Ingestion:
         kept_events = [e for e in kept_events if e is not None]
         kept_events = kept_events[: self.max_kalshi_events]
 
+        n_events = len(kept_events)
+        print(
+            f"[ingest] kalshi: walking /markets for {n_events} events "
+            f"(this is the slow N+1 phase — one HTTP call per event)",
+            flush=True,
+        )
+
         out: list[Market] = []
         self.last_drops["kalshi_missing_date"] = 0
         self.last_drops["kalshi_low_volume"] = 0
         self.last_drops["kalshi_low_liquidity"] = 0
-        for ev in kept_events:
+        progress_step = max(50, n_events // 20)  # ~20 progress lines total
+        for i, ev in enumerate(kept_events, start=1):
             try:
                 m_resp = self._http.get(
                     f"{KALSHI_API_BASE}/markets"
@@ -503,6 +518,12 @@ class Ingestion:
             out.extend(markets)
             for k in drops:
                 self.last_drops[f"kalshi_{k}"] += drops[k]
+            if i % progress_step == 0 or i == n_events:
+                print(
+                    f"[ingest] kalshi /markets {i} / {n_events} events  "
+                    f"({len(out)} markets kept)",
+                    flush=True,
+                )
         return out
 
     def fetch_poly(self) -> list[Market]:
@@ -517,7 +538,8 @@ class Ingestion:
         self.last_drops["poly_missing_date"] = 0
         self.last_drops["poly_low_liquidity"] = 0
         page_size = 500
-        for offset in range(0, self.poly_fetch_limit, page_size):
+        n_pages_expected = max(1, (self.poly_fetch_limit + page_size - 1) // page_size)
+        for page_i, offset in enumerate(range(0, self.poly_fetch_limit, page_size), start=1):
             resp = self._http.get(
                 f"{GAMMA_API_BASE}/events"
                 f"?limit={page_size}&offset={offset}"
@@ -536,4 +558,9 @@ class Ingestion:
             out.extend(markets)
             for k in drops:
                 self.last_drops[f"poly_{k}"] += drops[k]
+            print(
+                f"[ingest] poly /events page {page_i} / {n_pages_expected}: "
+                f"+{len(markets)} markets ({len(out)} total)",
+                flush=True,
+            )
         return out
