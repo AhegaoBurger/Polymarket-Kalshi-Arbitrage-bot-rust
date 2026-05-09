@@ -430,6 +430,7 @@ async fn main() -> Result<()> {
     let heartbeat_handle = tokio::spawn(async move {
         use crate::types::{kalshi_fee_cents, poly_fee_cents};
         use std::sync::atomic::Ordering;
+        const HEARTBEAT_TOP_N: usize = 5;
         let mut interval = tokio::time::interval(tokio::time::Duration::from_secs(60));
         loop {
             interval.tick().await;
@@ -437,9 +438,16 @@ async fn main() -> Result<()> {
             let mut with_kalshi = 0;
             let mut with_poly = 0;
             let mut with_both = 0;
-            // Track best arb: (total_cost, market_id, p_yes, k_no, k_yes, p_no,
-            // k_fee, p_fee, is_poly_yes_kalshi_no)
-            let mut best_arb: Option<(u16, u16, u16, u16, u16, u16, u16, u16, bool)> = None;
+            // (total_cost, market_id, p_yes, k_no, k_yes, p_no, k_fee, p_fee, is_poly_yes_kalshi_no)
+            let mut all_arbs: Vec<(u16, u16, u16, u16, u16, u16, u16, u16, bool)> =
+                Vec::with_capacity(market_count);
+            // Gap-distribution buckets. gap = cost - threshold; <0 means real arb.
+            let mut bucket_arb = 0usize;       // gap < 0
+            let mut bucket_close = 0usize;     // 0..=5
+            let mut bucket_near = 0usize;      // 6..=10
+            let mut bucket_mild = 0usize;      // 11..=20
+            let mut bucket_eff = 0usize;       // 21..=50
+            let mut bucket_very_eff = 0usize;  // > 50
 
             for market in heartbeat_state.markets.iter().take(market_count) {
                 let (k_yes, k_no, _, _) = market.kalshi.load();
@@ -469,37 +477,56 @@ async fn main() -> Result<()> {
                         (cost2, k_fee2, p_fee2, false)
                     };
 
-                    if best_arb.is_none() || best_cost < best_arb.as_ref().unwrap().0 {
-                        best_arb = Some((best_cost, market.market_id, p_yes, k_no, k_yes, p_no, best_k_fee, best_p_fee, is_poly_yes));
-                    }
+                    all_arbs.push((best_cost, market.market_id, p_yes, k_no, k_yes, p_no, best_k_fee, best_p_fee, is_poly_yes));
+
+                    let gap = best_cost as i32 - heartbeat_threshold as i32;
+                    if gap < 0 { bucket_arb += 1; }
+                    else if gap <= 5 { bucket_close += 1; }
+                    else if gap <= 10 { bucket_near += 1; }
+                    else if gap <= 20 { bucket_mild += 1; }
+                    else if gap <= 50 { bucket_eff += 1; }
+                    else { bucket_very_eff += 1; }
                 }
             }
 
             info!("💓 System heartbeat | Markets: {} total, {} with Kalshi prices, {} with Polymarket prices, {} with both | threshold={}¢",
                   market_count, with_kalshi, with_poly, with_both, heartbeat_threshold);
 
-            if let Some((cost, market_id, p_yes, k_no, k_yes, p_no, k_fee, p_fee, is_poly_yes)) = best_arb {
-                let gap = cost as i16 - heartbeat_threshold as i16;
-                let desc = heartbeat_state.get_by_id(market_id)
-                    .and_then(|m| m.pair.as_ref())
-                    .map(|p| &*p.description)
-                    .unwrap_or("Unknown");
-                let leg_breakdown = if is_poly_yes {
-                    format!("P_yes({}¢) + P_fee({}¢) + K_no({}¢) + K_fee({}¢) = {}¢",
-                            p_yes, p_fee, k_no, k_fee, cost)
-                } else {
-                    format!("K_yes({}¢) + K_fee({}¢) + P_no({}¢) + P_fee({}¢) = {}¢",
-                            k_yes, k_fee, p_no, p_fee, cost)
-                };
-                if gap <= 10 {
-                    info!("   📊 Best opportunity: {} | {} | gap={:+}¢ | [Poly_yes={}¢ Kalshi_no={}¢ Kalshi_yes={}¢ Poly_no={}¢]",
-                          desc, leg_breakdown, gap, p_yes, k_no, k_yes, p_no);
-                } else {
-                    info!("   📊 Best opportunity: {} | {} | gap={:+}¢ (market efficient)",
-                          desc, leg_breakdown, gap);
-                }
-            } else if with_both == 0 {
+            if with_both > 0 {
+                info!("   📈 Gap distribution: <0¢: {} (arb!) | 0-5¢: {} | 6-10¢: {} | 11-20¢: {} | 21-50¢: {} | >50¢: {}",
+                      bucket_arb, bucket_close, bucket_near, bucket_mild, bucket_eff, bucket_very_eff);
+            }
+
+            if all_arbs.is_empty() {
                 warn!("   ⚠️  No markets with both Kalshi and Polymarket prices - verify WebSocket connections");
+            } else {
+                // Cheapest cost = closest to (or past) the arb threshold.
+                all_arbs.sort_by_key(|a| a.0);
+                let n = all_arbs.len().min(HEARTBEAT_TOP_N);
+                info!("   📊 Top {} closest to arb:", n);
+                for (i, &(cost, market_id, p_yes, k_no, k_yes, p_no, k_fee, p_fee, is_poly_yes))
+                    in all_arbs.iter().take(n).enumerate()
+                {
+                    let gap = cost as i16 - heartbeat_threshold as i16;
+                    let desc = heartbeat_state.get_by_id(market_id)
+                        .and_then(|m| m.pair.as_ref())
+                        .map(|p| &*p.description)
+                        .unwrap_or("Unknown");
+                    let leg_breakdown = if is_poly_yes {
+                        format!("P_yes({}¢) + P_fee({}¢) + K_no({}¢) + K_fee({}¢) = {}¢",
+                                p_yes, p_fee, k_no, k_fee, cost)
+                    } else {
+                        format!("K_yes({}¢) + K_fee({}¢) + P_no({}¢) + P_fee({}¢) = {}¢",
+                                k_yes, k_fee, p_no, p_fee, cost)
+                    };
+                    if gap <= 10 {
+                        info!("     {}. {} | {} | gap={:+}¢ | [Poly_yes={}¢ Kalshi_no={}¢ Kalshi_yes={}¢ Poly_no={}¢]",
+                              i + 1, desc, leg_breakdown, gap, p_yes, k_no, k_yes, p_no);
+                    } else {
+                        info!("     {}. {} | {} | gap={:+}¢ (efficient)",
+                              i + 1, desc, leg_breakdown, gap);
+                    }
+                }
             }
         }
     });
