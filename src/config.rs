@@ -189,6 +189,15 @@ pub fn fomc_enabled() -> bool {
         .unwrap_or(true)
 }
 
+/// Sports adapter master switch. Default ON; set `SPORTS_ENABLED=0` to disable
+/// (e.g. to test the AI-matched pipeline in isolation, or to roll back the
+/// sports adapter without redeploying).
+pub fn sports_enabled() -> bool {
+    std::env::var("SPORTS_ENABLED")
+        .map(|v| v != "0" && v.to_lowercase() != "false")
+        .unwrap_or(true)
+}
+
 /// Detection-only gate for FOMC pairs. Default OFF — the first live meeting
 /// is a soak test. Flip to `1` once we've verified pair quality post-meeting.
 pub fn exec_allow_fomc() -> bool {
@@ -235,6 +244,19 @@ mod tests {
         env::set_var("FOMC_ENABLED", "0");
         assert!(!fomc_enabled());
         env::remove_var("FOMC_ENABLED");
+    }
+
+    #[test]
+    fn sports_enabled_defaults_to_true() {
+        env::remove_var("SPORTS_ENABLED");
+        assert!(sports_enabled());
+    }
+
+    #[test]
+    fn sports_enabled_respects_zero() {
+        env::set_var("SPORTS_ENABLED", "0");
+        assert!(!sports_enabled());
+        env::remove_var("SPORTS_ENABLED");
     }
 
     #[test]

@@ -186,14 +186,20 @@ async fn main() -> Result<()> {
     info!("🔍 Market discovery{}...",
           if force_discovery { " (forced refresh)" } else { "" });
 
-    let sports_adapter: Arc<dyn adapters::EventAdapter> =
-        Arc::new(adapters::sports::SportsAdapter::new(
-            kalshi_api.clone(),
-            Arc::new(team_cache),
-            ENABLED_LEAGUES.to_vec(),
-        ));
+    let mut active_adapters: Vec<Arc<dyn adapters::EventAdapter>> = Vec::new();
 
-    let mut active_adapters: Vec<Arc<dyn adapters::EventAdapter>> = vec![sports_adapter];
+    if config::sports_enabled() {
+        let sports_adapter: Arc<dyn adapters::EventAdapter> =
+            Arc::new(adapters::sports::SportsAdapter::new(
+                kalshi_api.clone(),
+                Arc::new(team_cache),
+                ENABLED_LEAGUES.to_vec(),
+            ));
+        active_adapters.push(sports_adapter);
+        info!("⚽ SportsAdapter enabled (set SPORTS_ENABLED=0 to disable)");
+    } else {
+        info!("⚽ SportsAdapter disabled via SPORTS_ENABLED=0");
+    }
 
     if config::fomc_enabled() {
         let fomc_http = reqwest::Client::builder()

@@ -183,6 +183,10 @@ impl ExecutionEngine {
         // Calculate profit
         let profit_cents = req.profit_cents();
         if profit_cents < 1 {
+            warn!(
+                "[EXEC] ⛔ {} {:?}: profit={}¢ — below 1¢ minimum",
+                pair.pair_id, req.arb_type, profit_cents
+            );
             self.release_in_flight(market_id);
             return Ok(ExecutionResult {
                 market_id,
@@ -235,6 +239,16 @@ impl ExecutionEngine {
         }
 
         if max_contracts < KALSHI_MIN_CONTRACTS {
+            warn!(
+                "[EXEC] ⛔ {} {:?}: balance caps fill at {} contracts (need ≥{}). \
+                 Per-contract cost: Kalshi={}¢ Poly={}¢ — top up the wallet that's binding.",
+                pair.pair_id,
+                req.arb_type,
+                max_contracts,
+                KALSHI_MIN_CONTRACTS,
+                cost.kalshi_cents_per_contract,
+                cost.poly_cents_per_contract,
+            );
             self.release_in_flight(market_id);
             return Ok(ExecutionResult {
                 market_id,
@@ -250,6 +264,18 @@ impl ExecutionEngine {
         if cost.poly_min_leg_price_cents > 0
             && max_contracts * cost.poly_min_leg_price_cents < POLY_MIN_ORDER_CENTS
         {
+            let needed = (POLY_MIN_ORDER_CENTS + cost.poly_min_leg_price_cents - 1)
+                / cost.poly_min_leg_price_cents;
+            warn!(
+                "[EXEC] ⛔ {} {:?}: Poly $5 min order needs ≥{} contracts at {}¢/leg, \
+                 but balance/liquidity caps at {}. Top up the binding wallet, \
+                 or wait for the cheaper Poly leg to drift higher.",
+                pair.pair_id,
+                req.arb_type,
+                needed,
+                cost.poly_min_leg_price_cents,
+                max_contracts,
+            );
             self.release_in_flight(market_id);
             return Ok(ExecutionResult {
                 market_id,
@@ -261,7 +287,11 @@ impl ExecutionEngine {
         }
 
         // Circuit breaker check
-        if let Err(_reason) = self.circuit_breaker.can_execute(&pair.pair_id, max_contracts).await {
+        if let Err(reason) = self.circuit_breaker.can_execute(&pair.pair_id, max_contracts).await {
+            warn!(
+                "[EXEC] ⛔ {} {:?}: circuit breaker rejected {} contracts: {}",
+                pair.pair_id, req.arb_type, max_contracts, reason
+            );
             self.release_in_flight(market_id);
             return Ok(ExecutionResult {
                 market_id,

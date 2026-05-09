@@ -89,6 +89,8 @@ dotenvx run -- cargo run --release
 DRY_RUN=0 dotenvx run -- cargo run --release
 ```
 
+> **Want AI-matched markets across politics / crypto / etc.?** Run the Python sidecar first to produce `.ai_matches.json`, then start the bot — the bot picks it up automatically. See [AI-Matched Markets (Sidecar)](#ai-matched-markets-sidecar).
+
 ---
 
 ## Environment Variables
@@ -117,6 +119,22 @@ DRY_RUN=0 dotenvx run -- cargo run --release
 | --------------- | -------------------- | ---------------------------------------------------------------------------------------------- |
 | `TEST_ARB`      | `0`                  | `1` = inject synthetic arb opportunity for testing                                             |
 | `TEST_ARB_TYPE` | `poly_yes_kalshi_no` | Arb type: `poly_yes_kalshi_no`, `kalshi_yes_poly_no`, `poly_same_market`, `kalshi_same_market` |
+
+### Adapter Toggles
+
+| Variable          | Default | Description                                                                                                          |
+| ----------------- | ------- | -------------------------------------------------------------------------------------------------------------------- |
+| `SPORTS_ENABLED`  | `1`     | `0` = skip the sports adapter entirely. Useful for testing AI-matched pairs in isolation.                           |
+| `FOMC_ENABLED`    | `1`     | `0` = skip the FOMC adapter (e.g. if FRED is down).                                                                 |
+
+### AI Matcher (Rust-side controls)
+
+The Rust bot reads `.ai_matches.json` from the repo root if it exists (produced by the Python sidecar — see [AI-Matched Markets](#ai-matched-markets-sidecar) below).
+
+| Variable                 | Default | Description                                                                                                |
+| ------------------------ | ------- | ---------------------------------------------------------------------------------------------------------- |
+| `EXEC_ALLOW_AI_MATCHES`  | `0`     | `1` = allow AI-sourced pairs to execute. Default `0` keeps them **detection-only** (logs but no orders).   |
+| `AI_MATCHES_MAX_AGE_SEC` | `86400` | Reject `.ai_matches.json` older than this (seconds). Default 24h. Stale file → AI pairs silently dropped.  |
 
 ### Circuit Breaker
 
@@ -179,6 +197,110 @@ DRY_RUN=0 CB_MAX_DAILY_LOSS=10000 dotenvx run -- cargo run --release
 # Clear cache and re-fetch all market mappings
 FORCE_DISCOVERY=1 dotenvx run -- cargo run --release
 ```
+
+---
+
+## AI-Matched Markets (Sidecar)
+
+The repo ships with a standalone Python sidecar at `scripts/ai_matcher/` that pairs Kalshi and Polymarket markets across **all categories** (politics, crypto, sports, etc.) using local sentence-transformer embeddings plus optional Claude verification. It is a separate process from the Rust bot and writes its output to `.ai_matches.json` at the repo root. The Rust bot loads that file automatically on startup.
+
+### Pipeline at a glance
+
+```
+┌──────────────┐    ingest     ┌──────────┐  embed +     ┌────────────┐  write
+│ Kalshi /     │──────────────▶│ ai_matcher │──top-K ─────▶│ verifier   │──────▶ .ai_matches.json
+│ Polymarket   │  (public APIs)│ (Python)   │  retrieval   │ (cosine OR │
+│ public APIs  │               │            │              │  Claude)   │
+└──────────────┘               └──────────┘               └────────────┘
+                                                                 │
+                                                                 ▼
+                                                       Rust bot reads on startup
+                                                       (detection-only by default)
+```
+
+### One-time setup
+
+```bash
+cd scripts/ai_matcher
+uv sync                                          # installs deps into .venv (uv-managed)
+```
+
+Required env: `ANTHROPIC_API_KEY` for the LLM-verified mode (skip with `--no-llm`). No Kalshi or OpenAI keys needed — embeddings run locally on CPU; the sidecar uses public Kalshi/Polymarket browse endpoints.
+
+### Run modes
+
+```bash
+cd scripts/ai_matcher
+
+# Cheap mode — cosine similarity only, no Claude calls. Fast, free, much weaker.
+# Good for testing the wiring (this is what you ran to get 13 matches).
+uv run python -m ai_matcher run --no-llm
+
+# Default — embeddings retrieve top-K candidates, Claude verifies each pair.
+# Catches different resolution dates / data sources that embeddings miss.
+uv run python -m ai_matcher run
+
+# Loop mode — re-run on per-category TTLs (faster-changing categories refresh more often)
+uv run python -m ai_matcher run --loop
+
+# Restrict to one category, with sample cap
+uv run python -m ai_matcher run --category Politics --sample 50
+
+# Re-open the last audit report (audit/report.html) without re-running
+uv run python -m ai_matcher review
+
+# Random spot-check N accepted pairs
+uv run python -m ai_matcher audit --sample 20
+```
+
+### Sidecar tuning (env vars on the Python side)
+
+| Variable                    | Default | What it does                                                                                                                       |
+| --------------------------- | ------- | ---------------------------------------------------------------------------------------------------------------------------------- |
+| `MIN_LIQUIDITY_USD`         | `100.0` | Drops Polymarket markets below this. On Kalshi: drops only when liquidity is known and below; unknown values pass through.        |
+| `INGEST_KALSHI_MAX_EVENTS`  | `200`   | Cap on Kalshi events walked per run. Each event = one extra HTTP call.                                                            |
+| `INGEST_POLY_LIMIT`         | `500`   | Polymarket markets to fetch (already sorted by liquidity desc).                                                                   |
+| `EMBEDDINGS_ACCEPT_COSINE`  | `0.85`  | Cosine threshold for `--no-llm` acceptance.                                                                                       |
+| `EMBEDDINGS_ONLY`           | unset   | `1` defaults the sidecar to `--no-llm` without the flag.                                                                          |
+
+### End-to-end: matcher → arb bot
+
+The Rust bot does **not** invoke the matcher. Run it yourself, then start the bot:
+
+```bash
+# 1. Generate matches (cheap mode)
+cd scripts/ai_matcher
+uv run python -m ai_matcher run --no-llm
+cd ../..
+
+# 2. Start the Rust bot — detection-only on AI pairs (DEFAULT, SAFE)
+#    AI-sourced pairs will appear in arb-detection logs but won't execute orders.
+DRY_RUN=1 dotenvx run -- cargo run --release
+
+# 3. Once you trust the matches, allow execution on AI pairs:
+EXEC_ALLOW_AI_MATCHES=1 DRY_RUN=0 dotenvx run -- cargo run --release
+
+# 4. AI matches ONLY (skip sports + FOMC adapters entirely).
+#    Useful for isolating the AI pipeline end-to-end. FORCE_DISCOVERY=1 is
+#    important the first time — the discovery cache (.discovery_cache.json,
+#    2h TTL) may otherwise still hold sports/FOMC pairs from a prior run.
+SPORTS_ENABLED=0 FOMC_ENABLED=0 EXEC_ALLOW_AI_MATCHES=1 \
+  FORCE_DISCOVERY=1 DRY_RUN=0 dotenvx run -- cargo run --release
+```
+
+**Safety defaults:** AI-sourced pairs are gated at execution by `EXEC_ALLOW_AI_MATCHES` (default `0`). Even with `DRY_RUN=0`, AI pairs will only be detected, not traded, until you explicitly opt in. The staleness gate (`AI_MATCHES_MAX_AGE_SEC`, default 24h) drops the matches file silently if it's too old — re-run the sidecar to refresh.
+
+**Choosing a mode:**
+- `--no-llm`: free; use to verify the bot reads matches end-to-end. Two markets that embed-similar but resolve on different dates or sources will both be accepted — false positives are expected. **Do not pair with `EXEC_ALLOW_AI_MATCHES=1` for live trading.**
+- Default (LLM-verified): ~$1–5 on the first uncached run; the verifier cache amortizes subsequent runs. Required before flipping `EXEC_ALLOW_AI_MATCHES=1` in production.
+
+### Outputs
+
+| Path                       | Format       | Audience                                       |
+| -------------------------- | ------------ | ---------------------------------------------- |
+| `.ai_matches.json`         | JSON         | Rust bot (`src/adapters/ai_reader.rs`)         |
+| `audit/report.html`        | static HTML  | human review (open with `ai_matcher review`)   |
+| `.ai_matcher_audit.jsonl`  | JSONL        | append-only audit trail across runs            |
 
 ---
 
