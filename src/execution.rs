@@ -10,7 +10,7 @@ use std::time::{Duration, Instant};
 use tokio::sync::mpsc;
 use tracing::{info, warn, error};
 
-use crate::balance::{BalanceCache, KALSHI_MIN_CONTRACTS, POLY_MIN_ORDER_CENTS};
+use crate::balance::{BalanceCache, KALSHI_MIN_CONTRACTS, POLY_MIN_ORDER_SHARES};
 use crate::kalshi::KalshiApiClient;
 use crate::polymarket_clob::SharedAsyncClient;
 use crate::types::{
@@ -35,10 +35,6 @@ struct LegCost {
     kalshi_cents_per_contract: i64,
     /// Cents to spend on Polymarket per contract, summed across legs (0 if none).
     poly_cents_per_contract: i64,
-    /// Min per-leg price in cents on the Polymarket side — the per-order
-    /// minimum applies to each leg individually, so for PolyOnly we must use
-    /// the cheaper of the two legs here. 0 if no Polymarket leg.
-    poly_min_leg_price_cents: i64,
 }
 
 #[inline]
@@ -47,22 +43,18 @@ fn leg_cost(arb_type: ArbType, yes_cents: i64, no_cents: i64) -> LegCost {
         ArbType::PolyYesKalshiNo => LegCost {
             kalshi_cents_per_contract: no_cents,
             poly_cents_per_contract: yes_cents,
-            poly_min_leg_price_cents: yes_cents,
         },
         ArbType::KalshiYesPolyNo => LegCost {
             kalshi_cents_per_contract: yes_cents,
             poly_cents_per_contract: no_cents,
-            poly_min_leg_price_cents: no_cents,
         },
         ArbType::PolyOnly => LegCost {
             kalshi_cents_per_contract: 0,
             poly_cents_per_contract: yes_cents + no_cents,
-            poly_min_leg_price_cents: yes_cents.min(no_cents),
         },
         ArbType::KalshiOnly => LegCost {
             kalshi_cents_per_contract: yes_cents + no_cents,
             poly_cents_per_contract: 0,
-            poly_min_leg_price_cents: 0,
         },
     }
 }
@@ -197,13 +189,15 @@ impl ExecutionEngine {
             });
         }
 
-        // Calculate max contracts from size (min of both sides)
+        // Calculate max contracts from size (min of both sides). `yes_size`
+        // and `no_size` are centi-contracts (1 unit = 0.01 contract); /100
+        // converts to whole contracts. Both venues feed this convention —
+        // see `kalshi::qty_str_to_int` and `polymarket::parse_size`.
         let mut max_contracts = (req.yes_size.min(req.no_size) / 100) as i64;
 
-        // Safety: In test mode, cap position size at 10 contracts
-        // Note: Polymarket enforces a $1 minimum order value. At 40¢ per contract,
-        // a single contract ($0.40) would be rejected. Using 10 contracts ensures
-        // we meet the minimum requirement at any reasonable price level.
+        // Safety: In test mode, cap position size at 10 contracts. The
+        // POLY_MIN_ORDER_SHARES gate below enforces the per-leg minimum
+        // separately; this cap is a ceiling, not a floor.
         if self.test_mode && max_contracts > 10 {
             warn!("[EXEC] ⚠️ TEST_MODE: Position size capped from {} to 10 contracts", max_contracts);
             max_contracts = 10;
@@ -259,21 +253,19 @@ impl ExecutionEngine {
             });
         }
 
-        // Polymarket rejects any single leg below $5. Check the cheaper of the
-        // two legs against the min so we don't submit guaranteed-reject orders.
-        if cost.poly_min_leg_price_cents > 0
-            && max_contracts * cost.poly_min_leg_price_cents < POLY_MIN_ORDER_CENTS
-        {
-            let needed = (POLY_MIN_ORDER_CENTS + cost.poly_min_leg_price_cents - 1)
-                / cost.poly_min_leg_price_cents;
+        // Polymarket rejects any leg with size below the per-market minimum
+        // (default 5 shares). Confirmed via py-clob-client #301: the field is
+        // shares, not notional dollars. Per-market overrides exist (read from
+        // `/markets/{condition_id}.minimum_order_size`); for now we use the
+        // global default.
+        if max_contracts < POLY_MIN_ORDER_SHARES {
             warn!(
-                "[EXEC] ⛔ {} {:?}: Poly $5 min order needs ≥{} contracts at {}¢/leg, \
-                 but balance/liquidity caps at {}. Top up the binding wallet, \
-                 or wait for the cheaper Poly leg to drift higher.",
+                "[EXEC] ⛔ {} {:?}: Poly min order needs ≥{} shares, \
+                 balance/liquidity caps at {}. Top up the binding wallet, \
+                 or wait for deeper books.",
                 pair.pair_id,
                 req.arb_type,
-                needed,
-                cost.poly_min_leg_price_cents,
+                POLY_MIN_ORDER_SHARES,
                 max_contracts,
             );
             self.release_in_flight(market_id);

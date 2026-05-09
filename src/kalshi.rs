@@ -420,8 +420,13 @@ fn dollar_str_to_cents(s: &str) -> i64 {
 }
 
 #[inline]
+/// Parse Kalshi's qty string into centi-contracts (1 unit = 0.01 contract).
+/// Mirrors Polymarket's `parse_size` convention so both venues feed the same
+/// canonical unit through `SizeCents`. Preserves fractional contracts on
+/// Kalshi markets where `fractional_trading_enabled = true` (rolled out
+/// 2026-03-09; minimum lot is 0.01 contracts).
 fn qty_str_to_int(s: &str) -> i64 {
-    s.parse::<f64>().map(|q| q.round() as i64).unwrap_or(0)
+    s.parse::<f64>().map(|q| (q * 100.0).round() as i64).unwrap_or(0)
 }
 
 /// Per-market orderbook maintained by the WS reader task.
@@ -489,15 +494,19 @@ impl KalshiBook {
 
     /// Publish derived top-of-book into the lock-free `AtomicOrderbook`.
     /// Kalshi publishes BIDS, so asks are computed from the opposite side.
+    /// `q` is already in centi-contracts (see `qty_str_to_int`); pass it
+    /// through with a saturating clamp at `u16::MAX` (≈ 655 whole contracts
+    /// per level — enough for retail; revisit when level depth routinely
+    /// exceeds that).
     pub fn publish_top(&self, market: &crate::types::AtomicMarketState) {
         // To buy NO we cross the best YES bid.
         let (no_ask, no_size) = self.yes_bids.iter().next_back()
-            .map(|(&p, &q)| ((100 - p) as PriceCents, (q * p / 100) as SizeCents))
+            .map(|(&p, &q)| ((100 - p) as PriceCents, q.min(u16::MAX as i64) as SizeCents))
             .unwrap_or((0, 0));
 
         // To buy YES we cross the best NO bid.
         let (yes_ask, yes_size) = self.no_bids.iter().next_back()
-            .map(|(&p, &q)| ((100 - p) as PriceCents, (q * p / 100) as SizeCents))
+            .map(|(&p, &q)| ((100 - p) as PriceCents, q.min(u16::MAX as i64) as SizeCents))
             .unwrap_or((0, 0));
 
         market.kalshi.store(yes_ask, no_ask, yes_size, no_size);
@@ -724,31 +733,34 @@ mod tests {
 
     #[test]
     fn snapshot_then_deltas_derive_correct_top_of_book() {
+        // Inputs are whole-contract strings (e.g. "10"); `qty_str_to_int`
+        // scales them by 100 into centi-contracts (1 unit = 0.01 contract),
+        // so 10 contracts → 1000 stored. Assertions follow the stored unit.
         let mut book = KalshiBook::default();
 
         book.apply_snapshot(&snapshot_body(
             &[("0.40", "10"), ("0.41", "5"), ("0.42", "3")],
             &[("0.55", "7"), ("0.56", "2")],
         ));
-        assert_eq!(book.yes_bids.iter().next_back(), Some((&42, &3)));
-        assert_eq!(book.no_bids.iter().next_back(), Some((&56, &2)));
+        assert_eq!(book.yes_bids.iter().next_back(), Some((&42, &300)));
+        assert_eq!(book.no_bids.iter().next_back(), Some((&56, &200)));
 
-        // Add to an existing level.
+        // Add to an existing level (+4 contracts = +400 centi-contracts).
         assert!(book.apply_delta(&delta_body("0.42", "4", "yes")));
-        assert_eq!(book.yes_bids.get(&42), Some(&7));
+        assert_eq!(book.yes_bids.get(&42), Some(&700));
 
         // Reduce a level but keep it.
         assert!(book.apply_delta(&delta_body("0.42", "-5", "yes")));
-        assert_eq!(book.yes_bids.get(&42), Some(&2));
+        assert_eq!(book.yes_bids.get(&42), Some(&200));
 
         // Remove the level entirely — new top becomes 41.
         assert!(book.apply_delta(&delta_body("0.42", "-2", "yes")));
         assert_eq!(book.yes_bids.get(&42), None);
-        assert_eq!(book.yes_bids.iter().next_back(), Some((&41, &5)));
+        assert_eq!(book.yes_bids.iter().next_back(), Some((&41, &500)));
 
         // New level added to NO side via delta.
         assert!(book.apply_delta(&delta_body("0.57", "8", "no")));
-        assert_eq!(book.no_bids.iter().next_back(), Some((&57, &8)));
+        assert_eq!(book.no_bids.iter().next_back(), Some((&57, &800)));
 
         // Over-reduction still removes (saturating behavior — no negative qty).
         assert!(book.apply_delta(&delta_body("0.55", "-999", "no")));
@@ -767,7 +779,8 @@ mod tests {
         // Unknown side: no-op.
         assert!(!book.apply_delta(&delta_body("0.40", "1", "maybe")));
 
-        assert_eq!(book.yes_bids.get(&40), Some(&10));
-        assert_eq!(book.no_bids.get(&55), Some(&5));
+        // Stored values are centi-contracts: 10 contracts = 1000, 5 = 500.
+        assert_eq!(book.yes_bids.get(&40), Some(&1000));
+        assert_eq!(book.no_bids.get(&55), Some(&500));
     }
 }

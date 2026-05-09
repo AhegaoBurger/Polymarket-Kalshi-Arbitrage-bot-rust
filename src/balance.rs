@@ -25,9 +25,11 @@ use std::sync::atomic::{AtomicI64, AtomicU64, Ordering};
 use std::time::Duration;
 use tracing::{debug, info, warn};
 
-/// Polymarket minimum order value. Orders below this get 400'd by the CLOB
-/// with "order size is less than minimum." Currently $5 on Sports markets.
-pub const POLY_MIN_ORDER_CENTS: i64 = 500;
+/// Polymarket minimum order size in shares. The CLOB rejects any order with
+/// `size < minimum_order_size` (per-market field, default 5). Confirmed via
+/// the API rejection in py-clob-client issue #301: `Size (1.08) lower than
+/// the minimum: 5` — both numbers are shares, not notional dollars.
+pub const POLY_MIN_ORDER_SHARES: i64 = 5;
 
 /// Kalshi minimum order: at least 1 contract.
 pub const KALSHI_MIN_CONTRACTS: i64 = 1;
