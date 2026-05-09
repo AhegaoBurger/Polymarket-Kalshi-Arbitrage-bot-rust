@@ -2,6 +2,7 @@
 name = "prediction-market-arbitrage"
 version = "2.0.0"
 edition = "2021"
+default-run = "prediction-market-arbitrage"
 description = "Kalshi-Poly / Poly-Poly / Kalshi-Kalshi arbitrage bot - automated cross-platform prediction market trading system"
 keywords = ["polymarket", "kalshi", "arbitrage", "trading-bot", "prediction-markets", "kalshi-poly", "poly-poly", "kalshi-kalshi", "polymarket-arbitrage", "kalshi-arbitrage", "cross-platform-trading"]
 authors = ["teraus"]
