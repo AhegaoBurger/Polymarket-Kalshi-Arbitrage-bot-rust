@@ -5,16 +5,26 @@ Spec: docs/superpowers/specs/2026-05-02-matching-prefilter-and-llm-swap-design.m
 
 from __future__ import annotations
 
+import asyncio
 import json
+import os
 from dataclasses import asdict, dataclass
 from pathlib import Path
 from typing import Any
 
 import litellm
 
+# Silence "Give Feedback / Get Help" + "If you need to debug this error" lines
+# that litellm prints directly to stdout on every internal retry. These bypass
+# Python's logging module, so logging.getLogger("LiteLLM").setLevel doesn't help.
+litellm.suppress_debug_info = True
+
 from ai_matcher.ingestion import Market
 
 DEFAULT_MODEL = "gpt-4.1-mini"
+# Per-call timeout. Without this, a single hung HTTPS connection blocks
+# asyncio.gather forever (one stuck task → whole pipeline stuck at 99.9%).
+DEFAULT_LLM_TIMEOUT_SECONDS = 60.0
 
 VERIFIER_TOOL = {
     "type": "function",
@@ -89,6 +99,13 @@ def user_prompt(kalshi: Market, poly: Market) -> str:
     )
 
 
+# Cache writes are batched in the async path: every Nth successful call we
+# flush to disk. Tunable via SAVE_EVERY but 50 is a sensible default — small
+# enough that a crash loses ~50 calls of work, large enough that disk I/O
+# isn't a bottleneck under high concurrency.
+_DEFAULT_SAVE_EVERY = 50
+
+
 class Verifier:
     def __init__(self, model: str = DEFAULT_MODEL, cache_path: Path | None = None) -> None:
         self.model = model
@@ -96,6 +113,9 @@ class Verifier:
         self._cache: dict[str, dict] = self._load_cache()
         self.cache_hits = 0
         self.cache_misses = 0
+        self._dirty_count = 0
+        self._save_every = _DEFAULT_SAVE_EVERY
+        self._save_lock: asyncio.Lock | None = None
 
     def _load_cache(self) -> dict[str, dict]:
         if self.cache_path and self.cache_path.exists():
@@ -113,14 +133,20 @@ class Verifier:
     def _cache_key(self, k: Market, p: Market) -> str:
         return f"{self.model}|{k.content_hash()}|{p.content_hash()}"
 
-    def verify(self, kalshi: Market, poly: Market) -> Decision:
-        key = self._cache_key(kalshi, poly)
-        if key in self._cache:
-            self.cache_hits += 1
-            return Decision(**self._cache[key])
+    def is_cached(self, kalshi: Market, poly: Market) -> bool:
+        return self._cache_key(kalshi, poly) in self._cache
 
-        self.cache_misses += 1
-        resp = litellm.completion(
+    def flush(self) -> None:
+        """Force pending cache writes to disk. Call after a batch of async work."""
+        if self._dirty_count > 0:
+            self._save_cache()
+            self._dirty_count = 0
+
+    def _completion_kwargs(self, kalshi: Market, poly: Market) -> dict[str, Any]:
+        timeout = float(os.environ.get(
+            "LLM_TIMEOUT_SECONDS", str(DEFAULT_LLM_TIMEOUT_SECONDS)
+        ))
+        return dict(
             model=self.model,
             messages=[
                 {"role": "system", "content": SYSTEM_PROMPT},
@@ -129,21 +155,78 @@ class Verifier:
             tools=[VERIFIER_TOOL],
             tool_choice={"type": "function", "function": {"name": "report_match_decision"}},
             num_retries=3,
+            timeout=timeout,
         )
-        tool_input = self._extract_tool_input(resp)
-        cost = float(getattr(resp, "_hidden_params", {}).get("response_cost", 0.0) or 0.0)
-        decision = Decision(
-            confidence=float(tool_input["confidence"]),
-            resolution_match=bool(tool_input["resolution_match"]),
-            concerns=list(tool_input.get("concerns", [])),
-            reasoning=str(tool_input.get("reasoning", "")),
-            category=str(tool_input.get("category", "")),
-            event_type=str(tool_input.get("event_type", "Other")),
-            cost_usd=cost,
-        )
+
+    def verify(self, kalshi: Market, poly: Market) -> Decision:
+        key = self._cache_key(kalshi, poly)
+        if key in self._cache:
+            self.cache_hits += 1
+            return Decision(**self._cache[key])
+
+        self.cache_misses += 1
+        try:
+            resp = litellm.completion(**self._completion_kwargs(kalshi, poly))
+        except Exception as e:
+            return _error_decision(repr(e))
+
+        decision = self._build_decision(resp)
         self._cache[key] = asdict(decision)
         self._save_cache()
         return decision
+
+    async def averify(self, kalshi: Market, poly: Market) -> Decision:
+        """Async counterpart to verify(). Used by the parallel pipeline path.
+
+        Cache hits are returned synchronously (no await). Misses make a single
+        async LLM call. Cache writes batch under a shared lock — see flush()."""
+        key = self._cache_key(kalshi, poly)
+        if key in self._cache:
+            self.cache_hits += 1
+            return Decision(**self._cache[key])
+
+        self.cache_misses += 1
+        try:
+            resp = await litellm.acompletion(**self._completion_kwargs(kalshi, poly))
+        except Exception as e:
+            return _error_decision(repr(e))
+
+        decision = self._build_decision(resp)
+
+        if self._save_lock is None:
+            self._save_lock = asyncio.Lock()
+        async with self._save_lock:
+            self._cache[key] = asdict(decision)
+            self._dirty_count += 1
+            if self._dirty_count >= self._save_every:
+                self._save_cache()
+                self._dirty_count = 0
+        return decision
+
+    def _build_decision(self, resp: Any) -> Decision:
+        """Parse a LiteLLM response into a Decision, defaulting missing fields.
+
+        OpenAI tool-calling occasionally omits `required` fields on edge-case
+        prompts. We default rather than crash; the resulting low-confidence
+        Decision will be rejected downstream and logged in concerns[]."""
+        cost = float(getattr(resp, "_hidden_params", {}).get("response_cost", 0.0) or 0.0)
+        try:
+            tool_input = self._extract_tool_input(resp)
+        except ValueError as e:
+            return _error_decision(repr(e), cost=cost)
+
+        try:
+            return Decision(
+                confidence=float(tool_input.get("confidence", 0.0)),
+                resolution_match=bool(tool_input.get("resolution_match", False)),
+                concerns=list(tool_input.get("concerns") or []),
+                reasoning=str(tool_input.get("reasoning", "")),
+                category=str(tool_input.get("category", "")),
+                event_type=str(tool_input.get("event_type", "Other")),
+                cost_usd=cost,
+            )
+        except (TypeError, ValueError) as e:
+            return _error_decision(repr(e), cost=cost)
 
     @staticmethod
     def _extract_tool_input(resp: Any) -> dict:
@@ -161,6 +244,22 @@ class Verifier:
                 if args:
                     return json.loads(args)
         raise ValueError("LiteLLM response missing tool_calls")
+
+
+def _error_decision(msg: str, cost: float = 0.0) -> Decision:
+    """Decision returned when the LLM call or its response can't be processed.
+
+    Not cached: the failure may be transient (network/auth/rate-limit-exhaust),
+    so we let the next run retry."""
+    return Decision(
+        confidence=0.0,
+        resolution_match=False,
+        concerns=[f"verifier-error: {msg[:200]}"],
+        reasoning="LLM call or parse failed — rejecting as safety default.",
+        category="",
+        event_type="Other",
+        cost_usd=cost,
+    )
 
 
 class EmbeddingsOnlyVerifier:

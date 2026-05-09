@@ -2,6 +2,8 @@
 
 from __future__ import annotations
 
+import datetime as dt
+import re
 from dataclasses import dataclass
 from importlib.resources import files
 from pathlib import Path
@@ -9,6 +11,15 @@ from pathlib import Path
 from jinja2 import Environment, FileSystemLoader, select_autoescape
 
 from ai_matcher.verifier import Decision
+
+
+def _slug(s: str) -> str:
+    """Make a string safe to use inside a single filename component.
+
+    LLM-emitted categories can contain '/', spaces, ampersands, etc. — anything
+    not in [a-z0-9_-] gets collapsed to '-' so the result is always a single
+    flat filename rather than an implied path."""
+    return re.sub(r"[^a-z0-9_-]+", "-", s.lower()).strip("-") or "uncategorized"
 
 
 @dataclass
@@ -35,6 +46,22 @@ class PairAuditRow:
     bucket_poly: str = "Unknown"
     cosine: float = 0.0
     delta_days: float | None = None
+    kalshi_close_time: dt.datetime | None = None
+    poly_close_time: dt.datetime | None = None
+
+    @property
+    def resolves_at(self) -> dt.datetime | None:
+        """Later of the two close times — when capital is freed (both legs settled).
+
+        If only one is known, return that one; if neither, None."""
+        candidates = [t for t in (self.kalshi_close_time, self.poly_close_time) if t]
+        return max(candidates) if candidates else None
+
+    @property
+    def resolves_at_iso(self) -> str:
+        """ISO date string for the template (sortable lexicographically) or '—'."""
+        r = self.resolves_at
+        return r.strftime("%Y-%m-%d") if r else "—"
 
 
 def _env() -> Environment:
@@ -63,7 +90,7 @@ def render_report(rows: list[PairAuditRow], out_dir: Path) -> None:
               [r for r in rows if not r.accepted])
     for cat in categories:
         render_to(
-            f"report-by-category-{cat.lower()}.html",
+            f"report-by-category-{_slug(cat)}.html",
             f"ai_matcher — {cat}",
             [r for r in rows if r.decision.category == cat],
         )

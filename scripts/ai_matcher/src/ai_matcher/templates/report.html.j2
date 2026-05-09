@@ -49,6 +49,7 @@
   <th data-sort="string">Bucket pair</th>
   <th data-sort="numeric">Cosine</th>
   <th data-sort="numeric">Δdays</th>
+  <th data-sort="string">Resolves</th>
   <th data-sort="string">LLM analysis</th>
   <th data-sort="string">Override snippet</th>
 </tr>
@@ -88,6 +89,7 @@
   <td class="num">{{ row.bucket_kalshi }} → {{ row.bucket_poly }}</td>
   <td class="num">{{ '%.3f' | format(row.cosine) }}</td>
   <td class="num">{{ '%.1f' | format(row.delta_days) if row.delta_days is not none else '—' }}</td>
+  <td class="num">{{ row.resolves_at_iso }}</td>
   <td>
     Category: {{ row.decision.category }}<br>
     Concerns:

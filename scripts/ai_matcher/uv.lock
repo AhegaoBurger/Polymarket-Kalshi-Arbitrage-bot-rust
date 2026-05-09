@@ -12,6 +12,7 @@ dependencies = [
     { name = "jinja2" },
     { name = "litellm" },
     { name = "sentence-transformers" },
+    { name = "tqdm" },
 ]
 
 [package.dev-dependencies]
@@ -26,6 +27,7 @@ requires-dist = [
     { name = "jinja2", specifier = ">=3.1.6" },
     { name = "litellm", specifier = ">=1.50.0" },
     { name = "sentence-transformers", specifier = ">=5.4.1" },
+    { name = "tqdm", specifier = ">=4.66.0" },
 ]
 
 [package.metadata.requires-dev]

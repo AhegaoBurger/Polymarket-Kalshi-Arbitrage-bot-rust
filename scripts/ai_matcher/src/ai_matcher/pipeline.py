@@ -2,8 +2,10 @@
 
 from __future__ import annotations
 
+import asyncio
 import datetime as dt
 import json
+import logging
 import os
 import tempfile
 from dataclasses import dataclass
@@ -11,6 +13,7 @@ from pathlib import Path
 from typing import Any
 
 import numpy as np
+from tqdm import tqdm
 
 from collections import defaultdict
 
@@ -19,7 +22,17 @@ from ai_matcher.ingestion import Ingestion, IngestionResult, Market
 from ai_matcher.overrides import OverrideOutcome, OverrideSet
 from ai_matcher.report import PairAuditRow, render_report
 from ai_matcher.retrieval import BucketedHnswRetrieval
-from ai_matcher.verifier import EmbeddingsOnlyVerifier, Verifier
+from ai_matcher.verifier import (
+    DEFAULT_LLM_TIMEOUT_SECONDS,
+    Decision,
+    EmbeddingsOnlyVerifier,
+    Verifier,
+)
+
+# Quiet litellm's "Give Feedback / Get Help" boilerplate it logs on every
+# internal retry. Real exceptions still surface (logged at ERROR level by
+# litellm before bubbling); we only suppress the INFO/WARNING chatter.
+logging.getLogger("LiteLLM").setLevel(logging.ERROR)
 
 
 def date_overlap_ok(
@@ -99,6 +112,122 @@ def _call_verifier(verifier: Any, k: Market, p: Market, cosine: float):
     return verifier.verify(k, p)
 
 
+async def _async_verify_all(
+    verifier: Verifier,
+    work: list[tuple[Market, Market, float]],
+    concurrency: int,
+    show_progress: bool,
+) -> tuple[list[Decision], list[bool], float]:
+    """Run `verifier.averify` on every (kalshi, poly, cosine) triple in parallel.
+
+    A bounded `asyncio.Semaphore` keeps at most `concurrency` calls in flight,
+    which respects OpenAI RPM/TPM limits. Cache-hit status is sampled BEFORE
+    each call so we can attribute cost only to genuinely new LLM requests.
+
+    Returns (decisions, was_cached_flags, total_new_cost_usd).
+    """
+    sem = asyncio.Semaphore(concurrency)
+    decisions: list[Decision | None] = [None] * len(work)
+    was_cached: list[bool] = [verifier.is_cached(k, p) for k, p, _ in work]
+    counters = {"acc": 0, "rej": 0, "cached_done": 0, "cost": 0.0}
+
+    # Outer-task watchdog: if litellm's own timeout fails to fire (rare, but
+    # has been seen on stalled TLS handshakes), this guarantees the pipeline
+    # always reaches bookkeeping. Set slightly higher than the inner timeout.
+    inner_timeout = float(os.environ.get(
+        "LLM_TIMEOUT_SECONDS", str(DEFAULT_LLM_TIMEOUT_SECONDS)
+    ))
+    outer_timeout = inner_timeout + 10.0
+
+    pbar = tqdm(
+        total=len(work),
+        desc="Matching",
+        unit="pair",
+        disable=not show_progress,
+    )
+
+    async def one(i: int, k: Market, p: Market) -> None:
+        async with sem:
+            try:
+                d = await asyncio.wait_for(
+                    verifier.averify(k, p), timeout=outer_timeout
+                )
+            except asyncio.TimeoutError:
+                d = Decision(
+                    confidence=0.0,
+                    resolution_match=False,
+                    concerns=[f"verifier-error: outer timeout after {outer_timeout}s"],
+                    reasoning="LLM call exceeded watchdog timeout — rejecting and continuing.",
+                    category="",
+                    event_type="Other",
+                    cost_usd=0.0,
+                )
+        decisions[i] = d
+        if was_cached[i]:
+            counters["cached_done"] += 1
+        else:
+            counters["cost"] += float(d.cost_usd or 0.0)
+        if d.is_accepted(0.9):
+            counters["acc"] += 1
+        else:
+            counters["rej"] += 1
+        pbar.set_postfix(
+            acc=counters["acc"],
+            rej=counters["rej"],
+            cached=counters["cached_done"],
+            cost=f"${counters['cost']:.2f}",
+            refresh=False,
+        )
+        pbar.update(1)
+
+    try:
+        await asyncio.gather(*(one(i, k, p) for i, (k, p, _) in enumerate(work)))
+    finally:
+        pbar.close()
+        verifier.flush()  # persist any cache writes still buffered in memory
+
+    out = [d for d in decisions if d is not None]
+    return out, was_cached, counters["cost"]
+
+
+def _verify_all(
+    verifier: Any,
+    work: list[tuple[Market, Market, float]],
+    show_progress: bool = True,
+) -> tuple[list[Decision], list[bool], float]:
+    """Run verification on all work items.
+
+    LLM-backed `Verifier` runs concurrently via `asyncio.gather` (controlled by
+    `LLM_CONCURRENCY`, default 20). `EmbeddingsOnlyVerifier` and test mocks run
+    sequentially via the existing dispatch.
+
+    The async path drives a tqdm bar with live accept/reject/cached/cost.
+    The sync path drives the same bar one item at a time, except for empty work.
+    """
+    if not work:
+        return [], [], 0.0
+
+    if isinstance(verifier, Verifier):
+        concurrency = max(1, int(os.environ.get("LLM_CONCURRENCY", "20")))
+        return asyncio.run(
+            _async_verify_all(verifier, work, concurrency, show_progress)
+        )
+
+    decisions: list[Decision] = []
+    was_cached: list[bool] = []
+    cost = 0.0
+    iterator: Any = tqdm(work, desc="Matching", unit="pair", disable=not show_progress)
+    for k, p, c in iterator:
+        hits_before = getattr(verifier, "cache_hits", 0)
+        d = _call_verifier(verifier, k, p, c)
+        hit = getattr(verifier, "cache_hits", 0) > hits_before
+        if not hit:
+            cost += float(getattr(d, "cost_usd", 0.0) or 0.0)
+        decisions.append(d)
+        was_cached.append(hit)
+    return decisions, was_cached, cost
+
+
 def _kalshi_url(ticker: str) -> str:
     return f"https://kalshi.com/markets/{ticker}"
 
@@ -166,9 +295,9 @@ def run_pipeline(
     rejected = 0
     candidates_after_retrieval = 0
     drops_at_date_overlap = 0
-    verifier_calls = 0
-    verifier_cost_usd = 0.0
 
+    # === Pass 1: walk retrieved candidates, drop date-mismatches, collect work ===
+    work: list[tuple[Market, Market, float]] = []
     for k, k_vec in zip(result.kalshi, kalshi_vecs):
         bucketed_counts[k.bucket] += 1
         candidates = retrieval.query(k_vec, k.bucket) if all_polys else []
@@ -202,79 +331,113 @@ def run_pipeline(
                 rejected += 1
                 continue
 
-            verifier_calls += 1
-            hits_before = getattr(verifier, "cache_hits", 0)
-            decision = _call_verifier(verifier, k, p, cosine)
-            was_cache_hit = getattr(verifier, "cache_hits", 0) > hits_before
-            if not was_cache_hit:
-                verifier_cost_usd += getattr(decision, "cost_usd", 0.0) or 0.0
-            override = overrides.lookup(k.ticker, p.condition_id)
-            ai_accept = decision.is_accepted(min_confidence=cfg.acceptance_min_confidence)
-            if override == OverrideOutcome.BLACKLIST:
-                final_accepted = False
-            elif override == OverrideOutcome.WHITELIST:
-                final_accepted = True
-            else:
-                final_accepted = ai_accept
+            work.append((k, p, cosine))
 
-            tol_resolved = (
-                cfg.category_config.buckets[k.bucket].tolerance_days
-                if cfg.category_config and k.bucket in cfg.category_config.buckets
-                else (cfg.category_config.default_tolerance_days if cfg.category_config else None)
-            )
-            delta_days_resolved = (
-                int(abs((k.close_time_utc - p.close_time_utc).total_seconds()) // 86_400)
-                if (k.close_time_utc and p.close_time_utc) else None
-            )
+    verifier_calls = len(work)
 
-            if final_accepted:
-                accepted += 1
-                accepted_pairs.append({
-                    "kalshi_market_ticker": k.ticker,
-                    "poly_condition_id": p.condition_id,
-                    "poly_yes_token": p.poly_yes_token,
-                    "poly_no_token": p.poly_no_token,
-                    "category": decision.category,
-                    "event_type": decision.event_type,
-                    "confidence": decision.confidence,
-                    "description": f"{k.title} ↔ {p.title}",
-                    "bucket_kalshi": k.bucket,
-                    "bucket_poly": p.bucket,
-                    "cosine": round(float(cosine), 4),
-                    "delta_days": delta_days_resolved,
-                })
-            else:
-                rejected += 1
-            rows.append(PairAuditRow(
-                kalshi_ticker=k.ticker, kalshi_title=k.title,
-                kalshi_description=k.description, kalshi_resolution=k.resolution_criteria,
-                kalshi_outcomes=k.outcomes, kalshi_url=_kalshi_url(k.ticker),
-                poly_slug=p.ticker, poly_title=p.title,
-                poly_description=p.description, poly_resolution=p.resolution_criteria,
-                poly_outcomes=p.outcomes, poly_url=_poly_url(p.ticker),
-                decision=decision, accepted=final_accepted,
-                override_snippet=_override_snippet(k.ticker, p.condition_id),
-                override_outcome=override.value,
-                bucket_kalshi=k.bucket, bucket_poly=p.bucket,
-                cosine=float(cosine),
-                delta_days=delta_days_resolved,
-            ))
+    # === Pre-flight log: how many calls are about to fly ===
+    if isinstance(verifier, Verifier):
+        cached_count = sum(1 for k, p, _ in work if verifier.is_cached(k, p))
+        new_count = len(work) - cached_count
+        concurrency = max(1, int(os.environ.get("LLM_CONCURRENCY", "20")))
+        print(
+            f"[ai_matcher] verifying {len(work)} candidate pairs "
+            f"({cached_count} cached, {new_count} new LLM calls, "
+            f"concurrency={concurrency})",
+            flush=True,
+        )
+    elif isinstance(verifier, EmbeddingsOnlyVerifier):
+        print(
+            f"[ai_matcher] verifying {len(work)} candidate pairs "
+            f"(embeddings-only, no LLM calls)",
+            flush=True,
+        )
 
-            audit_log_lines.append(json.dumps({
-                "ts": dt.datetime.now(tz=dt.timezone.utc).isoformat(),
-                "kalshi": k.ticker, "poly": p.condition_id,
-                "decision": "accept" if final_accepted else "reject",
-                "reject_reason": None if final_accepted else "verifier",
-                "bucket_kalshi": k.bucket, "bucket_poly": p.bucket,
-                "cosine": round(float(cosine), 4),
-                "delta_days": delta_days_resolved, "tolerance_days": tol_resolved,
+    # === Pass 2: run verification (async for LLM, sync for embeddings/mocks) ===
+    decisions, was_cached_flags, verifier_cost_usd = _verify_all(verifier, work)
+
+    # === Pass 3: bookkeeping — overrides, audit rows, audit log entries ===
+    for (k, p, cosine), decision, _was_cached in zip(work, decisions, was_cached_flags):
+        override = overrides.lookup(k.ticker, p.condition_id)
+        ai_accept = decision.is_accepted(min_confidence=cfg.acceptance_min_confidence)
+        if override == OverrideOutcome.BLACKLIST:
+            final_accepted = False
+        elif override == OverrideOutcome.WHITELIST:
+            final_accepted = True
+        else:
+            final_accepted = ai_accept
+
+        tol_resolved = (
+            cfg.category_config.buckets[k.bucket].tolerance_days
+            if cfg.category_config and k.bucket in cfg.category_config.buckets
+            else (cfg.category_config.default_tolerance_days if cfg.category_config else None)
+        )
+        delta_days_resolved = (
+            int(abs((k.close_time_utc - p.close_time_utc).total_seconds()) // 86_400)
+            if (k.close_time_utc and p.close_time_utc) else None
+        )
+
+        resolves_at = None
+        if k.close_time_utc and p.close_time_utc:
+            resolves_at = max(k.close_time_utc, p.close_time_utc)
+        elif k.close_time_utc:
+            resolves_at = k.close_time_utc
+        elif p.close_time_utc:
+            resolves_at = p.close_time_utc
+
+        if final_accepted:
+            accepted += 1
+            accepted_pairs.append({
+                "kalshi_market_ticker": k.ticker,
+                "poly_condition_id": p.condition_id,
+                "poly_yes_token": p.poly_yes_token,
+                "poly_no_token": p.poly_no_token,
+                "category": decision.category,
+                "event_type": decision.event_type,
                 "confidence": decision.confidence,
-                "concerns": decision.concerns,
-                "reasoning": decision.reasoning,
-                "override": override.value,
-                "model": getattr(verifier, "model", ""),
-                "cost_usd": getattr(decision, "cost_usd", 0.0),
-            }))
+                "description": f"{k.title} ↔ {p.title}",
+                "bucket_kalshi": k.bucket,
+                "bucket_poly": p.bucket,
+                "cosine": round(float(cosine), 4),
+                "delta_days": delta_days_resolved,
+                "kalshi_close_time": k.close_time_utc.isoformat() if k.close_time_utc else None,
+                "poly_close_time": p.close_time_utc.isoformat() if p.close_time_utc else None,
+                "resolves_at": resolves_at.isoformat() if resolves_at else None,
+            })
+        else:
+            rejected += 1
+        rows.append(PairAuditRow(
+            kalshi_ticker=k.ticker, kalshi_title=k.title,
+            kalshi_description=k.description, kalshi_resolution=k.resolution_criteria,
+            kalshi_outcomes=k.outcomes, kalshi_url=_kalshi_url(k.ticker),
+            poly_slug=p.ticker, poly_title=p.title,
+            poly_description=p.description, poly_resolution=p.resolution_criteria,
+            poly_outcomes=p.outcomes, poly_url=_poly_url(p.ticker),
+            decision=decision, accepted=final_accepted,
+            override_snippet=_override_snippet(k.ticker, p.condition_id),
+            override_outcome=override.value,
+            bucket_kalshi=k.bucket, bucket_poly=p.bucket,
+            cosine=float(cosine),
+            delta_days=delta_days_resolved,
+            kalshi_close_time=k.close_time_utc,
+            poly_close_time=p.close_time_utc,
+        ))
+
+        audit_log_lines.append(json.dumps({
+            "ts": dt.datetime.now(tz=dt.timezone.utc).isoformat(),
+            "kalshi": k.ticker, "poly": p.condition_id,
+            "decision": "accept" if final_accepted else "reject",
+            "reject_reason": None if final_accepted else "verifier",
+            "bucket_kalshi": k.bucket, "bucket_poly": p.bucket,
+            "cosine": round(float(cosine), 4),
+            "delta_days": delta_days_resolved, "tolerance_days": tol_resolved,
+            "confidence": decision.confidence,
+            "concerns": decision.concerns,
+            "reasoning": decision.reasoning,
+            "override": override.value,
+            "model": getattr(verifier, "model", ""),
+            "cost_usd": getattr(decision, "cost_usd", 0.0),
+        }))
 
     payload = {
         "generated_at": dt.datetime.now(tz=dt.timezone.utc).isoformat(),
@@ -283,14 +446,17 @@ def run_pipeline(
         "version": 1,
         "pairs": accepted_pairs,
     }
-    _atomic_write_json(cfg.matches_path, payload)
-    render_report(rows, cfg.audit_dir)
-
+    # Write in order of "most important to keep on crash" → least.
+    # The audit log is the only crash-investigation breadcrumb, so persist it
+    # before the JSON or HTML so a render bug can't cost us the per-pair record.
     if audit_log_lines:
         cfg.audit_log_path.parent.mkdir(parents=True, exist_ok=True)
         with cfg.audit_log_path.open("a") as f:
             for line in audit_log_lines:
                 f.write(line + "\n")
+
+    _atomic_write_json(cfg.matches_path, payload)
+    render_report(rows, cfg.audit_dir)
 
     return {
         "ingested": {"kalshi": len(result.kalshi), "poly": len(result.poly)},

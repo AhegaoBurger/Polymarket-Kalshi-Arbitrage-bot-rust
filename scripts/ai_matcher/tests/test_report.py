@@ -2,6 +2,7 @@
 
 from __future__ import annotations
 
+import datetime as dt
 from pathlib import Path
 
 from ai_matcher.report import PairAuditRow, render_report
@@ -59,3 +60,40 @@ def test_report_has_sort_filter_js(tmp_path: Path):
     html = (tmp_path / "report.html").read_text()
     assert "addEventListener('click'" in html
     assert "addEventListener('input'" in html
+
+
+def test_resolves_at_column_shows_later_date(tmp_path: Path):
+    """Resolves column should show the later of the two close times (capital lockup)."""
+    row = _row(
+        kalshi_close_time=dt.datetime(2026, 11, 8, tzinfo=dt.timezone.utc),
+        poly_close_time=dt.datetime(2026, 11, 15, tzinfo=dt.timezone.utc),
+    )
+    render_report([row], tmp_path)
+    html = (tmp_path / "report.html").read_text()
+    assert "Resolves" in html  # column header
+    assert "2026-11-15" in html  # later of the two
+    # Property short-circuits when only one is known
+    assert PairAuditRow.resolves_at.fget(row).isoformat().startswith("2026-11-15")
+
+
+def test_resolves_at_handles_missing_close_times(tmp_path: Path):
+    row = _row()  # no close times set
+    render_report([row], tmp_path)
+    html = (tmp_path / "report.html").read_text()
+    # Resolves cell renders an em-dash placeholder, not blank
+    assert "—" in html
+
+
+def test_per_category_filename_strips_path_separators(tmp_path: Path):
+    """Categories like 'Corporate Acquisition/Merger' must not become subdirs."""
+    row = _row(decision=Decision(
+        confidence=0.95, resolution_match=True, concerns=[],
+        reasoning="r", category="Corporate Acquisition/Merger", event_type="Other",
+        cost_usd=0.0,
+    ))
+    render_report([row], tmp_path)
+    # Slashes in the category name must be sanitized; the file lives flat.
+    children = sorted(p.name for p in tmp_path.iterdir())
+    assert any(c.startswith("report-by-category-") and "/" not in c for c in children)
+    # No accidental subdirectory got created.
+    assert not (tmp_path / "report-by-category-corporate acquisition").exists()
