@@ -1,5 +1,6 @@
 target/
 .env
+.env.bak*
 .env.keys
 kalshi_private_key.txt
 keys/

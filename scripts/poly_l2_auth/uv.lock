@@ -601,7 +601,7 @@ dependencies = [
 [package.metadata]
 requires-dist = [
     { name = "py-clob-client", specifier = ">=0.34.6" },
-    { name = "py-clob-client-v2", git = "https://github.com/Polymarket/py-clob-client-v2" },
+    { name = "py-clob-client-v2", git = "https://github.com/alexandrosh8/py-clob-client-v2?rev=c9f0b4d9832c11bf3966d34a53ccfb56cee03062" },
 ]
 
 [[package]]
@@ -637,9 +637,10 @@ wheels = [
 
 [[package]]
 name = "py-clob-client-v2"
-version = "1.0.0"
-source = { git = "https://github.com/Polymarket/py-clob-client-v2#a2ec069fb66096e2b80ff0b7fdf628fc41d6352c" }
+version = "1.0.1rc1"
+source = { git = "https://github.com/alexandrosh8/py-clob-client-v2?rev=c9f0b4d9832c11bf3966d34a53ccfb56cee03062#c9f0b4d9832c11bf3966d34a53ccfb56cee03062" }
 dependencies = [
+    { name = "eth-abi" },
     { name = "eth-account" },
     { name = "eth-utils" },
     { name = "httpx", extra = ["http2"] },

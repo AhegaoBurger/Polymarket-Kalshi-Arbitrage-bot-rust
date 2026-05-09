@@ -22,4 +22,9 @@ requires = ["uv_build>=0.9.7,<0.10.0"]
 build-backend = "uv_build"
 
 [tool.uv.sources]
-py-clob-client-v2 = { git = "https://github.com/Polymarket/py-clob-client-v2" }
+# Pinned to PR #42 (alexandrosh8/fix-41-ua-bypass) until upstream merges:
+# adds versioned User-Agent + browser header bundle to ALL requests, which
+# is what unblocks /balance-allowance and /auth/api-key on V2 (post-Apr 28
+# 2026 cutover). Stock python-httpx UA gets soft-blocked (401 / CF 403).
+# See py-clob-client-v2 issues #38, #41, #45.
+py-clob-client-v2 = { git = "https://github.com/alexandrosh8/py-clob-client-v2", rev = "c9f0b4d9832c11bf3966d34a53ccfb56cee03062" }

@@ -25,6 +25,13 @@ use std::sync::atomic::{AtomicBool, Ordering};
 /// generic SDK-identifier User-Agents (e.g. `py_clob_client`) — observed as
 /// 403 with a Cloudflare HTML challenge page on POST endpoints. Mimic a real
 /// browser to get past the WAF; the underlying request is identical.
+///
+/// Post-2026-04-28 V2 cutover: UA alone is INSUFFICIENT — Cloudflare now
+/// also scores `sec-ch-ua-*`, `sec-fetch-*`, `Accept`, and `Accept-Language`.
+/// A bare UA + `Accept: */*` returns 401 `Unauthorized/Invalid api key` on
+/// L2 endpoints (a soft-block masquerading as auth failure). The full
+/// browser-bundle below mirrors py-clob-client-v2 PR #42, which is the only
+/// confirmed-working header set against the post-cutover WAF.
 const USER_AGENT: &str =
     "Mozilla/5.0 (Macintosh; Intel Mac OS X 14_5) AppleWebKit/537.36 \
      (KHTML, like Gecko) Chrome/126.0.0.0 Safari/537.36";
@@ -107,9 +114,35 @@ impl PreparedCreds {
 
 fn add_default_headers(headers: &mut HeaderMap) {
     headers.insert("User-Agent", HeaderValue::from_static(USER_AGENT));
-    headers.insert("Accept", HeaderValue::from_static("*/*"));
+    headers.insert(
+        "Accept",
+        HeaderValue::from_static("application/json, text/plain, */*"),
+    );
+    headers.insert("Accept-Language", HeaderValue::from_static("en-US,en;q=0.9"));
     headers.insert("Connection", HeaderValue::from_static("keep-alive"));
     headers.insert("Content-Type", HeaderValue::from_static("application/json"));
+    // Browser-fingerprint bundle: mirrors py-clob-client-v2 PR #42 verbatim.
+    // sec-ch-ua claims Chromium 124 even though our UA says Chrome 126 —
+    // Cloudflare doesn't enforce internal consistency (PR #42's UA is
+    // "polymarket-clob-client-v2/1.0.1rc1" and still passes), so we keep
+    // the bundle byte-identical to the proven-working set.
+    // Accept-Encoding is intentionally omitted: reqwest's `gzip`/`deflate`
+    // features are not enabled in Cargo.toml, so advertising compression
+    // would let Cloudflare return encoded bytes that we can't decode.
+    headers.insert(
+        "sec-ch-ua",
+        HeaderValue::from_static(
+            r#""Chromium";v="124", "Google Chrome";v="124", "Not-A.Brand";v="99""#,
+        ),
+    );
+    headers.insert("sec-ch-ua-mobile", HeaderValue::from_static("?0"));
+    headers.insert(
+        "sec-ch-ua-platform",
+        HeaderValue::from_static(r#""macOS""#),
+    );
+    headers.insert("sec-fetch-dest", HeaderValue::from_static("empty"));
+    headers.insert("sec-fetch-mode", HeaderValue::from_static("cors"));
+    headers.insert("sec-fetch-site", HeaderValue::from_static("same-site"));
 }
 
 #[inline(always)]
