@@ -1,6 +1,9 @@
 [workspace]
 resolver = "2"
-members = ["crates/pmbots-arb", "crates/pmbots-gengar"]
+# `crates/pmbots-gengar` is added back in Task 4 of the gengar-rust-port plan,
+# once that crate exists on disk. Listing it here before then makes the
+# workspace fail to load.
+members = ["crates/pmbots-arb"]
 
 [workspace.dependencies]
 anyhow             = "1.0"

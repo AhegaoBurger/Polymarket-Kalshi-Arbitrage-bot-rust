@@ -2585,6 +2585,40 @@ dependencies = [
 ]
 
 [[package]]
+name = "pmbots-arb"
+version = "2.0.0"
+dependencies = [
+ "anyhow",
+ "arrayvec",
+ "async-trait",
+ "base64 0.22.1",
+ "chrono",
+ "criterion",
+ "dotenvy",
+ "ethers",
+ "futures-util",
+ "governor",
+ "hex",
+ "hmac",
+ "nonzero_ext",
+ "pkcs1",
+ "rand 0.8.5",
+ "reqwest",
+ "rsa",
+ "rustc-hash",
+ "serde",
+ "serde_json",
+ "sha2",
+ "tempfile",
+ "tiny-keccak",
+ "tokio",
+ "tokio-tungstenite 0.21.0",
+ "tracing",
+ "tracing-subscriber",
+ "wide",
+]
+
+[[package]]
 name = "portable-atomic"
 version = "1.11.1"
 source = "registry+https://github.com/rust-lang/crates.io-index"
@@ -2619,40 +2653,6 @@ name = "precomputed-hash"
 version = "0.1.1"
 source = "registry+https://github.com/rust-lang/crates.io-index"
 checksum = "925383efa346730478fb4838dbe9137d2a47675ad789c546d150a6e1dd4ab31c"
-
-[[package]]
-name = "prediction-market-arbitrage"
-version = "2.0.0"
-dependencies = [
- "anyhow",
- "arrayvec",
- "async-trait",
- "base64 0.22.1",
- "chrono",
- "criterion",
- "dotenvy",
- "ethers",
- "futures-util",
- "governor",
- "hex",
- "hmac",
- "nonzero_ext",
- "pkcs1",
- "rand 0.8.5",
- "reqwest",
- "rsa",
- "rustc-hash",
- "serde",
- "serde_json",
- "sha2",
- "tempfile",
- "tiny-keccak",
- "tokio",
- "tokio-tungstenite 0.21.0",
- "tracing",
- "tracing-subscriber",
- "wide",
-]
 
 [[package]]
 name = "prettyplease"
