@@ -28,6 +28,7 @@ tokio-tungstenite  = { workspace = true }
 tracing            = { workspace = true }
 tracing-subscriber = { workspace = true }
 hex                = { workspace = true }
+rand               = { workspace = true }
 
 # Gengar-specific
 libm = "0.2"
