@@ -5,13 +5,14 @@ use anyhow::Result;
 use std::sync::Arc;
 use std::time::Duration;
 use tokio::sync::RwLock;
+use tokio::task::JoinHandle;
 use tokio::time::sleep;
-use tracing::{info, warn, error};
+use tracing::{info, warn};
 use crate::config::GengarConfig;
 use crate::market::{self};
 use crate::polymarket::{gamma::GammaClient, ws::{self, TokenPriceCache}};
 use crate::price_feed::SharedPrice;
-use crate::strategy::{self, Signal, SkipReason};
+use crate::strategy;
 use crate::tracker::Tracker;
 use crate::executor::Executor;
 
@@ -30,7 +31,27 @@ pub struct GengarBot {
     pub state: Arc<RwLock<BotState>>,
 }
 
+#[derive(Debug, Clone)]
+pub struct OpenPosition {
+    pub window_ts: i64,
+    pub token_id: String,
+    pub side: String,               // "UP" or "DOWN"
+    pub price: f64,
+    pub shares: i64,
+    pub usd_spent: f64,
+    pub order_id: String,
+    pub opening_price: f64,
+}
+
 #[derive(Debug, Default)]
+pub struct PendingPhantom {
+    pub window_ts: i64,
+    pub claim_order_id: String,
+    pub expected_proceeds: f64,
+    pub balance_before: f64,
+}
+
+#[derive(Default)]
 pub struct BotState {
     pub current_window: i64,
     pub opening_price: f64,
@@ -40,7 +61,22 @@ pub struct BotState {
     pub session_start_balance: f64,
     pub bankroll: f64,
     pub realized_pnl_today: f64,
-    pub price_history: std::collections::VecDeque<f64>,  // for rolling vol
+    pub positions: Vec<OpenPosition>,
+    pub pending_phantom: Option<PendingPhantom>,
+    pub window_returns: std::collections::VecDeque<f64>,
+    pub price_history: std::collections::VecDeque<f64>,
+    pub ws_handle: Option<JoinHandle<()>>,                   // current-window Polymarket WS task
+}
+
+impl BotState {
+    pub fn add_pos(&mut self, p: OpenPosition) { self.positions.push(p); }
+    pub fn rolling_vol(&self, floor: f64, cap: f64, min_samples: usize) -> f64 {
+        if self.window_returns.len() < min_samples { return cap; }
+        let n = self.window_returns.len() as f64;
+        let mean = self.window_returns.iter().sum::<f64>() / n;
+        let var = self.window_returns.iter().map(|x| (x - mean).powi(2)).sum::<f64>() / n;
+        var.sqrt().clamp(floor, cap)
+    }
 }
 
 impl GengarBot {
@@ -76,10 +112,12 @@ impl GengarBot {
 
             // --- Window transition detection (NO nested lock re-acquisition) ---
             let transition: bool;
+            let prev_window: i64;
             let need_unhalt_check: bool;
             {
                 let mut st = self.state.write().await;
                 transition = window_ts != st.current_window;
+                prev_window = st.current_window;
                 if transition {
                     info!("[GENGAR] window transition: {} → {}", st.current_window, window_ts);
                     st.current_window = window_ts;
@@ -90,6 +128,24 @@ impl GengarBot {
 
             if need_unhalt_check && self.try_unhalt().await {
                 self.state.write().await.clob_halted = false;
+            }
+
+            // On transition: resolve prior window, then rotate WS to new window.
+            if transition && prev_window > 0 {
+                self.resolve_window(prev_window).await;
+                match market::fetch_current(&self.gamma, (self.cfg.market_period_secs / 60) as u32).await {
+                    Ok(Some(m)) => self.rotate_ws_subscription(&m).await,
+                    Ok(None)    => warn!("[GENGAR] no active market for window {}", window_ts),
+                    Err(e)      => warn!("[GENGAR] gamma fetch failed: {}", e),
+                }
+            } else if transition {
+                // First-ever window of this run — no prior window to resolve, but
+                // still rotate WS to subscribe to the current window's tokens.
+                match market::fetch_current(&self.gamma, (self.cfg.market_period_secs / 60) as u32).await {
+                    Ok(Some(m)) => self.rotate_ws_subscription(&m).await,
+                    Ok(None)    => warn!("[GENGAR] no active market for window {}", window_ts),
+                    Err(e)      => warn!("[GENGAR] gamma fetch failed: {}", e),
+                }
             }
 
             // --- Capture opening price (separate lock acquisition) ---
@@ -140,6 +196,182 @@ impl GengarBot {
         }
     }
 
-    /// Stub — filled in Task 20.
-    async fn maybe_enter(&self, _secs_remaining: u64) -> Result<()> { Ok(()) }
+    /// Tear down the previous window's Polymarket WS task and spawn a new one
+    /// subscribed to the new window's Up/Down token IDs. Called on transition.
+    pub async fn rotate_ws_subscription(&self, market: &crate::polymarket::gamma::ActiveMarket) {
+        let tokens = vec![market.token_id_up.clone(), market.token_id_down.clone()];
+        let cache = self.poly_prices.clone();
+
+        let new_handle = tokio::spawn(async move {
+            if let Err(e) = crate::polymarket::ws::run_ws(tokens, cache).await {
+                tracing::warn!("[GENGAR][POLY-WS] task ended: {}", e);
+            }
+        });
+
+        let mut st = self.state.write().await;
+        if let Some(prev) = st.ws_handle.take() { prev.abort(); }
+        st.ws_handle = Some(new_handle);
+    }
+
+    async fn maybe_enter(&self, secs_remaining: u64) -> Result<()> {
+        // Skip if there's an open position for the current window
+        {
+            let st = self.state.read().await;
+            if st.positions.iter().any(|p| p.window_ts == st.current_window) { return Ok(()); }
+        }
+
+        // Health check before every entry attempt. Reference: bot.py:669.
+        if let Some(exec) = &self.executor {
+            if let Err(e) = exec.clob.get_ok().await {
+                self.handle_error(&e.to_string()).await;
+                return Ok(());
+            }
+        }
+
+        // Get fresh prices
+        let btc_now = self.price.read().await.price;
+        let st = self.state.read().await;
+        if st.opening_price <= 0.0 || btc_now <= 0.0 { return Ok(()); }
+        let btc_delta_pct = (btc_now - st.opening_price) / st.opening_price;
+        let vol = st.rolling_vol(self.cfg.vol.floor, self.cfg.vol.cap, 6);
+        let bankroll = st.bankroll;
+        let window_ts = st.current_window;
+        drop(st);
+
+        // Fetch active market for the current window
+        let market = match market::fetch_current(&self.gamma, (self.cfg.market_period_secs / 60) as u32).await? {
+            Some(m) => m,
+            None => return Ok(()),
+        };
+        let token_id = if btc_delta_pct > 0.0 { &market.token_id_up } else { &market.token_id_down };
+
+        // Get current market price (WS cache preferred; fallback to /price)
+        let market_price = {
+            let cache = self.poly_prices.read().await;
+            cache.get(token_id).map(|t| t.best_ask)
+        };
+        let market_price = match market_price {
+            Some(p) if p > 0.0 && p < 1.0 => p,
+            _ => match &self.executor {
+                Some(e) => e.clob.calculate_market_price(token_id, crate::polymarket::types::Side::Buy, 25.0).await?,
+                None => return Ok(()),  // dry-run without an exec client can't fetch price
+            }
+        };
+
+        // Strategy gate
+        let signal = match strategy::evaluate(btc_delta_pct, secs_remaining, market_price, bankroll, vol, &self.cfg.strategy) {
+            Ok(s)  => s,
+            Err(r) => {
+                let _ = self.tracker.log_signal(crate::tracker::SignalRow {
+                    ts: Tracker::now_iso(), window_ts, side: if btc_delta_pct > 0.0 {"UP".into()} else {"DOWN".into()},
+                    btc_delta_pct, seconds_remaining: secs_remaining, market_price,
+                    true_prob: 0.0, edge: 0.0, bet_usd: 0.0, vol,
+                    skip_reason: format!("{:?}", r),
+                });
+                return Ok(());
+            }
+        };
+
+        // Log accepted signal
+        let _ = self.tracker.log_signal(crate::tracker::SignalRow {
+            ts: Tracker::now_iso(), window_ts, side: signal.side.into(),
+            btc_delta_pct, seconds_remaining: secs_remaining, market_price,
+            true_prob: signal.true_prob, edge: signal.edge, bet_usd: signal.bet_usd, vol,
+            skip_reason: "".into(),
+        });
+
+        if self.cfg.dry_run { info!("[GENGAR][DRY] would buy {} ${:.2}@{:.3}", signal.side, signal.bet_usd, market_price); return Ok(()); }
+
+        // Live entry
+        let exec = self.executor.as_ref().unwrap();
+        let res = exec.buy(token_id, market_price, signal.bet_usd).await?;
+        use crate::executor::OrderResultStatus::*;
+        match res.status {
+            Filled | GhostFilled => {
+                let mut st = self.state.write().await;
+                let opening_price = st.opening_price;
+                st.add_pos(OpenPosition {
+                    window_ts, token_id: token_id.clone(), side: signal.side.into(),
+                    price: market_price, shares: res.shares, usd_spent: res.usd_spent,
+                    order_id: res.order_id.unwrap_or_default(),
+                    opening_price,
+                });
+                st.bankroll -= res.usd_spent;
+                let _ = self.tracker.log_trade(crate::tracker::TradeRow {
+                    ts: Tracker::now_iso(), window_ts, side: signal.side.into(),
+                    price: market_price, shares: res.shares, usd: res.usd_spent,
+                    order_id: "buy".into(), status: format!("{:?}", res.status),
+                    resolution: None, pnl: None,
+                });
+            }
+            Partial => warn!("[GENGAR][EXEC] partial buy (unexpected for GTC limit)"),
+            Failed(reason) => {
+                warn!("[GENGAR][EXEC] buy failed: {}", reason);
+                self.handle_error(&reason).await;
+            }
+        }
+        Ok(())
+    }
+
+    /// Reference: bot.py:682-694, captured once at startup, no auto-reset.
+    pub async fn check_daily_loss(&self) {
+        let mut st = self.state.write().await;
+        let session_pnl = st.bankroll - st.session_start_balance;
+        if session_pnl <= -self.cfg.risk.daily_loss_limit {
+            warn!("[GENGAR] daily-loss CB tripped: session PnL=${:.2} ≤ -${}",
+                  session_pnl, self.cfg.risk.daily_loss_limit);
+            st.daily_loss_halted = true;
+        }
+    }
+
+    /// Called at every window boundary. Reference: bot.py:827-1012.
+    /// (Resolution detection is large; this is a minimal stub for MVP — fills via
+    /// claim-sell at $0.99, defers via _pending_phantom on no-balance-movement.)
+    pub async fn resolve_window(&self, prev_window_ts: i64) {
+        let prev_positions: Vec<OpenPosition> = {
+            let st = self.state.read().await;
+            st.positions.iter().filter(|p| p.window_ts == prev_window_ts).cloned().collect()
+        };
+        for pos in prev_positions {
+            // For dry-run or no-executor: resolve by comparing BTC opening vs current.
+            if self.cfg.dry_run || self.executor.is_none() {
+                let cur_btc = self.price.read().await.price;
+                let won = match pos.side.as_str() {
+                    "UP"   => cur_btc >= pos.opening_price,
+                    "DOWN" => cur_btc <  pos.opening_price,
+                    _ => false,
+                };
+                let pnl = if won { pos.shares as f64 * (1.0 - pos.price) } else { -pos.usd_spent };
+                info!("[GENGAR][DRY-RESOLVE] {} pnl=${:.2}", if won {"WIN"} else {"LOSS"}, pnl);
+                let mut st = self.state.write().await;
+                st.realized_pnl_today += pnl;
+                st.positions.retain(|p| p.window_ts != prev_window_ts);
+                continue;
+            }
+            // Live: try claim-sell at $0.99 to detect WIN; on no-movement defer to _pending_phantom.
+            let exec = self.executor.as_ref().unwrap();
+            let balance_before = exec.clob.get_balance_allowance(&exec.creds, exec.eoa_addr).await.unwrap_or(0.0);
+            let claim = exec.sell(&pos.token_id, 0.99, pos.shares).await;
+            match claim {
+                Ok(r) if matches!(r.status, crate::executor::OrderResultStatus::Filled | crate::executor::OrderResultStatus::GhostFilled) => {
+                    let pnl = r.usd_spent - pos.usd_spent;
+                    let mut st = self.state.write().await;
+                    st.realized_pnl_today += pnl;
+                    st.positions.retain(|p| p.window_ts != prev_window_ts);
+                }
+                Ok(_) => {
+                    // Possibly a phantom; defer.
+                    let mut st = self.state.write().await;
+                    st.pending_phantom = Some(PendingPhantom {
+                        window_ts: prev_window_ts,
+                        claim_order_id: pos.order_id.clone(),
+                        expected_proceeds: pos.shares as f64 * 0.99,
+                        balance_before,
+                    });
+                }
+                Err(e) => warn!("[GENGAR][RESOLVE] claim-sell error: {}", e),
+            }
+        }
+        self.check_daily_loss().await;
+    }
 }
