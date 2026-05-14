@@ -21,6 +21,12 @@ pub const HALT_ERROR_PATTERNS: &[&str] = &[
     "request exception", "service not ready", "status_code=none",
 ];
 
+/// Brownian-model volatility fallback used until enough rolling samples accumulate.
+/// Reference: gengar bot.py:76 `_vol_fallback = 0.12`. This is the v13 calibrated
+/// value — the README documents that 0.08 was 2x overconfident and 0.15 was too
+/// conservative; 0.12 is the sweet spot.
+pub const VOL_FALLBACK: f64 = 0.12;
+
 pub struct GengarBot {
     pub cfg: Arc<GengarConfig>,
     pub gamma: GammaClient,
@@ -70,8 +76,14 @@ pub struct BotState {
 
 impl BotState {
     pub fn add_pos(&mut self, p: OpenPosition) { self.positions.push(p); }
-    pub fn rolling_vol(&self, floor: f64, cap: f64, min_samples: usize) -> f64 {
-        if self.window_returns.len() < min_samples { return cap; }
+
+    /// Rolling stddev of `window_returns` in percentage points, clamped to
+    /// `[floor, cap]`. Falls back to `VOL_FALLBACK` (0.12) when fewer than
+    /// `max(6, rolling_windows / 2)` samples are present. Reference: gengar
+    /// bot.py:603-614 `_compute_realized_vol`.
+    pub fn rolling_vol(&self, floor: f64, cap: f64, rolling_windows: usize) -> f64 {
+        let min_samples = std::cmp::max(6, rolling_windows / 2);
+        if self.window_returns.len() < min_samples { return VOL_FALLBACK; }
         let n = self.window_returns.len() as f64;
         let mean = self.window_returns.iter().sum::<f64>() / n;
         let var = self.window_returns.iter().map(|x| (x - mean).powi(2)).sum::<f64>() / n;
@@ -113,11 +125,13 @@ impl GengarBot {
             // --- Window transition detection (NO nested lock re-acquisition) ---
             let transition: bool;
             let prev_window: i64;
+            let prev_opening_price: f64;
             let need_unhalt_check: bool;
             {
                 let mut st = self.state.write().await;
                 transition = window_ts != st.current_window;
                 prev_window = st.current_window;
+                prev_opening_price = st.opening_price;
                 if transition {
                     info!("[GENGAR] window transition: {} → {}", st.current_window, window_ts);
                     st.current_window = window_ts;
@@ -132,7 +146,7 @@ impl GengarBot {
 
             // On transition: resolve prior window, then rotate WS to new window.
             if transition && prev_window > 0 {
-                self.resolve_window(prev_window).await;
+                self.resolve_window(prev_window, prev_opening_price).await;
                 match market::fetch_current(&self.gamma, (self.cfg.market_period_secs / 60) as u32).await {
                     Ok(Some(m)) => self.rotate_ws_subscription(&m).await,
                     Ok(None)    => warn!("[GENGAR] no active market for window {}", window_ts),
@@ -232,8 +246,10 @@ impl GengarBot {
         let btc_now = self.price.read().await.price;
         let st = self.state.read().await;
         if st.opening_price <= 0.0 || btc_now <= 0.0 { return Ok(()); }
-        let btc_delta_pct = (btc_now - st.opening_price) / st.opening_price;
-        let vol = st.rolling_vol(self.cfg.vol.floor, self.cfg.vol.cap, 6);
+        // Percentage points (matches gengar bot.py:317 `* 100`). strategy::evaluate
+        // expects the same units as vol — both in percent points.
+        let btc_delta_pct = (btc_now - st.opening_price) / st.opening_price * 100.0;
+        let vol = st.rolling_vol(self.cfg.vol.floor, self.cfg.vol.cap, self.cfg.vol.rolling_windows);
         let bankroll = st.bankroll;
         let window_ts = st.current_window;
         drop(st);
@@ -324,10 +340,86 @@ impl GengarBot {
         }
     }
 
+    /// Resolve any `pending_phantom` from a prior window's deferred claim-sell.
+    /// Reference: gengar bot.py:436-485. Compares current real balance to the
+    /// captured `balance_before` snapshot: if it grew by ≥ 50% of expected
+    /// proceeds, the claim landed (WIN); otherwise it's confirmed LOSS. Either
+    /// way the phantom and the originating position are cleared from state.
+    pub async fn resolve_pending_phantom(&self) {
+        let phantom = {
+            let mut st = self.state.write().await;
+            st.pending_phantom.take()
+        };
+        let Some(pp) = phantom else { return; };
+
+        // Dry-run / no executor: matches bot.py:482-485 (treat as loss).
+        if self.cfg.dry_run || self.executor.is_none() {
+            let mut st = self.state.write().await;
+            let cost: f64 = st.positions.iter()
+                .filter(|p| p.window_ts == pp.window_ts)
+                .map(|p| p.usd_spent).sum();
+            st.realized_pnl_today -= cost;
+            st.positions.retain(|p| p.window_ts != pp.window_ts);
+            warn!("[GENGAR] phantom dry-resolved as LOSS (${:.2})", cost);
+            return;
+        }
+
+        let exec = self.executor.as_ref().unwrap();
+        let real_bal = match exec.clob.get_balance_allowance(&exec.creds, exec.eoa_addr).await {
+            Ok(b) => b,
+            Err(e) => {
+                warn!("[GENGAR] phantom balance check failed: {} (leaving phantom unresolved)", e);
+                // Put phantom back so the next transition can retry.
+                self.state.write().await.pending_phantom = Some(pp);
+                return;
+            }
+        };
+        let balance_increase = (real_bal - pp.balance_before).max(0.0);
+
+        let mut st = self.state.write().await;
+        let cost: f64 = st.positions.iter()
+            .filter(|p| p.window_ts == pp.window_ts)
+            .map(|p| p.usd_spent).sum();
+        if balance_increase > pp.expected_proceeds * 0.50 {
+            let pnl = balance_increase - cost;
+            st.realized_pnl_today += pnl;
+            st.bankroll = real_bal;
+            info!("[GENGAR] phantom resolved: WIN +${:.2}", pnl);
+        } else {
+            st.realized_pnl_today -= cost;
+            st.bankroll = real_bal;
+            warn!("[GENGAR] phantom confirmed: LOSS -${:.2}", cost);
+        }
+        st.positions.retain(|p| p.window_ts != pp.window_ts);
+    }
+
+    /// Push the just-closed window's |return%| into the rolling-vol buffer.
+    /// Reference: gengar bot.py:487-492.
+    pub async fn push_closing_delta(&self, prev_opening_price: f64, closing_btc_price: f64) {
+        if prev_opening_price <= 0.0 || closing_btc_price <= 0.0 { return; }
+        let closing_delta = ((closing_btc_price - prev_opening_price) / prev_opening_price).abs() * 100.0;
+        let mut st = self.state.write().await;
+        st.window_returns.push_back(closing_delta);
+        let cap = self.cfg.vol.rolling_windows;
+        while st.window_returns.len() > cap {
+            st.window_returns.pop_front();
+        }
+    }
+
     /// Called at every window boundary. Reference: bot.py:827-1012.
-    /// (Resolution detection is large; this is a minimal stub for MVP — fills via
-    /// claim-sell at $0.99, defers via _pending_phantom on no-balance-movement.)
-    pub async fn resolve_window(&self, prev_window_ts: i64) {
+    /// Order: (1) resolve any deferred phantom from the PRIOR window, (2) push
+    /// the just-closed window's |return%| into the rolling-vol buffer, (3) try
+    /// claim-selling open positions at $0.99 — fills count as WIN, no-balance-
+    /// movement gets deferred into `pending_phantom` for the next transition.
+    pub async fn resolve_window(&self, prev_window_ts: i64, prev_opening_price: f64) {
+        // (1) Resolve any pending phantom captured at a previous transition.
+        self.resolve_pending_phantom().await;
+
+        // (2) Record closing delta for rolling-vol producer.
+        let closing_btc = self.price.read().await.price;
+        self.push_closing_delta(prev_opening_price, closing_btc).await;
+
+        // (3) Resolve open positions from the just-closed window.
         let prev_positions: Vec<OpenPosition> = {
             let st = self.state.read().await;
             st.positions.iter().filter(|p| p.window_ts == prev_window_ts).cloned().collect()
@@ -335,10 +427,9 @@ impl GengarBot {
         for pos in prev_positions {
             // For dry-run or no-executor: resolve by comparing BTC opening vs current.
             if self.cfg.dry_run || self.executor.is_none() {
-                let cur_btc = self.price.read().await.price;
                 let won = match pos.side.as_str() {
-                    "UP"   => cur_btc >= pos.opening_price,
-                    "DOWN" => cur_btc <  pos.opening_price,
+                    "UP"   => closing_btc >= pos.opening_price,
+                    "DOWN" => closing_btc <  pos.opening_price,
                     _ => false,
                 };
                 let pnl = if won { pos.shares as f64 * (1.0 - pos.price) } else { -pos.usd_spent };
@@ -348,7 +439,7 @@ impl GengarBot {
                 st.positions.retain(|p| p.window_ts != prev_window_ts);
                 continue;
             }
-            // Live: try claim-sell at $0.99 to detect WIN; on no-movement defer to _pending_phantom.
+            // Live: try claim-sell at $0.99 to detect WIN; on no-movement defer to pending_phantom.
             let exec = self.executor.as_ref().unwrap();
             let balance_before = exec.clob.get_balance_allowance(&exec.creds, exec.eoa_addr).await.unwrap_or(0.0);
             let claim = exec.sell(&pos.token_id, 0.99, pos.shares).await;
@@ -360,7 +451,8 @@ impl GengarBot {
                     st.positions.retain(|p| p.window_ts != prev_window_ts);
                 }
                 Ok(_) => {
-                    // Possibly a phantom; defer.
+                    // Possibly a phantom; defer (position stays in state.positions until phantom
+                    // is resolved at the NEXT transition — see resolve_pending_phantom).
                     let mut st = self.state.write().await;
                     st.pending_phantom = Some(PendingPhantom {
                         window_ts: prev_window_ts,

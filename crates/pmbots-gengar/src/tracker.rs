@@ -3,7 +3,7 @@
 
 use anyhow::{Context, Result};
 use chrono::Utc;
-use csv::Writer;
+use csv::{Writer, WriterBuilder};
 use serde::Serialize;
 use std::fs::{create_dir_all, File, OpenOptions};
 use std::path::PathBuf;
@@ -34,12 +34,18 @@ impl Tracker {
 
     fn writer_for(&self, name: &str) -> Result<Writer<File>> {
         let path = self.log_dir.join(name);
+        // Skip header emission when appending to an existing non-empty file —
+        // otherwise resumed sessions write a duplicate header mid-file, breaking
+        // pandas / spreadsheet imports.
+        let has_existing_data = path.metadata().map(|m| m.len() > 0).unwrap_or(false);
         let f = OpenOptions::new()
             .create(true)
             .append(true)
             .open(&path)
             .with_context(|| format!("open {:?}", path))?;
-        Ok(Writer::from_writer(f))
+        Ok(WriterBuilder::new()
+            .has_headers(!has_existing_data)
+            .from_writer(f))
     }
 
     pub fn log_signal(&self, row: SignalRow) -> Result<()> {
