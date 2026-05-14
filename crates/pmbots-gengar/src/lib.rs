@@ -5,3 +5,4 @@
 pub mod polymarket;
 pub mod strategy;
 pub mod market;
+pub mod price_feed;
