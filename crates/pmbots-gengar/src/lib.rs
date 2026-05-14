@@ -4,3 +4,4 @@
 
 pub mod polymarket;
 pub mod strategy;
+pub mod market;
