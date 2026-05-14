@@ -8,3 +8,4 @@ pub mod market;
 pub mod price_feed;
 pub mod tracker;
 pub mod telegram_notifier;
+pub mod config;
