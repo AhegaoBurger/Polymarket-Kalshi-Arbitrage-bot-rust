@@ -369,6 +369,64 @@ pub struct OrderStatus {
     pub size_matched: Option<String>,
 }
 
+// ============================================================================
+// Read endpoints: balance + market-order expected fill price.
+// ----------------------------------------------------------------------------
+// Mirrors `executor.py:104-126` in gengar Python:
+//   - GET /balance-allowance?asset_type=COLLATERAL → USDC balance (6 decimals)
+//   - GET /price?token_id=&side=&amount= → expected fill price for a market
+//     order of the given USD notional on the given side.
+// ============================================================================
+
+impl ClobClient {
+    /// GET /balance-allowance for COLLATERAL (USDC). Returns dollars as f64.
+    /// Polygon USDC has 6 decimals; we divide the response by 1e6.
+    pub async fn get_balance_allowance(&self, creds: &ApiCreds, eoa_addr: Address) -> Result<f64> {
+        let path = "/balance-allowance";
+        let body = "";
+        let mut headers = Self::auth_headers(creds, "GET", path, body)?;
+        headers.insert("POLY_ADDRESS", HeaderValue::from_str(&format!("{:?}", eoa_addr))?);
+
+        let resp = self.http
+            .get(format!("{}{}?asset_type=COLLATERAL", CLOB_BASE, path))
+            .headers(headers).send().await
+            .context("GET /balance-allowance")?;
+        if !resp.status().is_success() {
+            anyhow::bail!("GET /balance-allowance → {}", resp.status());
+        }
+        let v: serde_json::Value = resp.json().await?;
+        let raw = v.get("balance").and_then(|b| b.as_str())
+            .ok_or_else(|| anyhow::anyhow!("missing balance field"))?;
+        let micro: u64 = raw.parse().context("parse balance")?;
+        Ok(micro as f64 / 1_000_000.0)
+    }
+
+    /// GET /price — server-side expected fill price for a market order
+    /// of the given USD notional on the given side.
+    pub async fn calculate_market_price(
+        &self,
+        token_id: &str,
+        side: Side,
+        amount_usd: f64,
+    ) -> Result<f64> {
+        let url = format!(
+            "{}/price?token_id={}&side={}&amount={}",
+            CLOB_BASE,
+            token_id,
+            match side { Side::Buy => "BUY", Side::Sell => "SELL" },
+            amount_usd
+        );
+        let resp = self.http.get(&url).send().await
+            .context("GET /price")?;
+        if !resp.status().is_success() {
+            anyhow::bail!("GET /price → {}", resp.status());
+        }
+        let v: serde_json::Value = resp.json().await?;
+        v.get("price").and_then(|p| p.as_str()).and_then(|s| s.parse::<f64>().ok())
+            .ok_or_else(|| anyhow::anyhow!("price field missing/invalid"))
+    }
+}
+
 #[cfg(test)]
 mod tests {
     use super::*;
@@ -385,6 +443,15 @@ mod tests {
         assert!(ua.contains("Chrome/"));
         assert!(ua.contains("Safari/"));
         assert!(!ua.to_lowercase().contains("python"));
+    }
+
+    #[test]
+    fn calculate_market_price_url_format() {
+        let url = format!(
+            "{}/price?token_id={}&side={}&amount={}",
+            CLOB_BASE, "tok-123", "BUY", 25.0
+        );
+        assert_eq!(url, "https://clob.polymarket.com/price?token_id=tok-123&side=BUY&amount=25");
     }
 }
 
