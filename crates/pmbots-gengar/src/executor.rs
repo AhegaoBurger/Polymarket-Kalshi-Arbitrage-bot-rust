@@ -103,6 +103,7 @@ pub struct Executor {
     pub eoa_addr: Address,
     pub wallet: LocalWallet,
     pub sig_type: SignatureType,
+    pub chain_id: u64,
 }
 
 impl Executor {
@@ -131,7 +132,7 @@ impl Executor {
         }
         let balance_before = self
             .clob
-            .get_balance_allowance(&self.creds, self.eoa_addr)
+            .get_balance_allowance(&self.creds, self.eoa_addr, self.sig_type)
             .await
             .context("balance_before")?;
 
@@ -145,7 +146,7 @@ impl Executor {
         };
         let signed = match self
             .clob
-            .create_order(args, self.sig_type, &self.wallet)
+            .create_order(args, self.sig_type, self.chain_id, &self.wallet, false)
             .await
         {
             Ok(s) => s,
@@ -172,7 +173,7 @@ impl Executor {
                 sleep(Duration::from_secs(3)).await;
                 let bal_after = self
                     .clob
-                    .get_balance_allowance(&self.creds, self.eoa_addr)
+                    .get_balance_allowance(&self.creds, self.eoa_addr, self.sig_type)
                     .await
                     .unwrap_or(balance_before);
                 let dropped = balance_before - bal_after;
@@ -203,7 +204,7 @@ impl Executor {
                 sleep(Duration::from_secs(3)).await;
                 let bal_after = self
                     .clob
-                    .get_balance_allowance(&self.creds, self.eoa_addr)
+                    .get_balance_allowance(&self.creds, self.eoa_addr, self.sig_type)
                     .await
                     .unwrap_or(balance_before);
                 let dropped = balance_before - bal_after;
@@ -236,7 +237,7 @@ impl Executor {
             sleep(Duration::from_millis(BUY_VERIFY_SLEEP_MS)).await;
             let bal_after = self
                 .clob
-                .get_balance_allowance(&self.creds, self.eoa_addr)
+                .get_balance_allowance(&self.creds, self.eoa_addr, self.sig_type)
                 .await
                 .unwrap_or(balance_before);
             let dropped = balance_before - bal_after;
@@ -254,8 +255,8 @@ impl Executor {
                     usd_spent: dropped,
                 });
             }
-            // Fallback: poll /order/{id}.
-            if let Ok(status) = self
+            // Fallback: poll /data/order/{id}.
+            if let Ok(Some(status)) = self
                 .clob
                 .get_order(&self.creds, self.eoa_addr, &order_id)
                 .await
@@ -315,7 +316,7 @@ impl Executor {
         }
         let balance_before = self
             .clob
-            .get_balance_allowance(&self.creds, self.eoa_addr)
+            .get_balance_allowance(&self.creds, self.eoa_addr, self.sig_type)
             .await
             .context("sell balance_before")?;
 
@@ -329,7 +330,7 @@ impl Executor {
         };
         let signed = self
             .clob
-            .create_order(args, self.sig_type, &self.wallet)
+            .create_order(args, self.sig_type, self.chain_id, &self.wallet, false)
             .await
             .context("sell create_order")?;
         let post_result = self
@@ -352,7 +353,7 @@ impl Executor {
                 sleep(Duration::from_secs(3)).await;
                 let bal_after = self
                     .clob
-                    .get_balance_allowance(&self.creds, self.eoa_addr)
+                    .get_balance_allowance(&self.creds, self.eoa_addr, self.sig_type)
                     .await
                     .unwrap_or(balance_before);
                 let received = bal_after - balance_before;
@@ -378,7 +379,7 @@ impl Executor {
         sleep(Duration::from_secs(3)).await;
         let bal_after = self
             .clob
-            .get_balance_allowance(&self.creds, self.eoa_addr)
+            .get_balance_allowance(&self.creds, self.eoa_addr, self.sig_type)
             .await
             .unwrap_or(balance_before);
         let received = bal_after - balance_before;
@@ -397,6 +398,20 @@ impl Executor {
                 shares: shares_left.max(0),
                 usd_spent: received,
             });
+        }
+        // The sell GTC limit is resting on the order book. Cancel it so it
+        // doesn't fill asynchronously after the strategy has moved on (matches
+        // gengar executor.py:433-434). Best-effort: log on failure, don't
+        // propagate — the bot can still operate; phantom resolution at the
+        // next window boundary will reconcile any retroactive fill.
+        if let Err(e) = self
+            .clob
+            .cancel_order(&self.creds, self.eoa_addr, &order_id)
+            .await
+        {
+            warn!("[GENGAR][EXEC] cancel UNVERIFIED_SELL order {} failed: {}", order_id, e);
+        } else {
+            info!("[GENGAR][EXEC] cancelled UNVERIFIED_SELL order {}", order_id);
         }
         Ok(OrderResult {
             status: OrderResultStatus::Failed("UNVERIFIED_SELL".into()),

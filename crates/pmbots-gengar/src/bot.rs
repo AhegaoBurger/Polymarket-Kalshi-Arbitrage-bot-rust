@@ -15,10 +15,20 @@ use crate::price_feed::SharedPrice;
 use crate::strategy;
 use crate::tracker::Tracker;
 use crate::executor::Executor;
+use crate::telegram_notifier::Telegram;
 
 pub const CLOB_HALT_THRESHOLD: u32 = 3;        // bot.py:816-823
+/// Patterns from gengar Python's py-clob-client exception strings. Kept for
+/// reference; our Rust port now also halts on raw `get_ok()` failures and HTTP
+/// 5xx from order endpoints (the Rust error strings don't necessarily contain
+/// these phrases — matching by pattern alone would never trip the CB).
 pub const HALT_ERROR_PATTERNS: &[&str] = &[
     "request exception", "service not ready", "status_code=none",
+    "/ok",             // our Rust ClobClient::get_ok bubbles up with this in the chain
+    "POST /order",     // wraps POST failures
+    "GET /balance-allowance",
+    "GET /data/order",
+    "/order →",        // 4xx/5xx wire failures from any endpoint
 ];
 
 /// Brownian-model volatility fallback used until enough rolling samples accumulate.
@@ -34,6 +44,7 @@ pub struct GengarBot {
     pub poly_prices: TokenPriceCache,
     pub tracker: Arc<Tracker>,
     pub executor: Option<Executor>,           // None in DRY_RUN
+    pub telegram: Option<Telegram>,           // None if env vars unset
     pub state: Arc<RwLock<BotState>>,
 }
 
@@ -57,6 +68,22 @@ pub struct PendingPhantom {
     pub balance_before: f64,
 }
 
+/// Captured at the moment a buy returns `UNVERIFIED_BUY`. The next window
+/// transition rechecks balance against `balance_before`; if it dropped by
+/// > $1, register the shares as a real position retroactively.
+/// Reference: gengar bot.py:493-516.
+#[derive(Debug, Clone)]
+pub struct PendingBuy {
+    pub window_ts: i64,
+    pub token_id: String,
+    pub side: String,
+    pub price: f64,
+    pub shares: i64,
+    pub balance_before: f64,
+    pub opening_price: f64,
+    pub order_id: String,
+}
+
 #[derive(Default)]
 pub struct BotState {
     pub current_window: i64,
@@ -72,41 +99,144 @@ pub struct BotState {
     pub window_returns: std::collections::VecDeque<f64>,
     pub price_history: std::collections::VecDeque<f64>,
     pub ws_handle: Option<JoinHandle<()>>,                   // current-window Polymarket WS task
+    pub pending_buy: Option<PendingBuy>,                     // UNVERIFIED_BUY retroactive ctx
 }
 
 impl BotState {
     pub fn add_pos(&mut self, p: OpenPosition) { self.positions.push(p); }
 
-    /// Rolling stddev of `window_returns` in percentage points, clamped to
-    /// `[floor, cap]`. Falls back to `VOL_FALLBACK` (0.12) when fewer than
-    /// `max(6, rolling_windows / 2)` samples are present. Reference: gengar
-    /// bot.py:603-614 `_compute_realized_vol`.
+    /// Rolling **sample** stddev of `window_returns` in percentage points,
+    /// clamped to `[floor, cap]`. Falls back to `VOL_FALLBACK` (0.12) when
+    /// fewer than `max(6, rolling_windows / 2)` samples are present.
+    ///
+    /// Reference: gengar bot.py:603-614 `_compute_realized_vol`, which calls
+    /// `statistics.stdev` — sample stddev with Bessel's correction (`/ (n-1)`),
+    /// NOT population stddev. Using `/ n` here would systematically report vol
+    /// ~4.4% lower at N=12 → higher z → overconfident probabilities → entries
+    /// the Python version would skip.
     pub fn rolling_vol(&self, floor: f64, cap: f64, rolling_windows: usize) -> f64 {
         let min_samples = std::cmp::max(6, rolling_windows / 2);
         if self.window_returns.len() < min_samples { return VOL_FALLBACK; }
         let n = self.window_returns.len() as f64;
+        if n < 2.0 { return VOL_FALLBACK; }
         let mean = self.window_returns.iter().sum::<f64>() / n;
-        let var = self.window_returns.iter().map(|x| (x - mean).powi(2)).sum::<f64>() / n;
+        let var = self.window_returns.iter().map(|x| (x - mean).powi(2)).sum::<f64>() / (n - 1.0);
         var.sqrt().clamp(floor, cap)
     }
 }
 
 impl GengarBot {
+    /// `initial_balance` is the real on-chain USDC for live runs (fetched by
+    /// the caller via `clob.get_balance_allowance`), or the configured notional
+    /// bankroll for dry-run. Both `bankroll` and `session_start_balance` start
+    /// at this value so Kelly sizes against real money and the daily-loss CB
+    /// has the right baseline.
     pub async fn new(
         cfg: Arc<GengarConfig>,
         price: SharedPrice,
         tracker: Arc<Tracker>,
         executor: Option<Executor>,
+        initial_balance: f64,
     ) -> Result<Self> {
         let gamma = GammaClient::new()?;
         let poly_prices = ws::new_cache();
-        let session_start_balance = cfg.strategy.min_bet; // placeholder; overwritten on first window when live
+        let telegram = Telegram::from_env();
+        if telegram.is_some() {
+            info!("[GENGAR] telegram alerts enabled");
+        }
         let state = Arc::new(RwLock::new(BotState {
-            bankroll: session_start_balance,
-            session_start_balance,
+            bankroll: initial_balance,
+            session_start_balance: initial_balance,
             ..Default::default()
         }));
-        Ok(Self { cfg, gamma, price, poly_prices, tracker, executor, state })
+        Ok(Self { cfg, gamma, price, poly_prices, tracker, executor, telegram, state })
+    }
+
+    /// Best-effort Telegram alert. No-op if telegram isn't configured.
+    fn tg(&self, msg: &str) {
+        if let Some(t) = &self.telegram {
+            t.send(msg);
+        }
+    }
+
+    /// Resolve any pending `UNVERIFIED_BUY` from the prior window by re-checking
+    /// the on-chain balance. If it dropped by > $1 since the buy attempt, the
+    /// order actually settled — retroactively register the position.
+    /// Reference: gengar bot.py:493-516.
+    pub async fn resolve_pending_buy(&self) {
+        let Some(pb) = self.state.write().await.pending_buy.take() else { return; };
+        let Some(exec) = &self.executor else {
+            // Dry-run: clear without registering.
+            return;
+        };
+        let real_bal = match exec
+            .clob
+            .get_balance_allowance(&exec.creds, exec.eoa_addr, exec.sig_type)
+            .await
+        {
+            Ok(b) => b,
+            Err(e) => {
+                // Put it back so we retry next transition.
+                warn!("[GENGAR] pending-buy balance check failed: {} — retrying next window", e);
+                self.state.write().await.pending_buy = Some(pb);
+                return;
+            }
+        };
+        let dropped = pb.balance_before - real_bal;
+        if dropped > 1.0 {
+            let pos = OpenPosition {
+                window_ts: pb.window_ts,
+                token_id: pb.token_id,
+                side: pb.side.clone(),
+                price: pb.price,
+                shares: pb.shares,
+                usd_spent: dropped,
+                order_id: pb.order_id,
+                opening_price: pb.opening_price,
+            };
+            info!(
+                "[GENGAR] retroactively registered UNVERIFIED_BUY as filled: -${:.2} @ window {}",
+                dropped, pb.window_ts
+            );
+            self.tg(&format!("retroactive-buy detected: {} @ {:.3} = -${:.2}", pb.side, pb.price, dropped));
+            let mut st = self.state.write().await;
+            st.add_pos(pos);
+            // Don't deduct again from bankroll — balance is now authoritative
+            // (and the window-boundary balance sync will overwrite it).
+        } else {
+            info!(
+                "[GENGAR] pending-buy from window {} did not settle (balance unchanged) — discarding",
+                pb.window_ts
+            );
+        }
+    }
+
+    /// Window-boundary balance sync: overwrite internal `bankroll` with the
+    /// on-chain USDC balance if drift exceeds $0.50. Reference: gengar
+    /// bot.py:549-558. The chain is authoritative; we only re-anchor when the
+    /// drift is meaningful so we don't fight noise.
+    pub async fn sync_balance_from_chain(&self) {
+        let Some(exec) = &self.executor else { return; };
+        let real_bal = match exec
+            .clob
+            .get_balance_allowance(&exec.creds, exec.eoa_addr, exec.sig_type)
+            .await
+        {
+            Ok(b) => b,
+            Err(e) => {
+                warn!("[GENGAR] window-boundary balance sync failed: {}", e);
+                return;
+            }
+        };
+        let mut st = self.state.write().await;
+        let drift = (real_bal - st.bankroll).abs();
+        if drift > 0.50 {
+            info!(
+                "[GENGAR] balance sync: internal=${:.2} chain=${:.2} drift=${:.2} — adopting chain",
+                st.bankroll, real_bal, drift
+            );
+            st.bankroll = real_bal;
+        }
     }
 
     /// Main event loop. Returns when the process is asked to stop (Ctrl-C).
@@ -264,7 +394,7 @@ impl GengarBot {
         // Get current market price (WS cache preferred; fallback to /price)
         let market_price = {
             let cache = self.poly_prices.read().await;
-            cache.get(token_id).map(|t| t.best_ask)
+            cache.get(token_id).map(|book| book.best_ask())
         };
         let market_price = match market_price {
             Some(p) if p > 0.0 && p < 1.0 => p,
@@ -322,6 +452,28 @@ impl GengarBot {
             }
             Partial => warn!("[GENGAR][EXEC] partial buy (unexpected for GTC limit)"),
             Failed(reason) => {
+                // UNVERIFIED_BUY: capture context for retroactive detection
+                // at the next window transition. Reference: bot.py:493-516.
+                if reason.contains("UNVERIFIED_BUY") {
+                    let opening_price = self.state.read().await.opening_price;
+                    let exec_ref = self.executor.as_ref().unwrap();
+                    let balance_before = exec_ref
+                        .clob
+                        .get_balance_allowance(&exec_ref.creds, exec_ref.eoa_addr, exec_ref.sig_type)
+                        .await
+                        .unwrap_or(0.0);
+                    self.state.write().await.pending_buy = Some(PendingBuy {
+                        window_ts,
+                        token_id: token_id.clone(),
+                        side: signal.side.into(),
+                        price: market_price,
+                        shares: res.shares,
+                        balance_before,
+                        opening_price,
+                        order_id: res.order_id.unwrap_or_default(),
+                    });
+                    warn!("[GENGAR] captured UNVERIFIED_BUY for retroactive detection at next window");
+                }
                 warn!("[GENGAR][EXEC] buy failed: {}", reason);
                 self.handle_error(&reason).await;
             }
@@ -365,7 +517,7 @@ impl GengarBot {
         }
 
         let exec = self.executor.as_ref().unwrap();
-        let real_bal = match exec.clob.get_balance_allowance(&exec.creds, exec.eoa_addr).await {
+        let real_bal = match exec.clob.get_balance_allowance(&exec.creds, exec.eoa_addr, exec.sig_type).await {
             Ok(b) => b,
             Err(e) => {
                 warn!("[GENGAR] phantom balance check failed: {} (leaving phantom unresolved)", e);
@@ -407,17 +559,25 @@ impl GengarBot {
     }
 
     /// Called at every window boundary. Reference: bot.py:827-1012.
-    /// Order: (1) resolve any deferred phantom from the PRIOR window, (2) push
-    /// the just-closed window's |return%| into the rolling-vol buffer, (3) try
-    /// claim-selling open positions at $0.99 — fills count as WIN, no-balance-
-    /// movement gets deferred into `pending_phantom` for the next transition.
+    /// Order: (1) resolve any pending UNVERIFIED_BUY retroactively, (2) resolve
+    /// any deferred phantom from a prior window, (3) push the just-closed
+    /// window's |return%| into the rolling-vol buffer, (4) sync bankroll from
+    /// chain, (5) try claim-selling open positions at $0.99 — fills count as
+    /// WIN, no-balance-movement gets deferred into `pending_phantom` for the
+    /// next transition.
     pub async fn resolve_window(&self, prev_window_ts: i64, prev_opening_price: f64) {
-        // (1) Resolve any pending phantom captured at a previous transition.
+        // (1) Retroactively detect a previously-UNVERIFIED_BUY that settled.
+        self.resolve_pending_buy().await;
+
+        // (2) Resolve any pending phantom captured at a previous transition.
         self.resolve_pending_phantom().await;
 
-        // (2) Record closing delta for rolling-vol producer.
+        // (3) Record closing delta for rolling-vol producer.
         let closing_btc = self.price.read().await.price;
         self.push_closing_delta(prev_opening_price, closing_btc).await;
+
+        // (4) Sync internal bankroll to on-chain USDC balance.
+        self.sync_balance_from_chain().await;
 
         // (3) Resolve open positions from the just-closed window.
         let prev_positions: Vec<OpenPosition> = {
@@ -433,7 +593,9 @@ impl GengarBot {
                     _ => false,
                 };
                 let pnl = if won { pos.shares as f64 * (1.0 - pos.price) } else { -pos.usd_spent };
-                info!("[GENGAR][DRY-RESOLVE] {} pnl=${:.2}", if won {"WIN"} else {"LOSS"}, pnl);
+                let outcome = if won { "WIN" } else { "LOSS" };
+                info!("[GENGAR][DRY-RESOLVE] {} pnl=${:.2}", outcome, pnl);
+                self.tg(&format!("[DRY] {} {} pnl=${:.2}", outcome, pos.side, pnl));
                 let mut st = self.state.write().await;
                 st.realized_pnl_today += pnl;
                 st.positions.retain(|p| p.window_ts != prev_window_ts);
@@ -441,11 +603,14 @@ impl GengarBot {
             }
             // Live: try claim-sell at $0.99 to detect WIN; on no-movement defer to pending_phantom.
             let exec = self.executor.as_ref().unwrap();
-            let balance_before = exec.clob.get_balance_allowance(&exec.creds, exec.eoa_addr).await.unwrap_or(0.0);
+            let balance_before = exec.clob.get_balance_allowance(&exec.creds, exec.eoa_addr, exec.sig_type).await.unwrap_or(0.0);
             let claim = exec.sell(&pos.token_id, 0.99, pos.shares).await;
             match claim {
                 Ok(r) if matches!(r.status, crate::executor::OrderResultStatus::Filled | crate::executor::OrderResultStatus::GhostFilled) => {
                     let pnl = r.usd_spent - pos.usd_spent;
+                    let outcome = if pnl >= 0.0 { "WIN" } else { "LOSS" };
+                    info!("[GENGAR][RESOLVE] {} {} pnl=${:+.2}", outcome, pos.side, pnl);
+                    self.tg(&format!("{} {} pnl=${:+.2}", outcome, pos.side, pnl));
                     let mut st = self.state.write().await;
                     st.realized_pnl_today += pnl;
                     st.positions.retain(|p| p.window_ts != prev_window_ts);

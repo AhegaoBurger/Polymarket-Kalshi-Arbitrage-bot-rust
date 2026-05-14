@@ -2,53 +2,107 @@
 
 use anyhow::{Context, Result};
 use std::sync::Arc;
-use tracing::info;
+use tracing::{info, warn};
 use tracing_subscriber::EnvFilter;
 use pmbots_gengar::{
-    config::GengarConfig,
     bot::GengarBot,
-    price_feed::{self, new_state},
-    polymarket::{clob::{ClobClient, SignatureType}, ws as poly_ws},
-    tracker::Tracker,
+    config::GengarConfig,
     executor::Executor,
+    polymarket::clob::{ClobClient, SignatureType},
+    price_feed::{self, new_state},
+    tracker::Tracker,
 };
 use ethers::signers::{LocalWallet, Signer};
 use ethers::types::Address;
-use std::str::FromStr;
+
+/// Polygon mainnet chain ID. V2 only supports Polygon (per arb's working code).
+const POLYGON_CHAIN_ID: u64 = 137;
 
 #[tokio::main]
 async fn main() -> Result<()> {
     tracing_subscriber::fmt()
-        .with_env_filter(EnvFilter::try_from_default_env()
-            .unwrap_or_else(|_| EnvFilter::new("info,pmbots_gengar=debug")))
+        .with_env_filter(
+            EnvFilter::try_from_default_env()
+                .unwrap_or_else(|_| EnvFilter::new("info,pmbots_gengar=debug")),
+        )
         .init();
 
     let cfg = Arc::new(GengarConfig::from_env().context("load config")?);
-    info!("[GENGAR] config: dry_run={} period={}s log_dir={:?}",
-          cfg.dry_run, cfg.market_period_secs, cfg.log_dir);
+    info!(
+        "[GENGAR] config: dry_run={} period={}s log_dir={:?}",
+        cfg.dry_run, cfg.market_period_secs, cfg.log_dir
+    );
 
     let tracker = Arc::new(Tracker::new(&cfg.log_dir, cfg.log_executions)?);
-    tracker.log_session(pmbots_gengar::tracker::SessionRow {
-        ts: Tracker::now_iso(), event: "start".into(),
-        bankroll: cfg.strategy.min_bet, trades_count: 0, wins: 0, losses: 0, session_pnl: 0.0,
-    }).ok();
 
     let price_state = new_state();
     tokio::spawn(price_feed::run_ws(price_state.clone()));
     tokio::spawn(price_feed::run_rest_fallback(price_state.clone()));
 
-    let executor: Option<Executor> = if cfg.dry_run {
-        None
+    // Build executor + fetch starting balance from chain (Batch 3 I1+I4).
+    let (executor, initial_balance): (Option<Executor>, f64) = if cfg.dry_run {
+        // Dry-run: use a notional starting bankroll so Kelly sizing works.
+        // Matches gengar Python's behavior — bot.py:71 `BANKROLL` env var
+        // defaults to $100 in dry-run.
+        (None, 100.0)
     } else {
         let wallet: LocalWallet = cfg.private_key.parse().context("parse private key")?;
         let eoa_addr: Address = cfg.safe_address.unwrap_or_else(|| wallet.address());
-        let sig_type = if cfg.safe_address.is_some() { SignatureType::Safe } else { SignatureType::Eoa };
+        let sig_type = if cfg.safe_address.is_some() {
+            SignatureType::Safe
+        } else {
+            SignatureType::Eoa
+        };
         let clob = ClobClient::new()?;
-        let creds = ClobClient::derive_api_creds(&wallet).await?;
-        Some(Executor { clob, creds, eoa_addr, wallet, sig_type })
+
+        // V2 path: get/create API creds via SERVER (not local HMAC).
+        let creds = clob
+            .get_or_derive_api_creds(&wallet, POLYGON_CHAIN_ID)
+            .await
+            .context("get_or_derive_api_creds")?;
+
+        // Fetch real USDC balance at startup so bankroll + session_start_balance
+        // reflect actual wallet state. Without this, Kelly sizes against a $5
+        // placeholder and the daily-loss CB compares against the wrong baseline.
+        let bal = clob
+            .get_balance_allowance(&creds, eoa_addr, sig_type)
+            .await
+            .context("fetch starting USDC balance")?;
+        info!("[GENGAR] startup balance: ${:.2} (eoa={:?})", bal, eoa_addr);
+        if bal < cfg.strategy.min_bet {
+            warn!(
+                "[GENGAR] startup balance ${:.2} is below GENGAR_MIN_BET=${} — \
+                 entries will be filtered by Kelly's min-bet floor",
+                bal, cfg.strategy.min_bet
+            );
+        }
+
+        let exec = Executor {
+            clob,
+            creds,
+            eoa_addr,
+            wallet,
+            sig_type,
+            chain_id: POLYGON_CHAIN_ID,
+        };
+        (Some(exec), bal)
     };
 
-    let bot = Arc::new(GengarBot::new(cfg, price_state, tracker.clone(), executor).await?);
+    tracker
+        .log_session(pmbots_gengar::tracker::SessionRow {
+            ts: Tracker::now_iso(),
+            event: "start".into(),
+            bankroll: initial_balance,
+            trades_count: 0,
+            wins: 0,
+            losses: 0,
+            session_pnl: 0.0,
+        })
+        .ok();
+
+    let bot = Arc::new(
+        GengarBot::new(cfg, price_state, tracker.clone(), executor, initial_balance).await?,
+    );
     let bot_clone = bot.clone();
 
     // bot.run() drives window transitions; the Polymarket WS subscription is
@@ -57,9 +111,16 @@ async fn main() -> Result<()> {
     let _ = tokio::spawn(async move { bot_clone.run().await });
     tokio::signal::ctrl_c().await.ok();
     info!("[GENGAR] shutdown requested");
-    tracker.log_session(pmbots_gengar::tracker::SessionRow {
-        ts: Tracker::now_iso(), event: "stop".into(),
-        bankroll: 0.0, trades_count: 0, wins: 0, losses: 0, session_pnl: 0.0,
-    }).ok();
+    tracker
+        .log_session(pmbots_gengar::tracker::SessionRow {
+            ts: Tracker::now_iso(),
+            event: "stop".into(),
+            bankroll: 0.0,
+            trades_count: 0,
+            wins: 0,
+            losses: 0,
+            session_pnl: 0.0,
+        })
+        .ok();
     Ok(())
 }
