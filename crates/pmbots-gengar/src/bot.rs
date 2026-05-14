@@ -100,6 +100,12 @@ pub struct BotState {
     pub price_history: std::collections::VecDeque<f64>,
     pub ws_handle: Option<JoinHandle<()>>,                   // current-window Polymarket WS task
     pub pending_buy: Option<PendingBuy>,                     // UNVERIFIED_BUY retroactive ctx
+    /// Last window we ATTEMPTED an entry in (regardless of fill outcome).
+    /// Matches gengar bot.py's `_trade_attempted` semantics: one entry attempt
+    /// per window — strategy keeps re-evaluating until a signal clears all
+    /// gates, then locks for the rest of the window. Without this, dry-run
+    /// spams "would buy" on every 500ms tick once a signal qualifies.
+    pub last_attempted_window: i64,
 }
 
 impl BotState {
@@ -358,10 +364,12 @@ impl GengarBot {
     }
 
     async fn maybe_enter(&self, secs_remaining: u64) -> Result<()> {
-        // Skip if there's an open position for the current window
+        // Skip if we've already attempted (or filled) an entry this window.
+        // One trade per window per gengar bot.py's `_trade_attempted` lock.
         {
             let st = self.state.read().await;
             if st.positions.iter().any(|p| p.window_ts == st.current_window) { return Ok(()); }
+            if st.last_attempted_window == st.current_window { return Ok(()); }
         }
 
         // Health check before every entry attempt. Reference: bot.py:669.
@@ -425,6 +433,11 @@ impl GengarBot {
             true_prob: signal.true_prob, edge: signal.edge, bet_usd: signal.bet_usd, vol,
             skip_reason: "".into(),
         });
+
+        // Lock entry for this window — one attempt per window regardless of
+        // fill success/failure/dry-run. Cleared automatically when the next
+        // window transition causes `current_window != last_attempted_window`.
+        self.state.write().await.last_attempted_window = window_ts;
 
         if self.cfg.dry_run { info!("[GENGAR][DRY] would buy {} ${:.2}@{:.3}", signal.side, signal.bet_usd, market_price); return Ok(()); }
 
