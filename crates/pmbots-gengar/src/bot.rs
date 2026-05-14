@@ -439,7 +439,30 @@ impl GengarBot {
         // window transition causes `current_window != last_attempted_window`.
         self.state.write().await.last_attempted_window = window_ts;
 
-        if self.cfg.dry_run { info!("[GENGAR][DRY] would buy {} ${:.2}@{:.3}", signal.side, signal.bet_usd, market_price); return Ok(()); }
+        if self.cfg.dry_run {
+            info!(
+                "[GENGAR][DRY] would buy {} ${:.2}@{:.3}",
+                signal.side, signal.bet_usd, market_price
+            );
+            // Add a virtual position so resolve_window can compute and log the
+            // WIN/LOSS outcome at the next transition. Without this, dry-run
+            // shows entries but never resolutions — defeating the purpose of
+            // dry-run validation.
+            let shares = (signal.bet_usd / market_price).round() as i64;
+            let opening_price = self.state.read().await.opening_price;
+            let mut st = self.state.write().await;
+            st.add_pos(OpenPosition {
+                window_ts,
+                token_id: token_id.clone(),
+                side: signal.side.into(),
+                price: market_price,
+                shares,
+                usd_spent: signal.bet_usd,
+                order_id: "dry-run".into(),
+                opening_price,
+            });
+            return Ok(());
+        }
 
         // Live entry
         let exec = self.executor.as_ref().unwrap();
