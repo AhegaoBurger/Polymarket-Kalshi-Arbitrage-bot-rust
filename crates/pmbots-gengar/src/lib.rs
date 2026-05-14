@@ -3,3 +3,4 @@
 //! Reference: ~/personal/gengar_polymarket_bot@9f49a07.
 
 pub mod polymarket;
+pub mod strategy;
