@@ -4,3 +4,4 @@
 //! 2026-05-14-gengar-rust-port-design.md §Out of Scope).
 
 pub mod types;
+pub mod gamma;
