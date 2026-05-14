@@ -10,3 +10,4 @@ pub mod tracker;
 pub mod telegram_notifier;
 pub mod config;
 pub mod executor;
+pub mod bot;
