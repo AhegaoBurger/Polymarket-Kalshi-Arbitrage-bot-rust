@@ -53,11 +53,33 @@ async fn main() -> Result<()> {
         let signer_addr: Address = wallet.address();
         // funder = the Safe proxy that holds the USDC. None for EOA flow.
         let funder: Option<Address> = cfg.safe_address;
-        let sig_type = if funder.is_some() {
+
+        // Signature type detection. Order of precedence:
+        //   1. GENGAR_SIG_TYPE env var override (0/1/2) — needed when the
+        //      auto-detect picks the wrong proxy type. Polymarket V2's "maker
+        //      address not allowed, please use the deposit wallet flow" error
+        //      means the auto-detected sig_type doesn't match how the funder
+        //      was registered server-side. Email/Magic logins → 1 (POLY_PROXY).
+        //   2. funder == signer or no funder set → 0 (EOA, direct trading).
+        //   3. funder != signer → 2 (Safe / browser wallet) by default. Users
+        //      who connected via Polymarket's email/Magic flow should set
+        //      GENGAR_SIG_TYPE=1 explicitly.
+        let sig_type = if let Ok(raw) = std::env::var("GENGAR_SIG_TYPE") {
+            match raw.trim() {
+                "0" => SignatureType::Eoa,
+                "1" => SignatureType::PolyProxy,
+                "2" => SignatureType::Safe,
+                _ => anyhow::bail!("GENGAR_SIG_TYPE must be 0, 1, or 2 (got {:?})", raw),
+            }
+        } else if funder.is_some() {
             SignatureType::Safe
         } else {
             SignatureType::Eoa
         };
+        info!(
+            "[GENGAR] signature type: {:?} (override via GENGAR_SIG_TYPE if Polymarket rejects orders)",
+            sig_type
+        );
         let clob = ClobClient::new()?;
 
         // V2 path: get/create API creds via SERVER (not local HMAC). L1
