@@ -172,20 +172,44 @@ def main() -> int:
         ),
     ]
 
-    nonce_payload = relayer.get_nonce(eoa_address, TransactionType.WALLET.value)
-    wallet_nonce = str(nonce_payload["nonce"])
-    deadline = str(int(time.time()) + 600)  # 10 minutes
-    print(f"\n[2/2] Submitting WALLET batch with {len(calls)} approvals "
-          f"(nonce={wallet_nonce}, deadline={deadline})...")
+    # After WALLET-CREATE returns STATE_MINED, the relayer's internal wallet
+    # registry has a brief indexing lag before it acknowledges the new wallet
+    # for batch submissions. Retry with backoff to wait it out.
+    print(f"\n[2/2] Submitting WALLET batch with {len(calls)} approvals...")
 
-    batch_resp = relayer.execute_deposit_wallet_batch(
-        calls=calls,
-        wallet_address=deposit_wallet,
-        nonce=wallet_nonce,
-        deadline=deadline,
-    )
-    batch_result = batch_resp.wait()
-    print(f"      Batch result: {batch_result}")
+    from py_builder_relayer_client.exceptions import RelayerApiException
+
+    batch_result = None
+    for attempt in range(1, 7):  # up to 6 attempts = ~63s total wait
+        # Fresh nonce + deadline each attempt; the deadline only needs to be
+        # in the future at the time the relayer processes it.
+        nonce_payload = relayer.get_nonce(eoa_address, TransactionType.WALLET.value)
+        wallet_nonce = str(nonce_payload["nonce"])
+        deadline = str(int(time.time()) + 600)
+        print(f"      Attempt {attempt}: nonce={wallet_nonce}, deadline={deadline}")
+        try:
+            batch_resp = relayer.execute_deposit_wallet_batch(
+                calls=calls,
+                wallet_address=deposit_wallet,
+                nonce=wallet_nonce,
+                deadline=deadline,
+            )
+            batch_result = batch_resp.wait()
+            print(f"      Batch result: {batch_result}")
+            break
+        except RelayerApiException as exc:
+            msg = str(exc)
+            transient = (
+                "not registered" in msg
+                or "wallet registry" in msg
+                or "not yet indexed" in msg
+            )
+            if not transient or attempt == 6:
+                raise
+            wait_s = min(2 ** attempt, 30)
+            print(f"      Transient registry error: {msg.splitlines()[0]}")
+            print(f"      Waiting {wait_s}s for relayer indexer to catch up...")
+            time.sleep(wait_s)
 
     print("\n" + "=" * 64)
     print("Setup complete.")
