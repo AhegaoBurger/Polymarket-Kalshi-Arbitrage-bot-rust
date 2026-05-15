@@ -69,7 +69,8 @@ async fn main() -> Result<()> {
                 "0" => SignatureType::Eoa,
                 "1" => SignatureType::PolyProxy,
                 "2" => SignatureType::Safe,
-                _ => anyhow::bail!("GENGAR_SIG_TYPE must be 0, 1, or 2 (got {:?})", raw),
+                "3" => SignatureType::Poly1271,
+                _ => anyhow::bail!("GENGAR_SIG_TYPE must be 0, 1, 2, or 3 (got {:?})", raw),
             }
         } else if funder.is_some() {
             SignatureType::Safe

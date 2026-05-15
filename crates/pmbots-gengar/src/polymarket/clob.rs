@@ -43,6 +43,31 @@ const ZERO_ADDRESS: &str = "0x0000000000000000000000000000000000000000";
 const ZERO_BYTES32: &str =
     "0x0000000000000000000000000000000000000000000000000000000000000000";
 
+// ============================================================================
+// POLY_1271 (sig_type=3) — Solady EIP-1271 wrapped signature constants.
+// Ported verbatim from rs-clob-client-v2 src/clob/client.rs:68-84.
+// Used only for sig_type=3 (deposit wallet flow). For sig_type 0/1/2 the
+// standard EIP-712 path remains untouched.
+// ============================================================================
+const DEPOSIT_WALLET_NAME: &str = "DepositWallet";
+const DEPOSIT_WALLET_VERSION: &str = "1";
+const ORDER_TYPE_STRING: &str = concat!(
+    "Order(uint256 salt,address maker,address signer,uint256 tokenId,",
+    "uint256 makerAmount,uint256 takerAmount,uint8 side,uint8 signatureType,",
+    "uint256 timestamp,bytes32 metadata,bytes32 builder)"
+);
+const SOLADY_TYPE_STRING: &str = concat!(
+    "TypedDataSign(Order contents,string name,string version,uint256 chainId,",
+    "address verifyingContract,bytes32 salt)",
+    "Order(uint256 salt,address maker,address signer,uint256 tokenId,",
+    "uint256 makerAmount,uint256 takerAmount,uint8 side,uint8 signatureType,",
+    "uint256 timestamp,bytes32 metadata,bytes32 builder)"
+);
+const DOMAIN_TYPE_STRING: &str =
+    "EIP712Domain(string name,string version,uint256 chainId,address verifyingContract)";
+const CTF_EXCHANGE_NAME: &str = "Polymarket CTF Exchange";
+const CTF_EXCHANGE_VERSION_V2: &str = "2";
+
 type HmacSha256 = Hmac<Sha256>;
 
 // ============================================================================
@@ -115,14 +140,19 @@ pub struct ApiCreds {
 // ============================================================================
 
 /// Polymarket CLOB signature types.
-///   0 = EOA               (funder == signer)
+///   0 = EOA               (funder == signer, direct trading)
 ///   1 = POLY_PROXY        (Magic / email login proxy)
-///   2 = POLY_GNOSIS_SAFE  (MetaMask / external-wallet Safe)
+///   2 = POLY_GNOSIS_SAFE  (MetaMask / browser-wallet Gnosis Safe, V2 legacy)
+///   3 = POLY_1271         (Polymarket-managed deposit wallet, Solady wrapped
+///                          EIP-1271 signing. V2-only, **required** by V2
+///                          production for accounts created via polymarket.com
+///                          UI per "deposit wallet flow" error.)
 #[derive(Debug, Clone, Copy)]
 pub enum SignatureType {
     Eoa = 0,
     PolyProxy = 1,
     Safe = 2,
+    Poly1271 = 3,
 }
 
 // ============================================================================
@@ -368,6 +398,161 @@ fn order_typed_data(
 }
 
 // ============================================================================
+// POLY_1271 HASH HELPERS
+//
+// Ports from rs-clob-client-v2's `sign_poly1271_order` (src/clob/client.rs:1794).
+// Standard EIP-712 with a Solady `TypedDataSign` wrapper. The outer digest is
+// signed by the EOA's private key; the wallet contract verifies it on-chain
+// via EIP-1271's `isValidSignature`.
+//
+// Wire format of the final signature in the order body:
+//   "0x" || inner_sig_hex(130) || domain_sep_hex(64) || contents_hash_hex(64)
+//        || ORDER_TYPE_STRING_hex(2*N) || contents_type_len_u16_be_hex(4)
+// ============================================================================
+
+fn keccak256(bytes: &[u8]) -> [u8; 32] {
+    use tiny_keccak::{Hasher, Keccak};
+    let mut k = Keccak::v256();
+    let mut out = [0u8; 32];
+    k.update(bytes);
+    k.finalize(&mut out);
+    out
+}
+
+fn pad32_address(addr: Address) -> [u8; 32] {
+    let mut out = [0u8; 32];
+    out[12..].copy_from_slice(addr.as_bytes());
+    out
+}
+
+fn pad32_u8(n: u8) -> [u8; 32] {
+    let mut out = [0u8; 32];
+    out[31] = n;
+    out
+}
+
+fn pad32_u64(n: u64) -> [u8; 32] {
+    let mut out = [0u8; 32];
+    out[24..].copy_from_slice(&n.to_be_bytes());
+    out
+}
+
+fn pad32_u128(n: u128) -> [u8; 32] {
+    let mut out = [0u8; 32];
+    out[16..].copy_from_slice(&n.to_be_bytes());
+    out
+}
+
+fn pad32_u256(n: U256) -> [u8; 32] {
+    let mut out = [0u8; 32];
+    n.to_big_endian(&mut out);
+    out
+}
+
+/// `hashStruct(Order)` per EIP-712. Order of fields matches `ORDER_TYPE_STRING`.
+#[allow(clippy::too_many_arguments)]
+fn hash_struct_order(
+    salt: u128,
+    maker: Address,
+    signer_addr: Address,
+    token_id_u256: U256,
+    maker_amount: u128,
+    taker_amount: u128,
+    side: u8,
+    signature_type: u8,
+    timestamp_ms: u64,
+) -> [u8; 32] {
+    let type_hash = keccak256(ORDER_TYPE_STRING.as_bytes());
+    let zero32 = [0u8; 32]; // metadata + builder = zero
+
+    let mut buf = Vec::with_capacity(32 * 12);
+    buf.extend_from_slice(&type_hash);
+    buf.extend_from_slice(&pad32_u128(salt));
+    buf.extend_from_slice(&pad32_address(maker));
+    buf.extend_from_slice(&pad32_address(signer_addr));
+    buf.extend_from_slice(&pad32_u256(token_id_u256));
+    buf.extend_from_slice(&pad32_u128(maker_amount));
+    buf.extend_from_slice(&pad32_u128(taker_amount));
+    buf.extend_from_slice(&pad32_u8(side));
+    buf.extend_from_slice(&pad32_u8(signature_type));
+    buf.extend_from_slice(&pad32_u64(timestamp_ms));
+    buf.extend_from_slice(&zero32); // metadata
+    buf.extend_from_slice(&zero32); // builder
+    keccak256(&buf)
+}
+
+/// `hashStruct(EIP712Domain)` for the CTF Exchange V2 domain.
+fn hash_struct_ctf_domain_v2(chain_id: u64, verifying_contract: Address) -> [u8; 32] {
+    let type_hash = keccak256(DOMAIN_TYPE_STRING.as_bytes());
+    let name_hash = keccak256(CTF_EXCHANGE_NAME.as_bytes());
+    let version_hash = keccak256(CTF_EXCHANGE_VERSION_V2.as_bytes());
+
+    let mut buf = Vec::with_capacity(32 * 5);
+    buf.extend_from_slice(&type_hash);
+    buf.extend_from_slice(&name_hash);
+    buf.extend_from_slice(&version_hash);
+    buf.extend_from_slice(&pad32_u64(chain_id));
+    buf.extend_from_slice(&pad32_address(verifying_contract));
+    keccak256(&buf)
+}
+
+/// `hashStruct(TypedDataSign)` per Solady. Order of fields matches
+/// `SOLADY_TYPE_STRING`. The `signer` here is the EIP-712 Order's `signer`
+/// field — for Poly1271 that's the funder (deposit wallet), NOT the EOA.
+fn hash_struct_typed_data_sign(
+    contents_hash: &[u8; 32],
+    chain_id: u64,
+    order_signer: Address,
+) -> [u8; 32] {
+    let type_hash = keccak256(SOLADY_TYPE_STRING.as_bytes());
+    let dw_name_hash = keccak256(DEPOSIT_WALLET_NAME.as_bytes());
+    let dw_version_hash = keccak256(DEPOSIT_WALLET_VERSION.as_bytes());
+    let zero32 = [0u8; 32]; // salt = 0
+
+    let mut buf = Vec::with_capacity(32 * 7);
+    buf.extend_from_slice(&type_hash);
+    buf.extend_from_slice(contents_hash);
+    buf.extend_from_slice(&dw_name_hash);
+    buf.extend_from_slice(&dw_version_hash);
+    buf.extend_from_slice(&pad32_u64(chain_id));
+    buf.extend_from_slice(&pad32_address(order_signer));
+    buf.extend_from_slice(&zero32);
+    keccak256(&buf)
+}
+
+/// Compute the outer EIP-712 digest `keccak256(0x1901 || domain_sep || sign_struct_hash)`.
+fn compute_poly1271_digest(domain_sep: &[u8; 32], sign_struct_hash: &[u8; 32]) -> [u8; 32] {
+    let mut input = [0u8; 66];
+    input[0] = 0x19;
+    input[1] = 0x01;
+    input[2..34].copy_from_slice(domain_sep);
+    input[34..66].copy_from_slice(sign_struct_hash);
+    keccak256(&input)
+}
+
+/// Build the Solady wrapped signature for the wire body. Format:
+///   "0x" || inner_sig(65 bytes hex) || app_domain_separator(32 bytes hex)
+///        || contents_hash(32 bytes hex) || ORDER_TYPE_STRING(bytes hex)
+///        || contents_type_len(u16 big-endian, 2 bytes hex)
+fn build_poly1271_wire_signature(
+    inner_sig_bytes: &[u8],
+    domain_sep: &[u8; 32],
+    contents_hash: &[u8; 32],
+) -> String {
+    let order_type_hex = hex::encode(ORDER_TYPE_STRING.as_bytes());
+    let mut wrapped = String::with_capacity(2 + 130 + 64 + 64 + order_type_hex.len() + 4);
+    wrapped.push_str("0x");
+    wrapped.push_str(&hex::encode(inner_sig_bytes));
+    wrapped.push_str(&hex::encode(domain_sep));
+    wrapped.push_str(&hex::encode(contents_hash));
+    wrapped.push_str(&order_type_hex);
+    let len = u16::try_from(ORDER_TYPE_STRING.len())
+        .expect("ORDER_TYPE_STRING length fits in u16");
+    wrapped.push_str(&hex::encode(len.to_be_bytes()));
+    wrapped
+}
+
+// ============================================================================
 // CLIENT
 // ============================================================================
 
@@ -594,9 +779,16 @@ impl ClobClient {
             .ok_or_else(|| anyhow!("price field missing/invalid in response: {}", v))
     }
 
-    /// Build + sign a V2 EIP-712 order. The `neg_risk` flag selects the right
+    /// Build + sign a V2 order. The `neg_risk` flag selects the right
     /// `verifyingContract`. BTC Up/Down 5-min markets are NOT neg-risk; the
     /// gengar caller should pass `false`.
+    ///
+    /// For `sig_type` 0/1/2 this uses standard EIP-712 signing. For `sig_type=3`
+    /// (Poly1271 / deposit wallet flow) it uses Solady's `TypedDataSign`
+    /// wrapped scheme — the EOA still produces the inner ECDSA signature, but
+    /// the EIP-712 Order's `signer` field is the funder (deposit wallet) and
+    /// the wire signature is a Solady wrap that the wallet contract verifies
+    /// on-chain via `isValidSignature`.
     pub async fn create_order(
         &self,
         args: OrderArgs,
@@ -607,7 +799,16 @@ impl ClobClient {
     ) -> Result<SignedOrder> {
         let salt = generate_salt();
         let timestamp_ms = current_unix_ts_ms();
+
+        // Maker/signer mapping per signature type. Matches rs-clob-client-v2
+        // src/clob/order_builder.rs:160-169.
         let maker = args.funder.unwrap_or(args.maker_address);
+        let order_signer = match sig_type {
+            SignatureType::Poly1271 => args.funder.ok_or_else(|| {
+                anyhow!("Poly1271 (sig_type=3) requires a funder (deposit wallet) address")
+            })?,
+            _ => args.maker_address,
+        };
 
         // Integer-cents arithmetic. Reference: arb's get_order_amounts_buy/sell
         // (polymarket_clob.rs:338-356). price_bps = cents * 100; size_micro =
@@ -627,32 +828,64 @@ impl ClobClient {
             ),
         };
 
-        let exchange = get_exchange_address(chain_id, neg_risk)?;
+        let exchange_str = get_exchange_address(chain_id, neg_risk)?;
+        let exchange_addr: Address = exchange_str
+            .parse()
+            .context("parse exchange contract address")?;
         let maker_str = format!("{:?}", maker);
-        let signer_str = format!("{:?}", args.maker_address);
+        let signer_str = format!("{:?}", order_signer);
         let maker_amount_str = maker_amount.to_string();
         let taker_amount_str = taker_amount.to_string();
 
-        let typed = order_typed_data(
-            chain_id,
-            exchange,
-            &OrderTypedDataInput {
-                maker: &maker_str,
-                signer: &signer_str,
-                token_id: &args.token_id,
-                maker_amount: &maker_amount_str,
-                taker_amount: &taker_amount_str,
-                side: side_int,
-                signature_type: sig_type as i32,
+        let signature_hex = if matches!(sig_type, SignatureType::Poly1271) {
+            // Poly1271 wrapped Solady signing. Reference:
+            // rs-clob-client-v2 src/clob/client.rs:1794-1837.
+            let token_id_u256 = U256::from_dec_str(&args.token_id)
+                .context("parse token_id as u256 for Poly1271 hash")?;
+            let contents_hash = hash_struct_order(
                 salt,
+                maker,
+                order_signer,
+                token_id_u256,
+                maker_amount,
+                taker_amount,
+                side_int as u8,
+                sig_type as u8,
                 timestamp_ms,
-            },
-        )?;
-        let digest: H256 = typed
-            .encode_eip712()
-            .map_err(|e| anyhow!("eip712 encode: {:?}", e))?
-            .into();
-        let sig = wallet.sign_hash(digest).context("sign order")?;
+            );
+            let domain_sep = hash_struct_ctf_domain_v2(chain_id, exchange_addr);
+            let sign_struct_hash =
+                hash_struct_typed_data_sign(&contents_hash, chain_id, order_signer);
+            let outer_digest = compute_poly1271_digest(&domain_sep, &sign_struct_hash);
+
+            let inner_sig = wallet
+                .sign_hash(H256::from(outer_digest))
+                .context("sign Poly1271 outer digest with EOA")?;
+            build_poly1271_wire_signature(&inner_sig.to_vec(), &domain_sep, &contents_hash)
+        } else {
+            // Standard EIP-712 path for sig_type 0/1/2.
+            let typed = order_typed_data(
+                chain_id,
+                exchange_str,
+                &OrderTypedDataInput {
+                    maker: &maker_str,
+                    signer: &signer_str,
+                    token_id: &args.token_id,
+                    maker_amount: &maker_amount_str,
+                    taker_amount: &taker_amount_str,
+                    side: side_int,
+                    signature_type: sig_type as i32,
+                    salt,
+                    timestamp_ms,
+                },
+            )?;
+            let digest: H256 = typed
+                .encode_eip712()
+                .map_err(|e| anyhow!("eip712 encode: {:?}", e))?
+                .into();
+            let sig = wallet.sign_hash(digest).context("sign order")?;
+            format!("0x{}", hex::encode(sig.to_vec()))
+        };
 
         Ok(SignedOrder {
             order: OrderStruct {
@@ -670,7 +903,7 @@ impl ClobClient {
                 metadata: ZERO_BYTES32.into(),
                 builder: ZERO_BYTES32.into(),
             },
-            signature: format!("0x{}", hex::encode(sig.to_vec())),
+            signature: signature_hex,
         })
     }
 
@@ -872,6 +1105,96 @@ mod tests {
         // Side is the string "BUY" in the wire body, not the EIP-712 uint8.
         assert!(body.contains("\"side\":\"BUY\""));
         assert!(body.contains("\"signatureType\":0"));
+    }
+
+    #[tokio::test]
+    async fn poly1271_order_uses_funder_as_signer_and_wraps_signature() {
+        // Test wallet — DO NOT use for real funds.
+        let wallet: LocalWallet =
+            "ac0974bec39a17e36ba4a6b4d238ff944bacb478cbed5efcae784d7bf4f2ff80"
+                .parse()
+                .unwrap();
+        let client = ClobClient::new().unwrap();
+        let funder: Address = "0x95edf54270e16bb15f59229a65c4c9bfbccc189c"
+            .parse()
+            .unwrap();
+        let args = OrderArgs {
+            token_id: "12345".into(),
+            price: PriceCents(68),
+            size_shares: 10,
+            side: Side::Buy,
+            maker_address: wallet.address(),
+            funder: Some(funder),
+        };
+        let signed = client
+            .create_order(args, SignatureType::Poly1271, 137, &wallet, false)
+            .await
+            .unwrap();
+
+        // For Poly1271 the order's `signer` field is the FUNDER, not the EOA.
+        // Both `maker` and `signer` are the deposit wallet.
+        assert_eq!(signed.order.signature_type, 3);
+        assert_eq!(signed.order.maker.to_lowercase(), format!("{:?}", funder));
+        assert_eq!(signed.order.signer.to_lowercase(), format!("{:?}", funder));
+
+        // Integer-cents math still applies: 10 shares × $0.68 = 6_800_000 USDC micros.
+        assert_eq!(signed.order.maker_amount, "6800000");
+        assert_eq!(signed.order.taker_amount, "10000000");
+
+        // The wire signature is the Solady wrap, NOT a plain 65-byte ECDSA:
+        //   2 (0x) + 130 (inner sig hex) + 64 (domain sep hex) + 64 (contents hash hex)
+        //     + 2*ORDER_TYPE_STRING.len() + 4 (u16 length hex) = 264 + 2*N + 4
+        // ORDER_TYPE_STRING is the literal Solady V2 Order type, length 287.
+        let expected_len = 2 + 130 + 64 + 64 + (ORDER_TYPE_STRING.len() * 2) + 4;
+        assert_eq!(
+            signed.signature.len(),
+            expected_len,
+            "wrapped signature wire length should be {} chars (sig 65 || domain 32 || contents 32 || type_string {} || len 2 bytes)",
+            expected_len,
+            ORDER_TYPE_STRING.len()
+        );
+        assert!(signed.signature.starts_with("0x"));
+
+        // The trailing 4 hex chars (2 bytes big-endian) must encode the
+        // ORDER_TYPE_STRING length so the deposit wallet contract can parse it.
+        let len_hex = &signed.signature[signed.signature.len() - 4..];
+        let len_bytes = hex::decode(len_hex).unwrap();
+        let parsed_len = u16::from_be_bytes([len_bytes[0], len_bytes[1]]) as usize;
+        assert_eq!(parsed_len, ORDER_TYPE_STRING.len());
+    }
+
+    #[test]
+    fn poly1271_requires_funder() {
+        // sig_type=3 without funder should error rather than silently using
+        // the EOA address (which would always fail server-side).
+        // Synthetic check: the precondition is enforced inside create_order;
+        // we test by calling synchronously via a runtime.
+        let rt = tokio::runtime::Runtime::new().unwrap();
+        rt.block_on(async {
+            let wallet: LocalWallet =
+                "ac0974bec39a17e36ba4a6b4d238ff944bacb478cbed5efcae784d7bf4f2ff80"
+                    .parse()
+                    .unwrap();
+            let client = ClobClient::new().unwrap();
+            let args = OrderArgs {
+                token_id: "12345".into(),
+                price: PriceCents(68),
+                size_shares: 10,
+                side: Side::Buy,
+                maker_address: wallet.address(),
+                funder: None,
+            };
+            let result = client
+                .create_order(args, SignatureType::Poly1271, 137, &wallet, false)
+                .await;
+            assert!(result.is_err());
+            let err_msg = result.unwrap_err().to_string();
+            assert!(
+                err_msg.contains("Poly1271") && err_msg.contains("funder"),
+                "expected Poly1271/funder error, got: {}",
+                err_msg
+            );
+        });
     }
 
     #[test]
