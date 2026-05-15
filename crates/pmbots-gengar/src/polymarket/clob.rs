@@ -18,7 +18,7 @@
 use anyhow::{anyhow, Context, Result};
 use base64::engine::general_purpose::URL_SAFE;
 use base64::Engine;
-use ethers::signers::{LocalWallet, Signer};
+use ethers::signers::LocalWallet;
 use ethers::types::transaction::eip712::{Eip712, TypedData};
 use ethers::types::{Address, H256, U256};
 use hmac::{Hmac, Mac};
@@ -591,17 +591,28 @@ impl ClobClient {
 
     // -- L1 auth (for /auth/api-key, /auth/derive-api-key) --
 
+    /// Build L1 ClobAuth headers.
+    ///
+    /// `auth_address` is the address bound to the resulting API key — for
+    /// standard accounts this is the wallet's EOA; for Poly1271 deposit
+    /// wallets we pass the funder address so the API key is server-side
+    /// associated with the deposit wallet (matching the EIP-712 `signer`
+    /// field of the orders we'll later post). The actual ECDSA signature
+    /// is always produced by the EOA's private key — the server verifies
+    /// via EIP-1271 that the EOA is an authorized signer for the deposit
+    /// wallet contract.
     fn build_l1_headers(
         wallet: &LocalWallet,
         chain_id: u64,
         nonce: u64,
+        auth_address: Address,
     ) -> Result<HeaderMap> {
-        let address_str = format!("{:?}", wallet.address());
+        let auth_address_str = format!("{:?}", auth_address);
         let timestamp = current_unix_ts();
-        let digest = clob_auth_digest(chain_id, &address_str, timestamp, nonce)?;
+        let digest = clob_auth_digest(chain_id, &auth_address_str, timestamp, nonce)?;
         let sig = wallet.sign_hash(digest)?;
         let mut h = HeaderMap::new();
-        h.insert("POLY_ADDRESS", HeaderValue::from_str(&address_str)?);
+        h.insert("POLY_ADDRESS", HeaderValue::from_str(&auth_address_str)?);
         h.insert(
             "POLY_SIGNATURE",
             HeaderValue::from_str(&format!("0x{}", sig))?,
@@ -617,13 +628,18 @@ impl ClobClient {
     /// Try `POST /auth/api-key` first (V2-friendly: always creates fresh creds),
     /// fall back to `GET /auth/derive-api-key` (V1-idempotent). Each call uses
     /// a fresh nanosecond nonce — V2 rejects reused (signer, nonce) pairs.
+    ///
+    /// `auth_address` is the address the API key will be associated with:
+    /// pass the wallet's EOA for sig_type 0/1/2, the funder (deposit wallet)
+    /// for sig_type=3 (Poly1271).
     pub async fn get_or_derive_api_creds(
         &self,
         wallet: &LocalWallet,
         chain_id: u64,
+        auth_address: Address,
     ) -> Result<ApiCreds> {
         let nonce1 = fresh_nonce();
-        let headers1 = Self::build_l1_headers(wallet, chain_id, nonce1)?;
+        let headers1 = Self::build_l1_headers(wallet, chain_id, nonce1, auth_address)?;
         let resp1 = self
             .http
             .post(format!("{}/auth/api-key", CLOB_BASE))
@@ -648,7 +664,7 @@ impl ClobClient {
         );
 
         let nonce2 = fresh_nonce();
-        let headers2 = Self::build_l1_headers(wallet, chain_id, nonce2)?;
+        let headers2 = Self::build_l1_headers(wallet, chain_id, nonce2, auth_address)?;
         let resp2 = self
             .http
             .get(format!("{}/auth/derive-api-key", CLOB_BASE))

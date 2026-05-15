@@ -83,22 +83,35 @@ async fn main() -> Result<()> {
         );
         let clob = ClobClient::new()?;
 
-        // V2 path: get/create API creds via SERVER (not local HMAC). L1
-        // POLY_ADDRESS = signer EOA — that's what `wallet.address()` returns.
+        // For Poly1271 (sig_type=3), the API key must be associated with the
+        // FUNDER (deposit wallet) on the server side because order.signer ==
+        // funder. If the API key were bound to the EOA, V2 production rejects
+        // every order with "the order signer address has to be the address of
+        // the API KEY" (Issue #58). For all other sig types the API key is
+        // bound to the EOA (which is also order.signer).
+        let auth_address = match sig_type {
+            SignatureType::Poly1271 => funder.ok_or_else(|| {
+                anyhow::anyhow!("Poly1271 requires GENGAR_SAFE_ADDRESS (deposit wallet)")
+            })?,
+            _ => signer_addr,
+        };
+        info!(
+            "[GENGAR] API auth address: {:?} (signer EOA produces signatures; \
+             server verifies via EIP-1271 when this differs from the EOA)",
+            auth_address
+        );
+
+        // V2 path: get/create API creds via SERVER (not local HMAC).
         let creds = clob
-            .get_or_derive_api_creds(&wallet, POLYGON_CHAIN_ID)
+            .get_or_derive_api_creds(&wallet, POLYGON_CHAIN_ID, auth_address)
             .await
             .context("get_or_derive_api_creds")?;
 
         // Seed the CLOB's internal balance cache from on-chain state. REQUIRED
-        // for Poly1271 deposit wallets (sig_type=3) before the first order —
-        // without this the cache reads $0 and every order is rejected as
-        // "insufficient balance" by the CLOB before it ever reaches signature
-        // validation. Harmless no-op for legacy Proxy/Safe accounts.
-        // Reference: docs.polymarket.com/api-reference/deposit-wallets
-        //            §"Sync CLOB Balances".
+        // for Poly1271 deposit wallets (sig_type=3) before the first order.
+        // Harmless no-op for legacy Proxy/Safe accounts.
         if let Err(e) = clob
-            .update_balance_allowance(&creds, signer_addr, sig_type)
+            .update_balance_allowance(&creds, auth_address, sig_type)
             .await
         {
             warn!(
@@ -107,12 +120,9 @@ async fn main() -> Result<()> {
             );
         }
 
-        // Fetch real USDC balance at startup so bankroll + session_start_balance
-        // reflect actual wallet state. POLY_ADDRESS header = signer_addr (EOA);
-        // signature_type query param tells the server to resolve the balance
-        // for the linked deposit wallet / proxy / Safe.
+        // L2 POLY_ADDRESS must match the API key's address (auth_address).
         let bal = clob
-            .get_balance_allowance(&creds, signer_addr, sig_type)
+            .get_balance_allowance(&creds, auth_address, sig_type)
             .await
             .context("fetch starting USDC balance")?;
         info!(
@@ -131,6 +141,7 @@ async fn main() -> Result<()> {
             clob,
             creds,
             signer_addr,
+            auth_address,
             funder,
             wallet,
             sig_type,
