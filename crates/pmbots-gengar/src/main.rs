@@ -90,10 +90,27 @@ async fn main() -> Result<()> {
             .await
             .context("get_or_derive_api_creds")?;
 
+        // Seed the CLOB's internal balance cache from on-chain state. REQUIRED
+        // for Poly1271 deposit wallets (sig_type=3) before the first order —
+        // without this the cache reads $0 and every order is rejected as
+        // "insufficient balance" by the CLOB before it ever reaches signature
+        // validation. Harmless no-op for legacy Proxy/Safe accounts.
+        // Reference: docs.polymarket.com/api-reference/deposit-wallets
+        //            §"Sync CLOB Balances".
+        if let Err(e) = clob
+            .update_balance_allowance(&creds, signer_addr, sig_type)
+            .await
+        {
+            warn!(
+                "[GENGAR] update_balance_allowance failed: {} — continuing; balance read may be stale",
+                e
+            );
+        }
+
         // Fetch real USDC balance at startup so bankroll + session_start_balance
         // reflect actual wallet state. POLY_ADDRESS header = signer_addr (EOA);
         // signature_type query param tells the server to resolve the balance
-        // for the linked Safe proxy.
+        // for the linked deposit wallet / proxy / Safe.
         let bal = clob
             .get_balance_allowance(&creds, signer_addr, sig_type)
             .await

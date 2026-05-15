@@ -710,6 +710,41 @@ impl ClobClient {
         Ok(h)
     }
 
+    /// `GET /balance-allowance/update` — seed the CLOB's internal balance cache
+    /// from on-chain state. **Required before the first order for Poly1271
+    /// (sig_type=3) deposit wallets**, otherwise the CLOB sees the wallet as
+    /// having $0 and rejects every order. Reference:
+    /// docs.polymarket.com/api-reference/deposit-wallets §"Sync CLOB Balances".
+    ///
+    /// Safe to call for any sig_type — for legacy Proxy/Safe wallets the
+    /// update is a no-op refresh of an already-populated cache.
+    pub async fn update_balance_allowance(
+        &self,
+        creds: &ApiCreds,
+        eoa_addr: Address,
+        sig_type: SignatureType,
+    ) -> Result<()> {
+        let sign_path = "/balance-allowance/update";
+        let url = format!(
+            "{}{}?asset_type=COLLATERAL&signature_type={}",
+            CLOB_BASE, sign_path, sig_type as i32
+        );
+        let headers = Self::build_l2_headers(creds, eoa_addr, "GET", sign_path, "")?;
+        let resp = self
+            .http
+            .get(&url)
+            .headers(headers)
+            .send()
+            .await
+            .context("GET /balance-allowance/update")?;
+        let status = resp.status();
+        if !status.is_success() {
+            let body = resp.text().await.unwrap_or_default();
+            anyhow::bail!("GET /balance-allowance/update → {} {}", status, body);
+        }
+        Ok(())
+    }
+
     /// GET /balance-allowance (USDC, 6 decimals, returned as a string).
     ///
     /// The `signature_type` query param is CRITICAL: without it, Safe-proxy
