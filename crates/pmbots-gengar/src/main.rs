@@ -47,28 +47,38 @@ async fn main() -> Result<()> {
         (None, 100.0)
     } else {
         let wallet: LocalWallet = cfg.private_key.parse().context("parse private key")?;
-        let eoa_addr: Address = cfg.safe_address.unwrap_or_else(|| wallet.address());
-        let sig_type = if cfg.safe_address.is_some() {
+        // signer_addr = the EOA that signs all CLOB requests. The API key was
+        // (or will be) issued against this address; POLY_ADDRESS in L2 headers
+        // MUST be this address, even when funds live in a Safe proxy.
+        let signer_addr: Address = wallet.address();
+        // funder = the Safe proxy that holds the USDC. None for EOA flow.
+        let funder: Option<Address> = cfg.safe_address;
+        let sig_type = if funder.is_some() {
             SignatureType::Safe
         } else {
             SignatureType::Eoa
         };
         let clob = ClobClient::new()?;
 
-        // V2 path: get/create API creds via SERVER (not local HMAC).
+        // V2 path: get/create API creds via SERVER (not local HMAC). L1
+        // POLY_ADDRESS = signer EOA — that's what `wallet.address()` returns.
         let creds = clob
             .get_or_derive_api_creds(&wallet, POLYGON_CHAIN_ID)
             .await
             .context("get_or_derive_api_creds")?;
 
         // Fetch real USDC balance at startup so bankroll + session_start_balance
-        // reflect actual wallet state. Without this, Kelly sizes against a $5
-        // placeholder and the daily-loss CB compares against the wrong baseline.
+        // reflect actual wallet state. POLY_ADDRESS header = signer_addr (EOA);
+        // signature_type query param tells the server to resolve the balance
+        // for the linked Safe proxy.
         let bal = clob
-            .get_balance_allowance(&creds, eoa_addr, sig_type)
+            .get_balance_allowance(&creds, signer_addr, sig_type)
             .await
             .context("fetch starting USDC balance")?;
-        info!("[GENGAR] startup balance: ${:.2} (eoa={:?})", bal, eoa_addr);
+        info!(
+            "[GENGAR] startup balance: ${:.2} (signer={:?}, funder={:?})",
+            bal, signer_addr, funder
+        );
         if bal < cfg.strategy.min_bet {
             warn!(
                 "[GENGAR] startup balance ${:.2} is below GENGAR_MIN_BET=${} — \
@@ -80,7 +90,8 @@ async fn main() -> Result<()> {
         let exec = Executor {
             clob,
             creds,
-            eoa_addr,
+            signer_addr,
+            funder,
             wallet,
             sig_type,
             chain_id: POLYGON_CHAIN_ID,

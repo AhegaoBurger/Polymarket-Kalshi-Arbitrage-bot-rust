@@ -14,7 +14,6 @@
 
 use anyhow::{Context, Result};
 use ethers::signers::LocalWallet;
-use ethers::signers::Signer;
 use ethers::types::Address;
 use std::time::Duration;
 use tokio::time::sleep;
@@ -100,7 +99,15 @@ mod size_tests {
 pub struct Executor {
     pub clob: ClobClient,
     pub creds: ApiCreds,
-    pub eoa_addr: Address,
+    /// The EOA address that signs orders and is sent in `POLY_ADDRESS` for
+    /// every authenticated CLOB request. Must match the address the API key
+    /// was issued against (`POST /auth/api-key`'s POLY_ADDRESS header).
+    pub signer_addr: Address,
+    /// The Safe proxy address that holds the actual USDC funds. `None` for
+    /// EOA flow (funds held directly by the signer). Sent only via the
+    /// `signature_type` query param on /balance-allowance and as the EIP-712
+    /// `maker` field in orders — never as the POLY_ADDRESS header.
+    pub funder: Option<Address>,
     pub wallet: LocalWallet,
     pub sig_type: SignatureType,
     pub chain_id: u64,
@@ -132,7 +139,7 @@ impl Executor {
         }
         let balance_before = self
             .clob
-            .get_balance_allowance(&self.creds, self.eoa_addr, self.sig_type)
+            .get_balance_allowance(&self.creds, self.signer_addr, self.sig_type)
             .await
             .context("balance_before")?;
 
@@ -141,8 +148,8 @@ impl Executor {
             price: PriceCents::from_dollars(price),
             size_shares: shares,
             side: Side::Buy,
-            maker_address: self.wallet.address(),
-            funder: Some(self.eoa_addr),
+            maker_address: self.signer_addr,
+            funder: self.funder,
         };
         let signed = match self
             .clob
@@ -163,7 +170,7 @@ impl Executor {
 
         let post_result = self
             .clob
-            .post_order(&self.creds, self.eoa_addr, &signed, OrderType::Gtc)
+            .post_order(&self.creds, self.signer_addr, &signed, OrderType::Gtc)
             .await;
         let order_id = match post_result {
             Ok(resp) if resp.success => resp.order_id,
@@ -173,7 +180,7 @@ impl Executor {
                 sleep(Duration::from_secs(3)).await;
                 let bal_after = self
                     .clob
-                    .get_balance_allowance(&self.creds, self.eoa_addr, self.sig_type)
+                    .get_balance_allowance(&self.creds, self.signer_addr, self.sig_type)
                     .await
                     .unwrap_or(balance_before);
                 let dropped = balance_before - bal_after;
@@ -204,7 +211,7 @@ impl Executor {
                 sleep(Duration::from_secs(3)).await;
                 let bal_after = self
                     .clob
-                    .get_balance_allowance(&self.creds, self.eoa_addr, self.sig_type)
+                    .get_balance_allowance(&self.creds, self.signer_addr, self.sig_type)
                     .await
                     .unwrap_or(balance_before);
                 let dropped = balance_before - bal_after;
@@ -237,7 +244,7 @@ impl Executor {
             sleep(Duration::from_millis(BUY_VERIFY_SLEEP_MS)).await;
             let bal_after = self
                 .clob
-                .get_balance_allowance(&self.creds, self.eoa_addr, self.sig_type)
+                .get_balance_allowance(&self.creds, self.signer_addr, self.sig_type)
                 .await
                 .unwrap_or(balance_before);
             let dropped = balance_before - bal_after;
@@ -258,7 +265,7 @@ impl Executor {
             // Fallback: poll /data/order/{id}.
             if let Ok(Some(status)) = self
                 .clob
-                .get_order(&self.creds, self.eoa_addr, &order_id)
+                .get_order(&self.creds, self.signer_addr, &order_id)
                 .await
             {
                 if let Some(sm) = status.size_matched.as_ref() {
@@ -316,7 +323,7 @@ impl Executor {
         }
         let balance_before = self
             .clob
-            .get_balance_allowance(&self.creds, self.eoa_addr, self.sig_type)
+            .get_balance_allowance(&self.creds, self.signer_addr, self.sig_type)
             .await
             .context("sell balance_before")?;
 
@@ -325,8 +332,8 @@ impl Executor {
             price: PriceCents::from_dollars(price),
             size_shares: sell_shares,
             side: Side::Sell,
-            maker_address: self.wallet.address(),
-            funder: Some(self.eoa_addr),
+            maker_address: self.signer_addr,
+            funder: self.funder,
         };
         let signed = self
             .clob
@@ -335,7 +342,7 @@ impl Executor {
             .context("sell create_order")?;
         let post_result = self
             .clob
-            .post_order(&self.creds, self.eoa_addr, &signed, OrderType::Gtc)
+            .post_order(&self.creds, self.signer_addr, &signed, OrderType::Gtc)
             .await;
         let order_id = match post_result {
             Ok(r) if r.success => r.order_id.unwrap_or_default(),
@@ -353,7 +360,7 @@ impl Executor {
                 sleep(Duration::from_secs(3)).await;
                 let bal_after = self
                     .clob
-                    .get_balance_allowance(&self.creds, self.eoa_addr, self.sig_type)
+                    .get_balance_allowance(&self.creds, self.signer_addr, self.sig_type)
                     .await
                     .unwrap_or(balance_before);
                 let received = bal_after - balance_before;
@@ -379,7 +386,7 @@ impl Executor {
         sleep(Duration::from_secs(3)).await;
         let bal_after = self
             .clob
-            .get_balance_allowance(&self.creds, self.eoa_addr, self.sig_type)
+            .get_balance_allowance(&self.creds, self.signer_addr, self.sig_type)
             .await
             .unwrap_or(balance_before);
         let received = bal_after - balance_before;
@@ -406,7 +413,7 @@ impl Executor {
         // next window boundary will reconcile any retroactive fill.
         if let Err(e) = self
             .clob
-            .cancel_order(&self.creds, self.eoa_addr, &order_id)
+            .cancel_order(&self.creds, self.signer_addr, &order_id)
             .await
         {
             warn!("[GENGAR][EXEC] cancel UNVERIFIED_SELL order {} failed: {}", order_id, e);

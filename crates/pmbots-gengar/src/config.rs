@@ -94,7 +94,9 @@ mod tests {
     #[test]
     fn requires_private_key_when_live() {
         std::env::set_var("GENGAR_DRY_RUN", "false");
-        std::env::remove_var("GENGAR_PRIVATE_KEY");
+        // `set_var` to empty (not `remove_var`) so `dotenvy::dotenv()` inside
+        // `from_env` doesn't repopulate from a real `.env` file in the repo.
+        std::env::set_var("GENGAR_PRIVATE_KEY", "");
         assert!(GengarConfig::from_env().is_err());
     }
 }

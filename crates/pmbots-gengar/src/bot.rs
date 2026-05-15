@@ -177,7 +177,7 @@ impl GengarBot {
         };
         let real_bal = match exec
             .clob
-            .get_balance_allowance(&exec.creds, exec.eoa_addr, exec.sig_type)
+            .get_balance_allowance(&exec.creds, exec.signer_addr, exec.sig_type)
             .await
         {
             Ok(b) => b,
@@ -225,7 +225,7 @@ impl GengarBot {
         let Some(exec) = &self.executor else { return; };
         let real_bal = match exec
             .clob
-            .get_balance_allowance(&exec.creds, exec.eoa_addr, exec.sig_type)
+            .get_balance_allowance(&exec.creds, exec.signer_addr, exec.sig_type)
             .await
         {
             Ok(b) => b,
@@ -495,7 +495,7 @@ impl GengarBot {
                     let exec_ref = self.executor.as_ref().unwrap();
                     let balance_before = exec_ref
                         .clob
-                        .get_balance_allowance(&exec_ref.creds, exec_ref.eoa_addr, exec_ref.sig_type)
+                        .get_balance_allowance(&exec_ref.creds, exec_ref.signer_addr, exec_ref.sig_type)
                         .await
                         .unwrap_or(0.0);
                     self.state.write().await.pending_buy = Some(PendingBuy {
@@ -553,7 +553,7 @@ impl GengarBot {
         }
 
         let exec = self.executor.as_ref().unwrap();
-        let real_bal = match exec.clob.get_balance_allowance(&exec.creds, exec.eoa_addr, exec.sig_type).await {
+        let real_bal = match exec.clob.get_balance_allowance(&exec.creds, exec.signer_addr, exec.sig_type).await {
             Ok(b) => b,
             Err(e) => {
                 warn!("[GENGAR] phantom balance check failed: {} (leaving phantom unresolved)", e);
@@ -639,7 +639,7 @@ impl GengarBot {
             }
             // Live: try claim-sell at $0.99 to detect WIN; on no-movement defer to pending_phantom.
             let exec = self.executor.as_ref().unwrap();
-            let balance_before = exec.clob.get_balance_allowance(&exec.creds, exec.eoa_addr, exec.sig_type).await.unwrap_or(0.0);
+            let balance_before = exec.clob.get_balance_allowance(&exec.creds, exec.signer_addr, exec.sig_type).await.unwrap_or(0.0);
             let claim = exec.sell(&pos.token_id, 0.99, pos.shares).await;
             match claim {
                 Ok(r) if matches!(r.status, crate::executor::OrderResultStatus::Filled | crate::executor::OrderResultStatus::GhostFilled) => {
