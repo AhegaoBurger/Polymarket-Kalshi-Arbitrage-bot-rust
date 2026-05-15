@@ -1047,6 +1047,7 @@ impl ClobClient {
 #[cfg(test)]
 mod tests {
     use super::*;
+    use ethers::signers::Signer; // wallet.address() in tests below
 
     #[test]
     fn client_builds() {

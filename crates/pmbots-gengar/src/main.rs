@@ -83,25 +83,24 @@ async fn main() -> Result<()> {
         );
         let clob = ClobClient::new()?;
 
-        // For Poly1271 (sig_type=3), the API key must be associated with the
-        // FUNDER (deposit wallet) on the server side because order.signer ==
-        // funder. If the API key were bound to the EOA, V2 production rejects
-        // every order with "the order signer address has to be the address of
-        // the API KEY" (Issue #58). For all other sig types the API key is
-        // bound to the EOA (which is also order.signer).
-        let auth_address = match sig_type {
-            SignatureType::Poly1271 => funder.ok_or_else(|| {
-                anyhow::anyhow!("Poly1271 requires GENGAR_SAFE_ADDRESS (deposit wallet)")
-            })?,
-            _ => signer_addr,
-        };
+        // L1 + L2 POLY_ADDRESS = signer EOA, always. This matches the official
+        // SDK's behavior (rs-clob-client-v2 src/auth.rs:184, 240 and
+        // src/clob/client.rs:251). The L1 ClobAuth signature is recovered to
+        // the EOA, so POLY_ADDRESS must be the EOA or the server rejects with
+        // "Invalid L1 Request headers."
+        //
+        // For Poly1271 (sig_type=3), this creates a known asymmetry: the API
+        // key is bound to the EOA, but order.signer in the EIP-712 body is
+        // the funder (deposit wallet). V2 production rejects these orders
+        // with "the order signer address has to be the address of the API
+        // KEY" (Issue #58 on rs-clob-client-v2 — open, unresolved). There
+        // is no client-side fix for this; awaiting Polymarket-side change.
+        let auth_address = signer_addr;
         info!(
-            "[GENGAR] API auth address: {:?} (signer EOA produces signatures; \
-             server verifies via EIP-1271 when this differs from the EOA)",
+            "[GENGAR] API auth address: {:?} (= signer EOA — both L1 and L2)",
             auth_address
         );
 
-        // V2 path: get/create API creds via SERVER (not local HMAC).
         let creds = clob
             .get_or_derive_api_creds(&wallet, POLYGON_CHAIN_ID, auth_address)
             .await
