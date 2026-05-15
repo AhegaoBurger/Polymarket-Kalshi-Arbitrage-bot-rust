@@ -151,22 +151,58 @@ lag (~5-30s) after WALLET-CREATE before subsequent batches see the wallet.
   flows broken on V2 production even for fresh wallets. Confirms the
   deposit wallet flow is mandatory.
 
-## Polymarket Positions API vs on-chain reality
+## Redemption — use the CtfCollateralAdapter, not CTF directly
 
-The positions API at `data-api.polymarket.com/positions?user=...` claims to
-report on-chain CTF holdings. **In practice, when redeeming, we found that
-`redeemPositions(pUSD, 0, conditionId, [1, 2])` returned `payout: 0` even
-though the API reported 8 winning shares held by the deposit wallet.**
-This means V2 either uses a wrapped collateral (not raw pUSD) when minting
-outcome tokens, or holds positions via an intermediary contract. The
-deposit wallet's CTF balance at the polymarket-reported asset_id needs
-direct on-chain verification — Polymarket's API may not reflect the actual
-ERC-1155 balance on the CTF contract.
+**Standard binary markets**: route redemption through
+`CtfCollateralAdapter` at `0xAdA100Db00Ca00073811820692005400218FcE1f`.
+This is the official "thin adapter" path per
+`docs.polymarket.com/trading/ctf/redeem`. It has the same ABI as
+`CTF.redeemPositions(address,bytes32,bytes32,uint256[])` (selector
+`0x01b7037c`) and the first `address` arg is **ignored** — verified by
+three live mainnet adapter txs that passed pUSD, USDC.e, and 0x0
+respectively, all succeeded. The adapter internally:
+
+1. Calls `CTF.redeemPositions(USDC.e, …)` against the deposit wallet's
+   approval (`setApprovalForAll(adapter, true)` on CTF, one-time).
+2. Receives USDC.e from CTF.
+3. Forwards USDC.e to the pUSD contract.
+4. pUSD mints 1:1 to the original sender (deposit wallet).
+
+Result: redemption payout lands as **pUSD**, no separate wrap step needed.
+
+**Why we initially called CTF directly and saw USDC.e**: didn't know about
+the adapter. CTF.redeemPositions works but skips the wrap — payout returns
+in the CTF's actual collateral (USDC.e). For markets that pre-date the pUSD
+migration or are standard-binary, that's USDC.e. The asymmetry between
+pUSD-debit (orders) and USDC.e-credit (CTF-direct redemption) would strand
+capital over time; the adapter path closes this loop.
+
+**For stranded USDC.e** (from prior CTF-direct redemptions): use
+`scripts/setup_deposit_wallet/wrap_usdce_to_pusd.py`, which calls
+`CollateralOnramp.wrap(USDC.e, deposit_wallet, amount)` to convert 1:1.
+
+Verification: the CTF mints outcome tokens against USDC.e
+(`0x2791Bca1f2de4661ED88A30C99A7a9449Aa84174`). Computed
+`CTF.getPositionId(USDC.e, CTF.getCollectionId(0, conditionId, 1))`
+matches Polymarket's reported asset_id exactly; pUSD does not match.
+Confirmed end-to-end: direct `CTF.redeemPositions(USDC.e, 0, conditionId,
+[1,2])` mined and credited $8.00 USDC.e for 8 winning shares (tx
+`0xe8a1b45e`). Pivoting to adapter would have credited pUSD instead.
+
+**Caveat**: this is for standard binary markets (`negativeRisk: false`).
+Neg-risk markets use the separately-deployed WrappedCollateral contract
+owned by the NegRiskAdapter (`0xd91E80cF2E7be2e162c6513ceD06f1dD0dA35296`)
+and you should call `NegRiskAdapter.redeemPositions(conditionId, amounts)`
+instead of CTF directly — that adapter unwraps to the underlying.
+
+**Local positionId derivation**: do NOT reimplement `getCollectionId` in
+Python/Rust. Gnosis CTF uses a hash-to-curve on alt-bn128 (find a point on
+y²=x³+3 mod P, retry x+=1 if y² isn't a quadratic residue) — a naive
+`% (BN256Q-1)` is wrong. Always `eth_call` the contract's view function.
 
 **Diagnostic**: `scripts/setup_deposit_wallet/check_balances.py` queries the
 on-chain CTF balanceOf and compares to the polymarket-reported asset_id.
-Determines whether tokens are at the standard derivation or at a different
-positionId (implying a wrapper).
+Useful for confirming the asset_id derivation when adding new market types.
 
 ## What works end-to-end (as of 2026-05-15)
 
@@ -181,10 +217,9 @@ positionId (implying a wrapper).
 
 ## What doesn't work yet
 
-- `redeemPositions` against the standard CTF + pUSD returns payout=0. The
-  diagnostic script (`check_balances.py`) will identify whether V2 uses a
-  wrapper token or a non-standard custody path. Until resolved, winning
-  shares accumulate in the deposit wallet but can't be converted to pUSD.
 - `pending_buy` state isn't persisted across gengar restarts; an
   `UNVERIFIED_BUY` mid-window followed by Ctrl+C loses position tracking
   (the order still settles on-chain, but gengar can't claim-sell at close).
+- Gengar's `resolve_window` does a claim-sell at $0.99 but doesn't yet call
+  `redeemPositions(USDC.e, 0, conditionId, [1,2])` automatically on winning
+  positions. Manual via `redeem_position.py` works end-to-end.

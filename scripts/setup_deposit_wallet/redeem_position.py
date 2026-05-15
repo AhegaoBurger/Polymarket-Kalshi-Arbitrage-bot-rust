@@ -37,13 +37,29 @@ from py_builder_signing_sdk.config import BuilderApiKeyCreds, BuilderConfig
 
 # Polygon mainnet — same as setup_deposit_wallet.py
 POLYGON_CHAIN_ID = 137
-PUSD = "0xC011a7E12a19f7B1f670d46F03B03f3342E82DFB"
+PUSD = "0xC011a7E12a19f7B1f670d46F03B03f3342E82DFB"  # user-facing collateral
+# CTF outcome tokens are minted against USDC.e (bridged), NOT pUSD. Verified on-chain
+# 2026-05-15: keccak(USDC.e || getCollectionId(0, conditionId, 1)) == polymarket asset_id.
+# pUSD is a user-facing veneer; the CTF positionId derivation predates the pUSD migration.
+USDCE = "0x2791Bca1f2de4661ED88A30C99A7a9449Aa84174"
 CTF = "0x4D97DCd97eC945f40cF65F87097ACe5EA0476045"
+# Polymarket CollateralOnramp — wrap(asset, recipient, amount). USDC.e → pUSD,
+# 1:1 with no fees. Verified contract per Polygonscan.
+ONRAMP = "0x93070a847efEf7F70739046A929D47a521F5B8ee"
+# CtfCollateralAdapter — the "thin adapter" for pUSD-native CTF actions per
+# https://docs.polymarket.com/trading/ctf/redeem. Calling redeemPositions on
+# the adapter (instead of CTF directly) yields pUSD payout instead of USDC.e:
+# adapter pulls USDC.e from CTF, forwards it to pUSD, pUSD mints 1:1 to sender.
+# Same selector and calldata shape as CTF.redeemPositions — first address arg
+# is actually ignored by the adapter (verified via three live mainnet txs that
+# passed pUSD, USDC.e, and 0x0 respectively — all succeeded).
+ADAPTER = "0xAdA100Db00Ca00073811820692005400218FcE1f"
+MAX_UINT256 = (1 << 256) - 1
 ZERO_BYTES32 = b"\x00" * 32
 
 
 def build_redeem_calldata(condition_id_hex: str) -> str:
-    """ABI-encode redeemPositions(address,bytes32,bytes32,uint256[1,2]) -> 0x..."""
+    """ABI-encode redeemPositions(USDC.e, 0, conditionId, [1,2]) -> 0x..."""
     if condition_id_hex.startswith("0x"):
         condition_id_hex = condition_id_hex[2:]
     condition_id = bytes.fromhex(condition_id_hex)
@@ -53,9 +69,213 @@ def build_redeem_calldata(condition_id_hex: str) -> str:
     selector = keccak(text="redeemPositions(address,bytes32,bytes32,uint256[])")[:4]
     params = encode(
         ["address", "bytes32", "bytes32", "uint256[]"],
-        [PUSD, ZERO_BYTES32, condition_id, [1, 2]],
+        [USDCE, ZERO_BYTES32, condition_id, [1, 2]],
     )
     return "0x" + (selector + params).hex()
+
+
+def build_approve_calldata(spender: str, amount: int = MAX_UINT256) -> str:
+    """ABI-encode ERC20.approve(spender, amount). Idempotent — re-approving is a no-op."""
+    selector = keccak(text="approve(address,uint256)")[:4]
+    params = encode(["address", "uint256"], [spender, amount])
+    return "0x" + (selector + params).hex()
+
+
+def build_set_approval_for_all_calldata(operator: str, approved: bool = True) -> str:
+    """ABI-encode ERC1155.setApprovalForAll(operator, approved). For CTF outcome tokens."""
+    selector = keccak(text="setApprovalForAll(address,bool)")[:4]
+    params = encode(["address", "bool"], [operator, approved])
+    return "0x" + (selector + params).hex()
+
+
+def ctf_is_approved_for_all(owner: str, operator: str,
+                            rpc_url: str = "https://polygon.gateway.tenderly.co") -> bool:
+    """Read CTF.isApprovedForAll(owner, operator) via Polygon RPC."""
+    import json as _json
+    from urllib import request as _req
+    selector = keccak(text="isApprovedForAll(address,address)")[:4].hex()
+    o = owner.removeprefix("0x").lower().rjust(64, "0")
+    op = operator.removeprefix("0x").lower().rjust(64, "0")
+    data = "0x" + selector + o + op
+    payload = {"jsonrpc": "2.0", "id": 1, "method": "eth_call",
+               "params": [{"to": CTF, "data": data}, "latest"]}
+    req = _req.Request(rpc_url, data=_json.dumps(payload).encode(),
+                       headers={"Content-Type": "application/json",
+                                "User-Agent": "Mozilla/5.0"})
+    r = _json.loads(_req.urlopen(req, timeout=15).read())
+    return int(r.get("result", "0x0"), 16) != 0
+
+
+def build_wrap_calldata(asset: str, recipient: str, amount: int) -> str:
+    """ABI-encode CollateralOnramp.wrap(asset, recipient, amount). USDC.e → pUSD 1:1."""
+    selector = keccak(text="wrap(address,address,uint256)")[:4]
+    params = encode(["address", "address", "uint256"], [asset, recipient, amount])
+    return "0x" + (selector + params).hex()
+
+
+def erc20_balance_of(token: str, holder: str, rpc_url: str = "https://polygon.gateway.tenderly.co") -> int:
+    """Read ERC20.balanceOf via Polygon RPC. Used to check USDC.e balance / allowance."""
+    import json as _json
+    from urllib import request as _req
+    selector = keccak(text="balanceOf(address)")[:4].hex()
+    holder_padded = holder.removeprefix("0x").lower().rjust(64, "0")
+    data = "0x" + selector + holder_padded
+    payload = {"jsonrpc": "2.0", "id": 1, "method": "eth_call",
+               "params": [{"to": token, "data": data}, "latest"]}
+    req = _req.Request(rpc_url, data=_json.dumps(payload).encode(),
+                       headers={"Content-Type": "application/json",
+                                "User-Agent": "Mozilla/5.0"})
+    r = _json.loads(_req.urlopen(req, timeout=15).read())
+    return int(r.get("result", "0x0"), 16)
+
+
+def erc20_allowance(token: str, owner: str, spender: str,
+                    rpc_url: str = "https://polygon.gateway.tenderly.co") -> int:
+    """Read ERC20.allowance(owner, spender) via Polygon RPC."""
+    import json as _json
+    from urllib import request as _req
+    selector = keccak(text="allowance(address,address)")[:4].hex()
+    o = owner.removeprefix("0x").lower().rjust(64, "0")
+    s = spender.removeprefix("0x").lower().rjust(64, "0")
+    data = "0x" + selector + o + s
+    payload = {"jsonrpc": "2.0", "id": 1, "method": "eth_call",
+               "params": [{"to": token, "data": data}, "latest"]}
+    req = _req.Request(rpc_url, data=_json.dumps(payload).encode(),
+                       headers={"Content-Type": "application/json",
+                                "User-Agent": "Mozilla/5.0"})
+    r = _json.loads(_req.urlopen(req, timeout=15).read())
+    return int(r.get("result", "0x0"), 16)
+
+
+def wrap_usdce_to_pusd(amount: int, relayer: RelayClient, *, log=print) -> dict:
+    """Wrap USDC.e to pUSD via the CollateralOnramp. If the onramp's USDC.e
+    allowance is below `amount`, prepend an approve(max) call in the same batch
+    so the conversion is atomic from the operator's POV.
+
+    Returns the relayer's wait() result. Raises if amount == 0.
+    """
+    if amount <= 0:
+        raise ValueError(f"wrap_usdce_to_pusd: amount must be > 0, got {amount}")
+
+    eoa_address = relayer.signer.address()
+    deposit_wallet = relayer.get_expected_deposit_wallet()
+    allowance = erc20_allowance(USDCE, deposit_wallet, ONRAMP)
+    log(f"  USDC.e allowance for onramp: {allowance} (need {amount})")
+
+    calls = []
+    if allowance < amount:
+        log("  → including approve(max) in batch")
+        calls.append(DepositWalletCall(
+            target=USDCE, value="0",
+            data=build_approve_calldata(ONRAMP, MAX_UINT256),
+        ))
+    calls.append(DepositWalletCall(
+        target=ONRAMP, value="0",
+        data=build_wrap_calldata(USDCE, deposit_wallet, amount),
+    ))
+
+    last_exc: RelayerApiException | None = None
+    for attempt in range(1, 7):
+        nonce_payload = relayer.get_nonce(eoa_address, TransactionType.WALLET.value)
+        nonce = str(nonce_payload["nonce"])
+        deadline = str(int(time.time()) + 600)
+        log(f"  Attempt {attempt}: nonce={nonce}, calls={len(calls)}")
+        try:
+            resp = relayer.execute_deposit_wallet_batch(
+                calls=calls, wallet_address=deposit_wallet,
+                nonce=nonce, deadline=deadline,
+            )
+            return resp.wait() or {}
+        except RelayerApiException as exc:
+            last_exc = exc
+            msg = str(exc)
+            transient = any(
+                p in msg for p in ("not registered", "wallet registry", "not yet indexed", "nonce")
+            )
+            if not transient or attempt == 6:
+                raise
+            wait_s = min(2 ** attempt, 30)
+            log(f"    Transient error: {msg.splitlines()[0][:120]}; waiting {wait_s}s")
+            time.sleep(wait_s)
+    if last_exc is not None:
+        raise last_exc
+    return {}
+
+
+def build_relayer(env: dict) -> RelayClient:
+    """Construct a RelayClient from env vars. Raises ValueError on missing creds."""
+    required = ["GENGAR_PRIVATE_KEY", "BUILDER_API_KEY", "BUILDER_SECRET", "BUILDER_PASS_PHRASE"]
+    missing = [v for v in required if not env.get(v)]
+    if missing:
+        raise ValueError(f"Missing env vars: {', '.join(missing)}")
+    relayer_url = env.get("RELAYER_URL", "https://relayer-v2.polymarket.com/")
+    if not relayer_url.endswith("/"):
+        relayer_url += "/"
+    builder_creds = BuilderApiKeyCreds(
+        key=env["BUILDER_API_KEY"],
+        secret=env["BUILDER_SECRET"],
+        passphrase=env["BUILDER_PASS_PHRASE"],
+    )
+    return RelayClient(
+        relayer_url, POLYGON_CHAIN_ID, env["GENGAR_PRIVATE_KEY"],
+        BuilderConfig(local_builder_creds=builder_creds),
+    )
+
+
+def redeem_condition(condition_id: str, relayer: RelayClient, *, log=print) -> dict:
+    """Submit a redeemPositions WALLET batch for a single conditionId via the
+    CtfCollateralAdapter, so payout lands as pUSD (not USDC.e). Returns the
+    relayer's wait() result. Retries transient errors up to 6 times.
+
+    The adapter requires a one-time CTF.setApprovalForAll(adapter, true) — if
+    not set, we prepend that call to the same batch so the conversion is
+    atomic from the operator's POV. Re-running after the approval is in place
+    skips the prepend and just sends the redeem call alone.
+
+    The adapter burns ALL outcome tokens the deposit wallet holds for this
+    condition — losing positions are no-ops (burn-for-$0) and safe to call.
+    """
+    eoa_address = relayer.signer.address()
+    deposit_wallet = relayer.get_expected_deposit_wallet()
+
+    calls = []
+    if not ctf_is_approved_for_all(deposit_wallet, ADAPTER):
+        log("  CTF not yet approved for adapter → including setApprovalForAll(true)")
+        calls.append(DepositWalletCall(
+            target=CTF, value="0",
+            data=build_set_approval_for_all_calldata(ADAPTER, True),
+        ))
+    calls.append(DepositWalletCall(
+        target=ADAPTER, value="0",
+        data=build_redeem_calldata(condition_id),
+    ))
+
+    last_exc: RelayerApiException | None = None
+    for attempt in range(1, 7):
+        nonce_payload = relayer.get_nonce(eoa_address, TransactionType.WALLET.value)
+        nonce = str(nonce_payload["nonce"])
+        deadline = str(int(time.time()) + 600)
+        log(f"  Attempt {attempt} on {condition_id[:10]}…: nonce={nonce}  calls={len(calls)}")
+        try:
+            resp = relayer.execute_deposit_wallet_batch(
+                calls=calls, wallet_address=deposit_wallet,
+                nonce=nonce, deadline=deadline,
+            )
+            return resp.wait() or {}
+        except RelayerApiException as exc:
+            last_exc = exc
+            msg = str(exc)
+            transient = any(
+                p in msg for p in ("not registered", "wallet registry", "not yet indexed", "nonce")
+            )
+            if not transient or attempt == 6:
+                raise
+            wait_s = min(2 ** attempt, 30)
+            log(f"    Transient error: {msg.splitlines()[0][:120]}; waiting {wait_s}s")
+            time.sleep(wait_s)
+    if last_exc is not None:
+        raise last_exc
+    return {}
 
 
 def main() -> int:
@@ -75,74 +295,26 @@ def main() -> int:
     condition_id = sys.argv[1]
     load_dotenv(os.path.join(os.path.dirname(__file__), "..", "..", ".env"))
 
-    required = ["GENGAR_PRIVATE_KEY", "BUILDER_API_KEY", "BUILDER_SECRET", "BUILDER_PASS_PHRASE"]
-    missing = [v for v in required if not os.environ.get(v)]
-    if missing:
-        sys.stderr.write(f"Missing env vars: {', '.join(missing)}\n")
+    try:
+        relayer = build_relayer(os.environ)
+    except ValueError as exc:
+        sys.stderr.write(f"{exc}\n")
         return 1
 
-    relayer_url = os.environ.get("RELAYER_URL", "https://relayer-v2.polymarket.com/")
-    if not relayer_url.endswith("/"):
-        relayer_url += "/"
-
-    builder_creds = BuilderApiKeyCreds(
-        key=os.environ["BUILDER_API_KEY"],
-        secret=os.environ["BUILDER_SECRET"],
-        passphrase=os.environ["BUILDER_PASS_PHRASE"],
-    )
-    relayer = RelayClient(
-        relayer_url,
-        POLYGON_CHAIN_ID,
-        os.environ["GENGAR_PRIVATE_KEY"],
-        BuilderConfig(local_builder_creds=builder_creds),
-    )
-
-    eoa_address = relayer.signer.address()
     deposit_wallet = relayer.get_expected_deposit_wallet()
-    print(f"EOA:            {eoa_address}")
+    print(f"EOA:            {relayer.signer.address()}")
     print(f"Deposit wallet: {deposit_wallet}")
     print(f"Condition ID:   {condition_id}")
+    print(f"Adapter:        {ADAPTER} (CtfCollateralAdapter — payout in pUSD)")
     print(f"CTF contract:   {CTF}")
-    print(f"Collateral:     {PUSD} (pUSD)")
-
-    calldata = build_redeem_calldata(condition_id)
-    call = DepositWalletCall(target=CTF, value="0", data=calldata)
-    print(f"\nCalldata: {calldata[:80]}...")
-
-    # Same retry pattern as the approvals script: relayer may need a moment
-    # to converge after the prior batch, and fresh nonce/deadline per attempt.
     print("\nSubmitting WALLET batch (1 call: redeemPositions)...")
-    for attempt in range(1, 7):
-        nonce_payload = relayer.get_nonce(eoa_address, TransactionType.WALLET.value)
-        nonce = str(nonce_payload["nonce"])
-        deadline = str(int(time.time()) + 600)
-        print(f"  Attempt {attempt}: nonce={nonce}, deadline={deadline}")
-        try:
-            resp = relayer.execute_deposit_wallet_batch(
-                calls=[call],
-                wallet_address=deposit_wallet,
-                nonce=nonce,
-                deadline=deadline,
-            )
-            result = resp.wait()
-            tx_hash = result.get("transactionHash") if result else None
-            state = result.get("state") if result else None
-            print(f"\n  ✓ Batch state: {state}")
-            print(f"  ✓ Tx hash:     {tx_hash}")
-            if tx_hash:
-                print(f"  ✓ Polygonscan: https://polygonscan.com/tx/{tx_hash}")
-            break
-        except RelayerApiException as exc:
-            msg = str(exc)
-            transient = any(
-                p in msg for p in ("not registered", "wallet registry", "not yet indexed", "nonce")
-            )
-            if not transient or attempt == 6:
-                raise
-            wait_s = min(2 ** attempt, 30)
-            print(f"    Transient error: {msg.splitlines()[0][:120]}")
-            print(f"    Waiting {wait_s}s...")
-            time.sleep(wait_s)
+    result = redeem_condition(condition_id, relayer)
+    tx_hash = result.get("transactionHash")
+    state = result.get("state")
+    print(f"\n  ✓ Batch state: {state}")
+    print(f"  ✓ Tx hash:     {tx_hash}")
+    if tx_hash:
+        print(f"  ✓ Polygonscan: https://polygonscan.com/tx/{tx_hash}")
 
     print("\n" + "=" * 64)
     print("Redemption submitted.")

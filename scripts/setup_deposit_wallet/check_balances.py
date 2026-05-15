@@ -22,13 +22,19 @@ from urllib import request
 from dotenv import load_dotenv
 from eth_utils import keccak
 
-POLYGON_RPC = "https://polygon-rpc.com/"  # primary
+POLYGON_RPC = "https://polygon-rpc.com/"  # primary (rate-limited free tier; often returns "tenant disabled")
 FALLBACK_RPCS = [
-    "https://polygon.llamarpc.com",
-    "https://polygon.drpc.org",
-    "https://1rpc.io/matic",
+    "https://polygon.gateway.tenderly.co",
     "https://polygon-bor-rpc.publicnode.com",
+    "https://polygon.api.onfinality.io/public",
+    "https://1rpc.io/matic",
+    "https://polygon.drpc.org",
 ]
+# urllib's default UA ("Python-urllib/3.13") is blocked by most public RPC Cloudflare WAFs.
+RPC_HEADERS = {
+    "Content-Type": "application/json",
+    "User-Agent": "Mozilla/5.0 (Macintosh; Intel Mac OS X 10_15_7) AppleWebKit/537.36",
+}
 
 CTF = "0x4D97DCd97eC945f40cF65F87097ACe5EA0476045"
 PUSD = "0xC011a7E12a19f7B1f670d46F03B03f3342E82DFB"
@@ -43,22 +49,34 @@ def rpc_call(rpc_url: str, payload: dict) -> dict:
     req = request.Request(
         rpc_url,
         data=json.dumps(payload).encode(),
-        headers={"Content-Type": "application/json"},
+        headers=RPC_HEADERS,
     )
     return json.loads(request.urlopen(req, timeout=15).read())
 
 
 def first_working_rpc() -> str:
-    """Try a list of public RPCs, return the first that responds to eth_chainId."""
+    """Honor POLYGON_RPC_URL if set; otherwise probe public RPCs with a real eth_call,
+    not just eth_chainId — some endpoints serve chainId from cache but 403 on eth_call."""
+    env_rpc = os.environ.get("POLYGON_RPC_URL")
+    if env_rpc:
+        return env_rpc
+    # pUSD.balanceOf(0x0) — cheap, but exercises the same code path as the real queries.
+    probe = {
+        "jsonrpc": "2.0", "method": "eth_call", "id": 0,
+        "params": [{"to": PUSD, "data": "0x70a08231" + "0" * 64}, "latest"],
+    }
     for url in [POLYGON_RPC, *FALLBACK_RPCS]:
         try:
-            r = rpc_call(url, {"jsonrpc": "2.0", "method": "eth_chainId", "id": 0, "params": []})
-            if r.get("result") == "0x89":  # 137
+            r = rpc_call(url, probe)
+            if isinstance(r.get("result"), str) and r["result"].startswith("0x") and "error" not in r:
                 return url
             print(f"  {url}: {r}", file=sys.stderr)
         except Exception as exc:
             print(f"  {url}: {exc}", file=sys.stderr)
-    raise RuntimeError("no working Polygon RPC")
+    raise RuntimeError(
+        "no working Polygon RPC — set POLYGON_RPC_URL in .env "
+        "(Alchemy/QuickNode/Infura free tier all work)"
+    )
 
 
 def eth_call(rpc: str, to: str, data: str) -> str:

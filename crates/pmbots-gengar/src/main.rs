@@ -6,6 +6,7 @@ use tracing::{info, warn};
 use tracing_subscriber::EnvFilter;
 use pmbots_gengar::{
     bot::GengarBot,
+    chain_rpc::{tokens, ChainRpc},
     config::GengarConfig,
     executor::Executor,
     polymarket::clob::{ClobClient, SignatureType},
@@ -125,9 +126,39 @@ async fn main() -> Result<()> {
             .await
             .context("fetch starting USDC balance")?;
         info!(
-            "[GENGAR] startup balance: ${:.2} (signer={:?}, funder={:?})",
+            "[GENGAR] startup CLOB trading balance: ${:.2} (signer={:?}, funder={:?})",
             bal, signer_addr, funder
         );
+
+        // Raw on-chain token split. The CLOB balance is a single aggregate; this
+        // is the pUSD-vs-USDC.e breakdown the operator actually wants. We read
+        // from the funder (deposit wallet) when sig_type=3, else from the signer.
+        let holder = funder.unwrap_or(signer_addr);
+        match ChainRpc::from_env() {
+            Ok(rpc) => {
+                let pusd_fut = rpc.erc20_balance(tokens::pusd(), holder);
+                let usdce_fut = rpc.erc20_balance(tokens::usdce(), holder);
+                match tokio::join!(pusd_fut, usdce_fut) {
+                    (Ok(pusd_micros), Ok(usdce_micros)) => {
+                        info!(
+                            "[GENGAR] on-chain tokens at {:?}:  pUSD ${:.4}  |  USDC.e ${:.4}  (redemptions pay out in USDC.e)",
+                            holder,
+                            pusd_micros as f64 / 1_000_000.0,
+                            usdce_micros as f64 / 1_000_000.0,
+                        );
+                    }
+                    (pusd_res, usdce_res) => {
+                        warn!(
+                            "[GENGAR] on-chain balance read failed: pUSD={:?} USDC.e={:?} — continuing",
+                            pusd_res.err(),
+                            usdce_res.err()
+                        );
+                    }
+                }
+            }
+            Err(e) => warn!("[GENGAR] chain RPC init failed: {} — skipping token split", e),
+        }
+
         if bal < cfg.strategy.min_bet {
             warn!(
                 "[GENGAR] startup balance ${:.2} is below GENGAR_MIN_BET=${} — \

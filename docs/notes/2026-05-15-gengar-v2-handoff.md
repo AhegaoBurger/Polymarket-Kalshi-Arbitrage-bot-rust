@@ -13,20 +13,45 @@ Concise state of `feat/gengar-rust-port` after the day's V2 trading push.
 
 ## Current blockers (in order of operational impact)
 
-1. **`redeemPositions` returns payout=0.** Standard CTF redemption against the deposit wallet's resolved-UP position returns zero payout despite Polymarket's API showing 8 winning shares. Two relayer txs (`0x97974d26...` and `0x2d574b15...`) both `STATE_MINED` with `PayoutRedemption(payout: 0)`. Polymarket-reported asset_id `0x86e3ee9a...` likely doesn't match the standard `getPositionId(pUSD, conditionId, indexSet=1)` derivation — V2 may custody outcome tokens against a wrapped collateral rather than raw pUSD. **Winning shares currently locked in the deposit wallet, can't programmatically convert to pUSD.** Diagnostic ready: `scripts/setup_deposit_wallet/check_balances.py`.
+1. ~~**`redeemPositions` returns payout=0.**~~ **RESOLVED 2026-05-15.** Two-step fix: (a) outcome tokens are minted against USDC.e (not pUSD); (b) the right call path is `CtfCollateralAdapter.redeemPositions(...)` at `0xAdA100Db00Ca00073811820692005400218FcE1f`, which wraps USDC.e → pUSD atomically. `redeem_position.py` now uses the adapter and auto-prepends `CTF.setApprovalForAll(adapter, true)` on first run; future redemptions land as pUSD directly. The initial direct-CTF redemption (tx `0xe8a1b45e1cdbc38d659e3b0154e4c776668738d31697e1c8af9461f90c2170ac`) put $8.00 USDC.e in the deposit wallet — convert via `wrap_usdce_to_pusd.py` one-shot when ready. See `docs/notes/polymarket-v2-internals.md`.
 2. **Issue #58 (Polymarket-side).** Some accounts get `"the order signer address has to be the address of the API KEY"` on Poly1271 orders because the API key is bound to the EOA but order.signer = funder. Account-state-dependent: the user's fresh email-signup account did NOT hit this (orders went through), but it's a real open issue. No client-side fix.
 3. **`pending_buy` state not persisted.** UNVERIFIED_BUY context lives in RAM. Ctrl+C with a pending fill mid-window loses position bookkeeping (chain settles correctly, but gengar can't claim-sell at window close). ~30 lines of disk persistence needed.
 4. **`UNVERIFIED_BUY` verification window too short.** 14s (3 attempts × 3s + 5s sleep) missed a real Polygon settlement that landed in ~15-30s. Bumping `BUY_VERIFY_ATTEMPTS` from 3 to 8 would catch most late settlements while keeping the never-cancel safety property.
-5. **polymarket.com UI doesn't see the deposit wallet.** UI only shows the user's legacy POLY_PROXY. Means: manual position management (redeem, withdraw) must go through scripts, not the UI. `redeem_position.py` is the entry point — but see blocker 1 (it doesn't actually pay out yet).
+5. ~~**polymarket.com UI doesn't see the deposit wallet.**~~ Still true (UI shows legacy POLY_PROXY only), but redemption is now scripted via `redeem_sweep.py` so this doesn't block operations. The sidecar polls the positions API every 90s and redeems any `redeemable: true` position automatically.
 
 ## Actionable next steps (smallest first)
 
-1. **Run `check_balances.py`** to confirm whether V2 uses a wrapper collateral. The asset_id-vs-positionId comparison is conclusive in one shot. Result determines whether the fix is "use the wrapper address in redeemPositions" or "tokens are at an intermediary contract, different redemption path."
-2. **Once wrapper is identified, fix `redeem_position.py`** to pass the wrapper as `collateralToken` instead of pUSD. Re-redeem the resolved UP position → +$8 to the deposit wallet → confirm via on-chain balance + re-run gengar.
-3. **Persist `pending_buy` to disk** (~30 lines in `bot.rs`): serialize to `positions.json.gengar` on every set/clear, restore on `GengarBot::new`. Resolves blocker 3.
-4. **Bump `BUY_VERIFY_ATTEMPTS = 8`** in `executor.rs` (1-line config change). Tradeoff: longer per-entry latency but fewer UNVERIFIED_BUY misses. Resolves blocker 4.
-5. **Auto-redeem at window close** in gengar's `resolve_window`. Currently does a claim-sell at $0.99; should ALSO call redeemPositions for any winning position (once blocker 1 is resolved). Closes the loop end-to-end.
-6. **Polymarket support ticket re: Issue #58 + the redeemPositions wrapper question.** Both need server-side input the docs don't cover. Useful regardless of whether we find workarounds.
+1. ~~Run check_balances.py / fix redeem_position.py.~~ **DONE.**
+2. **Persist `pending_buy` to disk** (~30 lines in `bot.rs`): serialize to `positions.json.gengar` on every set/clear, restore on `GengarBot::new`. Resolves blocker 3.
+3. **Bump `BUY_VERIFY_ATTEMPTS = 8`** in `executor.rs` (1-line config change). Tradeoff: longer per-entry latency but fewer UNVERIFIED_BUY misses. Resolves blocker 4.
+4. **Optional: in-process auto-redeem in gengar.** Currently the redemption loop lives in `redeem_sweep.py` (Python sidecar, separate process). If you want it in-process, port the relayer's WALLET-batch flow to Rust (large effort — Solady ERC-7739 signing for the batch payload, distinct from the order signing already in `clob.rs`). The sidecar is fine for now.
+5. **Polymarket support ticket re: Issue #58.** Server-side check that compares `order.signer` against the API-key address is the only remaining genuine Polymarket-side blocker. Account-state-dependent, no client-side fix.
+
+## Running gengar end-to-end (two-process setup)
+
+```
+Terminal A:  cargo run -p pmbots-gengar        # trades into the deposit wallet
+Terminal B:  cd scripts/setup_deposit_wallet && \
+             .venv/bin/python redeem_sweep.py  # redeems resolved positions (pUSD payout via adapter)
+```
+
+One-shot: `.venv/bin/python wrap_usdce_to_pusd.py` — converts any stranded
+USDC.e in the deposit wallet to pUSD via the Polymarket onramp (1:1, no fees).
+Run after the initial CTF-direct redemption ($8.00 USDC.e currently in wallet)
+to recycle that capital back into trading.
+
+Both processes share state only via the chain. The sweep is safe to start/stop
+independently; redeeming an already-redeemed condition is a no-op (the contract
+burns zero tokens for zero payout). Set `REDEEM_SWEEP_DRY_RUN=1` to log what
+would be redeemed without submitting.
+
+On startup, gengar now logs three balance views:
+- CLOB trading-available balance (single aggregate, used for Kelly sizing)
+- On-chain pUSD balance (user-facing veneer)
+- On-chain USDC.e balance (where redemption payouts actually land)
+
+Set `POLYGON_RPC_URL` in `.env` to use an authenticated RPC (Alchemy/QuickNode
+free tier all work) — otherwise gengar tries public endpoints in order.
 
 ## Operational gotchas to remember
 
@@ -34,6 +59,7 @@ Concise state of `feat/gengar-rust-port` after the day's V2 trading push.
 - `GENGAR_MIN_BET` interacts with integer-cents share rounding. At $5 floor + entry price >$0.50, share quantization can land below the $5 POLY_MIN_NOTIONAL. **Use ≥$7** to stay clear of the rounding floor at all valid entry prices.
 - The bot autonomously trades — Ctrl+C any time you're not OK with a position firing. With `GENGAR_DAILY_LOSS_LIMIT=$10` and current ~$3 deposit wallet balance, downside is bounded.
 - Deposit wallet provisioning is one-time per EOA. The 6 approvals + WALLET-CREATE never need re-running unless the EOA changes.
+- Redemption payouts arrive in **USDC.e**, not pUSD. To convert to pUSD, use the Polymarket onramp contract. The bot can spend either as collateral via the existing deposit-wallet approvals.
 
 ## Reference
 
