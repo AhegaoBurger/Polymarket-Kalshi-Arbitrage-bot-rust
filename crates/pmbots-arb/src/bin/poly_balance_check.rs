@@ -9,7 +9,7 @@
 //! in micros and as a USDC float.
 
 use anyhow::{Context, Result};
-use prediction_market_arbitrage::polymarket_clob::{
+use pmbots_arb::polymarket_clob::{
     ApiCreds, PolymarketAsyncClient, PreparedCreds, SharedAsyncClient,
 };
 

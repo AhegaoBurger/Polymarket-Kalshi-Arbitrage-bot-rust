@@ -1,0 +1,14 @@
+# Pre-release pins — these are the actual versions on PyPI as of May 2026.
+# Polymarket's deposit-wallet SDKs are still pre-1.0; the rc/pre-release
+# specifier is required to get pip to pick them up.
+#
+# Install with: pip install --pre -r requirements.txt
+#
+# Note: py-builder-relayer-client imports poly_eip712_structs but doesn't
+# declare it in install_requires, so we list it explicitly here.
+py-builder-relayer-client>=0.0.2rc1
+py-builder-signing-sdk
+poly-eip712-structs
+python-dotenv>=1.0.0
+eth-abi>=5.0.0
+eth-utils>=4.0.0

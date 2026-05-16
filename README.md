@@ -57,8 +57,8 @@ Beyond the complete arbitrage system, you may find these components particularly
 # Rust 1.75+
 curl --proto '=https' --tlsv1.2 -sSf https://sh.rustup.rs | sh
 
-# Build
-cargo build --release
+# Build the arb crate (workspace member)
+cargo build -p pmbots-arb --release
 ```
 
 ### 2. Set Up Credentials
@@ -83,10 +83,10 @@ RUST_LOG=info
 
 ```bash
 # Dry run (paper trading)
-dotenvx run -- cargo run --release
+dotenvx run -- cargo run -p pmbots-arb --release
 
 # Live execution
-DRY_RUN=0 dotenvx run -- cargo run --release
+DRY_RUN=0 dotenvx run -- cargo run -p pmbots-arb --release
 ```
 
 > **Want AI-matched markets across politics / crypto / etc.?** Run the Python sidecar first to produce `.ai_matches.json`, then start the bot — the bot picks it up automatically. See [AI-Matched Markets (Sidecar)](#ai-matched-markets-sidecar).
@@ -174,28 +174,28 @@ The Rust bot reads `.ai_matches.json` from the repo root if it exists (produced 
 
 ```bash
 # Full logging, dry run
-RUST_LOG=debug DRY_RUN=1 dotenvx run -- cargo run --release
+RUST_LOG=debug DRY_RUN=1 dotenvx run -- cargo run -p pmbots-arb --release
 ```
 
 ### Test Arbitrage Execution
 
 ```bash
 # Inject synthetic arb to test execution path
-TEST_ARB=1 DRY_RUN=0 dotenvx run -- cargo run --release
+TEST_ARB=1 DRY_RUN=0 dotenvx run -- cargo run -p pmbots-arb --release
 ```
 
 ### Production
 
 ```bash
 # Live trading with circuit breaker
-DRY_RUN=0 CB_MAX_DAILY_LOSS=10000 dotenvx run -- cargo run --release
+DRY_RUN=0 CB_MAX_DAILY_LOSS=10000 dotenvx run -- cargo run -p pmbots-arb --release
 ```
 
 ### Force Market Re-Discovery
 
 ```bash
 # Clear cache and re-fetch all market mappings
-FORCE_DISCOVERY=1 dotenvx run -- cargo run --release
+FORCE_DISCOVERY=1 dotenvx run -- cargo run -p pmbots-arb --release
 ```
 
 ---
@@ -275,17 +275,17 @@ cd ../..
 
 # 2. Start the Rust bot — detection-only on AI pairs (DEFAULT, SAFE)
 #    AI-sourced pairs will appear in arb-detection logs but won't execute orders.
-DRY_RUN=1 dotenvx run -- cargo run --release
+DRY_RUN=1 dotenvx run -- cargo run -p pmbots-arb --release
 
 # 3. Once you trust the matches, allow execution on AI pairs:
-EXEC_ALLOW_AI_MATCHES=1 DRY_RUN=0 dotenvx run -- cargo run --release
+EXEC_ALLOW_AI_MATCHES=1 DRY_RUN=0 dotenvx run -- cargo run -p pmbots-arb --release
 
 # 4. AI matches ONLY (skip sports + FOMC adapters entirely).
 #    Useful for isolating the AI pipeline end-to-end. FORCE_DISCOVERY=1 is
 #    important the first time — the discovery cache (.discovery_cache.json,
 #    2h TTL) may otherwise still hold sports/FOMC pairs from a prior run.
 SPORTS_ENABLED=0 FOMC_ENABLED=0 EXEC_ALLOW_AI_MATCHES=1 \
-  FORCE_DISCOVERY=1 DRY_RUN=0 dotenvx run -- cargo run --release
+  FORCE_DISCOVERY=1 DRY_RUN=0 dotenvx run -- cargo run -p pmbots-arb --release
 ```
 
 **Safety defaults:** AI-sourced pairs are gated at execution by `EXEC_ALLOW_AI_MATCHES` (default `0`). Even with `DRY_RUN=0`, AI pairs will only be detected, not traded, until you explicitly opt in. The staleness gate (`AI_MATCHES_MAX_AGE_SEC`, default 24h) drops the matches file silently if it's too old — re-run the sidecar to refresh.
@@ -380,19 +380,19 @@ src/
 ### Run Tests
 
 ```bash
-cargo test
+cargo test -p pmbots-arb
 ```
 
 ### Enable Profiling
 
 ```bash
-cargo build --release --features profiling
+cargo build -p pmbots-arb --release --features profiling
 ```
 
 ### Benchmarks
 
 ```bash
-cargo bench
+cargo bench -p pmbots-arb
 ```
 
 ---

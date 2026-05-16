@@ -22,6 +22,14 @@ scripts/poly_l2_auth/.venv/
 scripts/poly_l2_auth/.uv-cache/
 scripts/poly_l2_auth/__pycache__/
 scripts/poly_l2_auth/**/__pycache__/
+
+# setup_deposit_wallet sidecar
+scripts/setup_deposit_wallet/.venv/
+scripts/setup_deposit_wallet/__pycache__/
+
+# gengar runtime artifacts
+logs/
+crates/pmbots-gengar/logs/
 .ai_matches.json
 .ai_matches.json.tmp
 .ai_matcher_cache.json

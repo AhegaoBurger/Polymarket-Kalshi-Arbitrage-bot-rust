@@ -1,0 +1,50 @@
+[package]
+name = "pmbots-arb"
+version = "2.0.0"
+edition = "2021"
+default-run = "pmbots-arb"
+description = "Kalshi-Poly / Poly-Poly / Kalshi-Kalshi arbitrage bot - automated cross-platform prediction market trading system"
+keywords = ["polymarket", "kalshi", "arbitrage", "trading-bot", "prediction-markets"]
+authors = ["teraus"]
+license = "MIT OR Apache-2.0"
+repository = "https://github.com/terauss/prediction-market-arbitrage"
+
+[[bin]]
+name = "pmbots-arb"
+path = "src/main.rs"
+
+[[bin]]
+name = "poly_balance_check"
+path = "src/bin/poly_balance_check.rs"
+
+[dependencies]
+anyhow             = { workspace = true }
+async-trait        = { workspace = true }
+base64             = { workspace = true }
+chrono             = { workspace = true }
+dotenvy            = { workspace = true }
+ethers             = { workspace = true }
+futures-util       = { workspace = true }
+hmac               = { workspace = true }
+rand               = { workspace = true }
+reqwest            = { workspace = true }
+rsa                = { workspace = true }
+pkcs1              = { workspace = true }
+serde              = { workspace = true }
+serde_json         = { workspace = true }
+sha2               = { workspace = true }
+tokio              = { workspace = true }
+tokio-tungstenite  = { workspace = true }
+tracing            = { workspace = true }
+tracing-subscriber = { workspace = true }
+rustc-hash         = { workspace = true }
+tiny-keccak        = { workspace = true }
+governor           = { workspace = true }
+nonzero_ext        = { workspace = true }
+arrayvec           = { workspace = true }
+wide               = { workspace = true }
+
+[dev-dependencies]
+criterion = { workspace = true }
+hex       = { workspace = true }
+tempfile  = { workspace = true }
